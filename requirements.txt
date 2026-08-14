@@ -1,6 +1,1 @@
-# Add your Python dependencies here
-# Example:
-# openai
-# psycopg2-binary
-# requests
-
+openai>=1.0.0\npsycopg2-binary>=2.9.0\nrequests>=2.25.0
