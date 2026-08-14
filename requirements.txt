@@ -1,0 +1,6 @@
+# Add your Python dependencies here
+# Example:
+# openai
+# psycopg2-binary
+# requests
+
