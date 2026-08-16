@@ -316,7 +316,7 @@ class PamawasInvestigator:
                             result_str = self._truncate_context(
                                 result_str, self.config.truncation_limit
                             )
-                            result = json.loads(result_str)
+                            result = {"truncated": result_str}
 
                         # Add tool result to conversation
                         messages.append({

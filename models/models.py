@@ -53,6 +53,7 @@ class IncidentContext:
     severity: str = ""
     affected_services: list[str] | None = None
     events: list[dict[str, Any]] | None = None
+    error: str | None = None
 
     def __post_init__(self):
         if self.affected_services is None:
