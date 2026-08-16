@@ -2,6 +2,7 @@
 """Main entry point for the Pamawas Investigator service."""
 
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 
@@ -9,9 +10,10 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
-from config import Config
+from config import Config as InvestigationConfig
 from metrics import set_running
 from service.investigator import PamawasInvestigator
+from otel import init_tracer, OTelConfig
 
 # Configure logging
 logging.basicConfig(
@@ -32,8 +34,19 @@ async def lifespan(app: FastAPI):
 
     # Startup
     logger.info("Starting Pamawas Investigator")
+    
+    # Initialize OpenTelemetry tracing
+    otel_config = OTelConfig(
+        service_name="pamawas-investigator",
+        otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+        insecure=True,
+        sample_ratio=1.0,
+        enabled=bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
+    )
+    otel_shutdown = init_tracer(otel_config)
+    
     try:
-        config = Config.from_env()
+        config = InvestigationConfig.from_env()
         logger.info(f"Loaded config: LLM={config.llm_model} via {config.llm_base_url}")
 
         investigator = PamawasInvestigator(config)
@@ -46,6 +59,8 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
+    if otel_shutdown:
+        otel_shutdown()
     logger.info("Shutting down Pamawas Investigator")
     set_running(False)
 
