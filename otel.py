@@ -4,9 +4,8 @@ import logging
 import os
 from collections.abc import Callable
 from contextlib import contextmanager
-from typing import Optional
 
-from opentelemetry import propagate, trace
+from opentelemetry import trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 from opentelemetry.propagate import set_global_textmap
@@ -107,7 +106,7 @@ def init_tracer(config: OTelConfig) -> Callable | None:
 
         return shutdown
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - tracing must not prevent service startup
         logger.error("[otel] failed to initialize tracer: %s", e)
         return None
 

@@ -10,10 +10,10 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from config import Config as InvestigationConfig
-from metrics import set_running
-from service.investigator import PamawasInvestigator
-from otel import init_tracer, OTelConfig
 from logging_middleware import LoggingMiddleware, get_logger
+from metrics import set_running
+from otel import OTelConfig, init_tracer
+from service.investigator import PamawasInvestigator
 
 # Configure structured logging
 log = get_logger()
@@ -30,7 +30,7 @@ async def lifespan(app: FastAPI):
 
     # Startup
     log.info("starting_pamawas_investigator")
-    
+
     # Initialize OpenTelemetry tracing
     otel_config = OTelConfig(
         service_name="pamawas-investigator",
@@ -40,7 +40,7 @@ async def lifespan(app: FastAPI):
         enabled=bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
     )
     otel_shutdown = init_tracer(otel_config)
-    
+
     try:
         config = InvestigationConfig.from_env()
         log.info("config_loaded", llm_model=config.llm_model, llm_base_url=config.llm_base_url)
@@ -82,14 +82,13 @@ async def healthz():
     if investigator is None:
         return JSONResponse(
             status_code=503,
-            content={"status": "unhealthy", "error": "Investigator not initialized"}
+            content={"status": "unhealthy", "error": "Investigator not initialized"},
         )
 
     # Check database connectivity
     if investigator.db_conn is None:
         return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": "Database not connected"}
+            status_code=503, content={"status": "unhealthy", "error": "Database not connected"}
         )
 
     try:
@@ -98,10 +97,7 @@ async def healthz():
         return {"status": "healthy", "timestamp": time.time()}
     except Exception as e:  # noqa: BLE001
         log.error("health_check_failed", error=str(e))
-        return JSONResponse(
-            status_code=503,
-            content={"status": "unhealthy", "error": str(e)}
-        )
+        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
 
 @app.get("/ready")
@@ -110,14 +106,13 @@ async def ready():
     if investigator is None:
         return JSONResponse(
             status_code=503,
-            content={"status": "not ready", "error": "Investigator not initialized"}
+            content={"status": "not ready", "error": "Investigator not initialized"},
         )
 
     # Check database connectivity
     if investigator.db_conn is None:
         return JSONResponse(
-            status_code=503,
-            content={"status": "not ready", "error": "Database not ready"}
+            status_code=503, content={"status": "not ready", "error": "Database not ready"}
         )
 
     try:
@@ -126,20 +121,14 @@ async def ready():
         return {"status": "ready"}
     except Exception as e:  # noqa: BLE001
         log.error("readiness_check_failed", error=str(e))
-        return JSONResponse(
-            status_code=503,
-            content={"status": "not ready", "error": str(e)}
-        )
+        return JSONResponse(status_code=503, content={"status": "not ready", "error": str(e)})
 
 
 @app.post("/investigate")
 async def investigate(incident_id: str):
     """Trigger investigation for an incident."""
     if investigator is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "Investigator not initialized"}
-        )
+        return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
     log.info("investigation_started", incident_id=incident_id)
     findings = investigator.investigate(incident_id)
@@ -147,7 +136,7 @@ async def investigate(incident_id: str):
     return {
         "incident_id": incident_id,
         "findings": [f.to_dict() for f in findings],
-        "completed": True
+        "completed": True,
     }
 
 
@@ -155,10 +144,7 @@ async def investigate(incident_id: str):
 async def status():
     """Status endpoint."""
     if investigator is None:
-        return JSONResponse(
-            status_code=503,
-            content={"error": "Investigator not initialized"}
-        )
+        return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
     return {
         "running": True,
