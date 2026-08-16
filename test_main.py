@@ -1,18 +1,17 @@
-import pytest
 import os
-import json
-from unittest.mock import Mock, patch, MagicMock
+import pytest
+import sys
 from datetime import datetime
+from unittest.mock import Mock, patch
 
 # Import the investigator modules
-import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from models import EvidenceType, Finding
 from config import Config as InvestigationConfig
+from models import EvidenceType, Finding
+from service import PamawasInvestigator
 from service.investigator import InvestigatorLLM
 from tools import InvestigatorTools
-from service import PamawasInvestigator
 
 
 class TestEvidenceType:

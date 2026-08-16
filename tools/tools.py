@@ -1,12 +1,11 @@
 """Tool implementations for the Investigator."""
 
-import json
 import logging
 import time
-from typing import Any, List
+from typing import Any
 
 from models import Finding
-from metrics import observe_tool_call_duration, increment_tool_calls
+from metrics import increment_tool_calls, observe_tool_call_duration
 
 logger = logging.getLogger(__name__)
 
@@ -40,7 +39,7 @@ class InvestigatorTools:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "success")
             return result
-        except BaseException as e:
+        except Exception as e:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             logger.error(f"Prometheus query failed: {e}")
@@ -67,7 +66,7 @@ class InvestigatorTools:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "success")
             return result
-        except BaseException as e:
+        except Exception as e:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error(f"Loki query failed: {e}")
@@ -94,13 +93,13 @@ class InvestigatorTools:
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "success")
             return result
-        except BaseException as e:
+        except Exception as e:
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "error")
             logger.error(f"Get deployments failed: {e}")
             return {"status": "error", "error": str(e)}
 
-    def get_related_incidents(self, service: str, symptom_keywords: List[str]) -> dict[str, Any]:
+    def get_related_incidents(self, service: str, symptom_keywords: list[str]) -> dict[str, Any]:
         """Find related incidents from the database."""
         logger.info(f"Finding related incidents for {service} with keywords {symptom_keywords}")
         start_time = time.time()
@@ -122,13 +121,13 @@ class InvestigatorTools:
             observe_tool_call_duration("related_incidents", time.time() - start_time)
             increment_tool_calls("related_incidents", "success")
             return result
-        except BaseException as e:
+        except Exception as e:
             observe_tool_call_duration("related_incidents", time.time() - start_time)
             increment_tool_calls("related_incidents", "error")
             logger.error(f"Get related incidents failed: {e}")
             return {"status": "error", "error": str(e)}
 
-    def submit_findings(self, findings: List[Finding]) -> dict[str, Any]:
+    def submit_findings(self, findings: list[Finding]) -> dict[str, Any]:
         """Submit the final findings - this is the tool that forces structured output."""
         logger.info(f"Submitting {len(findings)} findings")
         start_time = time.time()
@@ -143,7 +142,7 @@ class InvestigatorTools:
             observe_tool_call_duration("submit_findings", time.time() - start_time)
             increment_tool_calls("submit_findings", "success")
             return result
-        except BaseException as e:
+        except Exception as e:
             observe_tool_call_duration("submit_findings", time.time() - start_time)
             increment_tool_calls("submit_findings", "error")
             logger.error(f"Submit findings failed: {e}")

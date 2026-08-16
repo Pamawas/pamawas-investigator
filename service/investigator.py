@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from typing import Dict, List, Any, Optional
+from typing import Any, Optional
 from datetime import datetime
 
 import psycopg2
@@ -41,7 +41,7 @@ class InvestigatorLLM:
         )
         self.model = config.llm_model
 
-    def chat_completion(self, messages: List[Dict], tools: Optional[List[Dict]] = None, tool_choice: str = "auto"):
+    def chat_completion(self, messages: list[dict], tools: list[dict] | None = None, tool_choice: str = "auto"):
         """Call the LLM with optional tool use."""
         try:
             response = self.client.chat.completions.create(
@@ -53,7 +53,7 @@ class InvestigatorLLM:
                 max_tokens=2000
             )
             return response.choices[0].message
-        except Exception as e:
+        except BaseException as e:
             logger.error(f"LLM call failed: {e}")
             raise
 
@@ -77,7 +77,7 @@ class PamawasInvestigator:
         try:
             self.db_conn = psycopg2.connect(self.config.database_url)
             logger.info("Connected to database")
-        except Exception as e:
+        except BaseException as e:
             logger.error(f"Failed to connect to database: {e}")
             increment_db_errors()
             self.db_conn = None
@@ -147,11 +147,11 @@ class PamawasInvestigator:
                         for e in events
                     ]
                 )
-        except Exception as e:
+        except BaseException as e:
             logger.error(f"Failed to get incident context: {e}")
             return IncidentContext(
                 incident_id=incident_id,
-                title=f"Error loading incident",
+                title="Error loading incident",
                 events=[],
                 started_at="",
                 error=str(e)
@@ -167,7 +167,7 @@ class PamawasInvestigator:
         half = (limit - marker_len) // 2
         return text[:half] + marker + text[-half:]
 
-    def investigate(self, incident_id: str) -> List[Finding]:
+    def investigate(self, incident_id: str) -> list[Finding]:
         """Main investigation loop with bounded tool-calling."""
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
@@ -361,11 +361,11 @@ Begin your investigation by understanding what happened. Use your tools to gathe
                         state.completed = True
                         return state.findings
 
-            except Exception as e:
+            except BaseException as e:
                 logger.error(f"Error in investigation loop: {e}")
                 state.findings.append(Finding(
                     type=EvidenceType.UNKNOWN,
-                    content=f"Investigation error: {str(e)}",
+                    content=f"Investigation error: {e!s}",
                     source="investigator_error",
                     confidence=0.0
                 ))
