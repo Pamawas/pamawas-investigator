@@ -8,14 +8,11 @@ from datetime import datetime
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from main import (
-    EvidenceType,
-    Finding,
-    InvestigationConfig,
-    InvestigatorLLM,
-    InvestigatorTools,
-    PamawasInvestigator,
-)
+from models import EvidenceType, Finding
+from config import Config as InvestigationConfig
+from service.investigator import InvestigatorLLM
+from tools import InvestigatorTools
+from service import PamawasInvestigator
 
 
 class TestEvidenceType:
@@ -72,29 +69,27 @@ class TestInvestigationConfig:
         assert config.max_tool_calls == 8
 
     def test_config_defaults(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgres://test:test@localhost/test")
+        monkeypatch.setenv("DATABASE_URL", "postgres://test:***@localhost/test")
         monkeypatch.setenv("LLM_API_KEY", "test-key")
 
         config = InvestigationConfig.from_env()
 
         assert config.max_tool_calls == 6
-        assert config.context_truncation_limit == 8192
+        assert config.truncation_limit == 8192
 
 
 class TestInvestigatorLLM:
     """Test LLM client"""
 
-    @patch('main.OpenAI')
+    @patch('service.investigator.OpenAI')
     def test_llm_initialization(self, mock_openai):
         config = InvestigationConfig(
-            database_url="postgres://test:test@localhost/test",
+            database_url="postgres://test:***@localhost/test",
             llm_base_url="https://api.openai.com/v1",
             llm_api_key="test-key",
             llm_model="gpt-4o-mini",
             prometheus_url="http://prometheus:9090",
             loki_url="http://loki:3100",
-            deployments_url="http://deployments:8080",
-            related_incidents_url="http://related:8080",
         )
 
         llm = InvestigatorLLM(config)
@@ -111,14 +106,12 @@ class TestInvestigatorTools:
 
     def setup_method(self):
         self.config = InvestigationConfig(
-            database_url="postgres://test:test@localhost/test",
+            database_url="postgres://test:***@localhost/test",
             llm_base_url="https://api.openai.com/v1",
             llm_api_key="test-key",
             llm_model="gpt-4o-mini",
             prometheus_url="http://prometheus:9090",
             loki_url="http://loki:3100",
-            deployments_url="http://deployments:8080",
-            related_incidents_url="http://related:8080",
         )
         self.tools = InvestigatorTools(self.config)
 
@@ -199,8 +192,6 @@ class TestPamawasInvestigator:
             llm_model="gpt-4o-mini",
             prometheus_url="http://prometheus:9090",
             loki_url="http://loki:3100",
-            deployments_url="http://deployments:8080",
-            related_incidents_url="http://related:8080",
         )
 
     def test_investigator_initialization(self):
@@ -223,7 +214,7 @@ class TestPamawasInvestigator:
         assert len(truncated) <= 1000
         assert "TRUNCATED" in truncated
 
-    @patch('main.OpenAI')
+    @patch('openai.OpenAI')
     def test_investigate_without_db(self, mock_openai):
         # Mock the LLM response
         mock_client = Mock()

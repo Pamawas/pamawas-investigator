@@ -10,9 +10,9 @@ from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
-from .config import Config
-from .service.investigator import PamawasInvestigator
-from .metrics import set_running, set_uptime
+from config import Config
+from service.investigator import PamawasInvestigator
+from metrics import set_running, set_uptime
 
 # Configure logging
 logging.basicConfig(

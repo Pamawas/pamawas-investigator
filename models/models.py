@@ -47,8 +47,8 @@ class IncidentContext:
     """Incident context loaded from database."""
     incident_id: str
     title: str
-    status: str
-    started_at: str
+    status: str = ""
+    started_at: str = ""
     resolved_at: Optional[str] = None
     severity: str = ""
     affected_services: List[str] = None

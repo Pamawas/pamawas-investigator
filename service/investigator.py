@@ -10,16 +10,16 @@ from datetime import datetime
 import psycopg2
 from openai import OpenAI
 
-from ..config import Config
-from ..models import (
+from config import Config
+from models import (
     EvidenceType,
     Finding,
     IncidentContext,
     InvestigationState,
     ToolResult,
 )
-from ..tools import InvestigatorTools, ToolRegistry
-from ..metrics import (
+from tools import InvestigatorTools, ToolRegistry
+from metrics import (
     increment_investigations,
     increment_findings,
     observe_loop_duration,
@@ -161,9 +161,11 @@ class PamawasInvestigator:
         """Truncate context to prevent excessive growth."""
         if len(text) <= limit:
             return text
-        # Keep beginning and end
-        half = limit // 2
-        return text[:half] + "\n... [TRUNCATED] ...\n" + text[-half:]
+        # Keep beginning and end, accounting for truncation marker
+        marker = "\n... [TRUNCATED] ...\n"
+        marker_len = len(marker)
+        half = (limit - marker_len) // 2
+        return text[:half] + marker + text[-half:]
 
     def investigate(self, incident_id: str) -> List[Finding]:
         """Main investigation loop with bounded tool-calling."""

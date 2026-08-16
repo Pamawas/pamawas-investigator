@@ -8,19 +8,11 @@ from datetime import datetime
 
 import psycopg2
 import requests
-from prometheus_client import Histogram
 
-from ..models import Finding, EvidenceType, ToolResult
-from ..metrics import observe_tool_call_duration, increment_tool_calls
+from models import Finding, EvidenceType, ToolResult
+from metrics import observe_tool_call_duration, increment_tool_calls
 
 logger = logging.getLogger(__name__)
-
-# Histogram for tool call durations
-TOOL_CALL_DURATION = Histogram(
-    "investigator_tool_call_duration_seconds",
-    "Tool call duration in seconds",
-    ["tool"],
-)
 
 
 class InvestigatorTools:
