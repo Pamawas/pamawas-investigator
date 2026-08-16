@@ -47,6 +47,7 @@ Orchestrates the investigation of incidents using an LLM with bounded tool acces
 ## System Prompt Intent (MVP §6)
 
 The investigator is instructed to:
+
 1. Understand the symptom and blast radius
 2. Find the first abnormal signal, not just the loudest alert
 3. Check recent changes near that time
@@ -69,6 +70,16 @@ The investigator is instructed to:
 | `RELATED_INCIDENTS_URL` | Related incidents service URL | `http://related-incidents:8080` |
 | `MAX_TOOL_CALLS` | Hard cap on tool rounds | `6` |
 | `LOG_LEVEL` | Log level | `info` |
+| `ENVIRONMENT` | Deployment environment | `development` |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP gRPC endpoint for Tempo | `tempo:4317` |
+
+## Observability
+
+| Feature | Endpoint/Format |
+|---------|-----------------|
+| **Prometheus Metrics** | `/metrics` — `investigator_investigations_total`, `investigator_tool_calls_total`, `investigator_findings_total`, `investigator_db_connection_errors_total`, `investigator_loop_duration_seconds`, `investigator_tool_call_duration_seconds`, `investigator_context_truncations_total`, `investigator_running`, `investigator_uptime_seconds` |
+| **Structured JSON Logging** | stdout — trace_id, span_id, service, component, method, path, status_code, duration_ms |
+| **OpenTelemetry Tracing** | OTLP gRPC → Tempo:4317 — W3C TraceContext propagation |
 
 ## Database Schema (from pamawas-schema)
 
@@ -90,6 +101,7 @@ CREATE TABLE IF NOT EXISTS evidence (
 ## LLM Provider Flexibility (MVP §7)
 
 The investigator uses a thin OpenAI-compatible client that works with:
+
 - **OpenAI** — `base_url: https://api.openai.com/v1`, `model: gpt-4o-mini`
 - **Ollama** — `base_url: http://localhost:11434/v1`, `api_key: ollama`, `model: llama3.1:70b`
 - **vLLM** — `base_url: http://localhost:8000/v1`, `model: meta-llama/Llama-3.1-70B-Instruct`
@@ -111,10 +123,10 @@ No code changes needed — only config.
 - ✅ Requirements.txt with dependencies
 - ✅ Dockerfile (Python base)
 - ✅ GitHub Actions workflow (main + dev branches, GHCR publishing)
-- ⬜ Real Prometheus/Loki HTTP clients (currently mocked)
-- ⬜ Structured JSON logging
-- ⬜ Configuration management (YAML + ENV)
-- ⬜ Unit tests for tool functions (target 80%+ coverage)
+- ✅ **Structured JSON logging with structlog + middleware**
+- ✅ **Request/response logging middleware with trace context**
+- ✅ **OpenTelemetry tracing (OTLP gRPC → Tempo)**
+- ✅ **Prometheus metrics endpoint (`/metrics`)**
 
 ## Kanban Tasks
 
@@ -147,6 +159,7 @@ docker run -e DATABASE_URL="postgres://..." \
   -e LLM_MODEL="gpt-4o-mini" \
   -e PROMETHEUS_URL="http://prometheus:9090" \
   -e LOKI_URL="http://loki:3100" \
+  -e OTEL_EXPORTER_OTLP_ENDPOINT="tempo:4317" \
   pamawas-investigator
 ```
 
