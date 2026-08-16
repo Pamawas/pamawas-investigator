@@ -4,8 +4,8 @@ import logging
 import time
 from typing import Any
 
-from models import Finding
 from metrics import increment_tool_calls, observe_tool_call_duration
+from models import Finding
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +18,7 @@ class InvestigatorTools:
 
     def query_prometheus(self, promql: str, start: str, end: str) -> dict[str, Any]:
         """Query Prometheus for metrics data."""
-        logger.info(f"Querying Prometheus: {promql} [{start} to {end}]")
+        logger.info("Querying Prometheus: %s [%s to %s]", promql, start, end)
         start_time = time.time()
 
         try:
@@ -30,7 +30,10 @@ class InvestigatorTools:
                     "resultType": "matrix",
                     "result": [
                         {
-                            "metric": {"__name__": "http_requests_total", "job": "api-server"},
+                            "metric": {
+                                "__name__": "http_requests_total",
+                                "job": "api-server"
+                            },
                             "values": [[start, "100"], [end, "150"]]
                         }
                     ]
@@ -39,15 +42,19 @@ class InvestigatorTools:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "success")
             return result
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
-            logger.error(f"Prometheus query failed: {e}")
+            logger.error("Prometheus query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def query_loki(self, logql: str, start: str, end: str, limit: int = 100) -> dict[str, Any]:
+    def query_loki(
+        self, logql: str, start: str, end: str, limit: int = 100
+    ) -> dict[str, Any]:
         """Query Loki for logs data."""
-        logger.info(f"Querying Loki: {logql} [{start} to {end}] limit={limit}")
+        logger.info(
+            "Querying Loki: %s [%s to %s] limit=%d", logql, start, end, limit
+        )
         start_time = time.time()
 
         try:
@@ -57,8 +64,14 @@ class InvestigatorTools:
                 "data": {
                     "result": [
                         {
-                            "stream": {"job": "api-server", "level": "error"},
-                            "values": [[start, "Error: connection refused"], [end, "Error: timeout"]]
+                            "stream": {
+                                "job": "api-server",
+                                "level": "error"
+                            },
+                            "values": [
+                                [start, "Error: connection refused"],
+                                [end, "Error: timeout"]
+                            ]
                         }
                     ]
                 }
@@ -66,15 +79,19 @@ class InvestigatorTools:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "success")
             return result
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
-            logger.error(f"Loki query failed: {e}")
+            logger.error("Loki query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def get_recent_deployments(self, service: str, start: str, end: str) -> dict[str, Any]:
+    def get_recent_deployments(
+        self, service: str, start: str, end: str
+    ) -> dict[str, Any]:
         """Get recent deployments for a service."""
-        logger.info(f"Getting recent deployments for {service} [{start} to {end}]")
+        logger.info(
+            "Getting recent deployments for %s [%s to %s]", service, start, end
+        )
         start_time = time.time()
 
         try:
@@ -93,15 +110,21 @@ class InvestigatorTools:
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "success")
             return result
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "error")
-            logger.error(f"Get deployments failed: {e}")
+            logger.error("Get deployments failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def get_related_incidents(self, service: str, symptom_keywords: list[str]) -> dict[str, Any]:
+    def get_related_incidents(
+        self, service: str, symptom_keywords: list[str]
+    ) -> dict[str, Any]:
         """Find related incidents from the database."""
-        logger.info(f"Finding related incidents for {service} with keywords {symptom_keywords}")
+        logger.info(
+            "Finding related incidents for %s with keywords %s",
+            service,
+            symptom_keywords
+        )
         start_time = time.time()
 
         try:
@@ -118,18 +141,22 @@ class InvestigatorTools:
                     }
                 ]
             }
-            observe_tool_call_duration("related_incidents", time.time() - start_time)
+            observe_tool_call_duration(
+                "related_incidents", time.time() - start_time
+            )
             increment_tool_calls("related_incidents", "success")
             return result
-        except Exception as e:
-            observe_tool_call_duration("related_incidents", time.time() - start_time)
+        except Exception as e:  # noqa: BLE001
+            observe_tool_call_duration(
+                "related_incidents", time.time() - start_time
+            )
             increment_tool_calls("related_incidents", "error")
-            logger.error(f"Get related incidents failed: {e}")
+            logger.error("Get related incidents failed: %s", e)
             return {"status": "error", "error": str(e)}
 
     def submit_findings(self, findings: list[Finding]) -> dict[str, Any]:
         """Submit the final findings - this is the tool that forces structured output."""
-        logger.info(f"Submitting {len(findings)} findings")
+        logger.info("Submitting %d findings", len(findings))
         start_time = time.time()
 
         try:
@@ -139,13 +166,17 @@ class InvestigatorTools:
                 "message": f"Submitted {len(findings)} findings",
                 "findings": [f.to_dict() for f in findings]
             }
-            observe_tool_call_duration("submit_findings", time.time() - start_time)
+            observe_tool_call_duration(
+                "submit_findings", time.time() - start_time
+            )
             increment_tool_calls("submit_findings", "success")
             return result
-        except Exception as e:
-            observe_tool_call_duration("submit_findings", time.time() - start_time)
+        except Exception as e:  # noqa: BLE001
+            observe_tool_call_duration(
+                "submit_findings", time.time() - start_time
+            )
             increment_tool_calls("submit_findings", "error")
-            logger.error(f"Submit findings failed: {e}")
+            logger.error("Submit findings failed: %s", e)
             return {"status": "error", "error": str(e)}
 
 
@@ -162,9 +193,18 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "promql": {"type": "string", "description": "PromQL query expression"},
-                            "start": {"type": "string", "description": "Start timestamp (ISO 8601)"},
-                            "end": {"type": "string", "description": "End timestamp (ISO 8601)"}
+                            "promql": {
+                                "type": "string",
+                                "description": "PromQL query expression"
+                            },
+                            "start": {
+                                "type": "string",
+                                "description": "Start timestamp (ISO 8601)"
+                            },
+                            "end": {
+                                "type": "string",
+                                "description": "End timestamp (ISO 8601)"
+                            }
                         },
                         "required": ["promql", "start", "end"]
                     }
@@ -178,10 +218,24 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "logql": {"type": "string", "description": "LogQL query expression"},
-                            "start": {"type": "string", "description": "Start timestamp (ISO 8601)"},
-                            "end": {"type": "string", "description": "End timestamp (ISO 8601)"},
-                            "limit": {"type": "integer", "description": "Maximum number of log entries to return"}
+                            "logql": {
+                                "type": "string",
+                                "description": "LogQL query expression"
+                            },
+                            "start": {
+                                "type": "string",
+                                "description": "Start timestamp (ISO 8601)"
+                            },
+                            "end": {
+                                "type": "string",
+                                "description": "End timestamp (ISO 8601)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": (
+                                    "Maximum number of log entries to return"
+                                )
+                            }
                         },
                         "required": ["logql", "start", "end"]
                     }
@@ -195,9 +249,18 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "service": {"type": "string", "description": "Service name"},
-                            "start": {"type": "string", "description": "Start timestamp (ISO 8601)"},
-                            "end": {"type": "string", "description": "End timestamp (ISO 8601)"}
+                            "service": {
+                                "type": "string",
+                                "description": "Service name"
+                            },
+                            "start": {
+                                "type": "string",
+                                "description": "Start timestamp (ISO 8601)"
+                            },
+                            "end": {
+                                "type": "string",
+                                "description": "End timestamp (ISO 8601)"
+                            }
                         },
                         "required": ["service", "start", "end"]
                     }
@@ -211,11 +274,16 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "service": {"type": "string", "description": "Service name"},
+                            "service": {
+                                "type": "string",
+                                "description": "Service name"
+                            },
                             "symptom_keywords": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": "Keywords to match against incident symptoms"
+                                "description": (
+                                    "Keywords to match against incident symptoms"
+                                )
                             }
                         },
                         "required": ["service", "symptom_keywords"]
@@ -237,13 +305,24 @@ class ToolRegistry:
                                     "properties": {
                                         "type": {
                                             "type": "string",
-                                            "enum": ["fact", "likely_cause", "hypothesis", "unknown"]
+                                            "enum": [
+                                                "fact",
+                                                "likely_cause",
+                                                "hypothesis",
+                                                "unknown"
+                                            ]
                                         },
                                         "content": {"type": "string"},
                                         "source": {"type": "string"},
-                                        "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}
+                                        "confidence": {
+                                            "type": "number",
+                                            "minimum": 0.0,
+                                            "maximum": 1.0
+                                        }
                                     },
-                                    "required": ["type", "content", "source", "confidence"]
+                                    "required": [
+                                        "type", "content", "source", "confidence"
+                                    ]
                                 }
                             }
                         },

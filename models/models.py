@@ -1,12 +1,12 @@
 """Data models for the Pamawas Investigator."""
 
-from dataclasses import dataclass, asdict
-from enum import Enum
-from typing import List, Optional, Dict, Any
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from enum import StrEnum
+from typing import Any
 
 
-class EvidenceType(str, Enum):
+class EvidenceType(StrEnum):
     """Evidence classification types."""
     FACT = "fact"
     LIKELY_CAUSE = "likely_cause"
@@ -22,7 +22,7 @@ class Finding:
     source: str
     confidence: float  # 0.0 to 1.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
             "type": self.type.value,
@@ -32,7 +32,7 @@ class Finding:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Finding":
+    def from_dict(cls, data: dict[str, Any]) -> Finding:
         """Create Finding from dictionary."""
         return cls(
             type=EvidenceType(data["type"]),
@@ -49,10 +49,10 @@ class IncidentContext:
     title: str
     status: str = ""
     started_at: str = ""
-    resolved_at: Optional[str] = None
+    resolved_at: str | None = None
     severity: str = ""
-    affected_services: List[str] = None
-    events: List[Dict[str, Any]] = None
+    affected_services: list[str] | None = None
+    events: list[dict[str, Any]] | None = None
 
     def __post_init__(self):
         if self.affected_services is None:
@@ -65,23 +65,23 @@ class IncidentContext:
 class ToolResult:
     """Result of a tool call."""
     tool_name: str
-    arguments: Dict[str, Any]
-    result: Dict[str, Any]
+    arguments: dict[str, Any]
+    result: dict[str, Any]
     duration_ms: float
     timestamp: datetime = None
 
     def __post_init__(self):
         if self.timestamp is None:
-            self.timestamp = datetime.utcnow()
+            self.timestamp = datetime.now(tz=UTC)
 
 
 @dataclass
 class InvestigationState:
     """State of an ongoing investigation."""
     incident_id: str
-    findings: List[Finding]
-    tool_calls: List[ToolResult]
+    findings: list[Finding]
+    tool_calls: list[ToolResult]
     tool_call_count: int = 0
     max_tool_calls: int = 6
     completed: bool = False
-    error: Optional[str] = None
+    error: str | None = None

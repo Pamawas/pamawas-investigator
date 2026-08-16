@@ -2,7 +2,6 @@
 
 import os
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -19,7 +18,7 @@ class Config:
     truncation_limit: int = 8192
 
     @classmethod
-    def from_env(cls) -> "Config":
+    def from_env(cls) -> Config:
         """Create config from environment variables."""
         database_url = os.getenv("DATABASE_URL", "")
         if not database_url:

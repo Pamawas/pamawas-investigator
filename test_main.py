@@ -1,8 +1,8 @@
 import os
-import pytest
 import sys
-from datetime import datetime
 from unittest.mock import Mock, patch
+
+import pytest
 
 # Import the investigator modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,7 +49,7 @@ class TestInvestigationConfig:
     """Test configuration loading"""
 
     def test_config_from_env(self, monkeypatch):
-        monkeypatch.setenv("DATABASE_URL", "postgres://test:test@localhost/test")
+        monkeypatch.setenv("DATABASE_URL", "postgres://test:***@localhost/test")
         monkeypatch.setenv("LLM_BASE_URL", "https://api.openai.com/v1")
         monkeypatch.setenv("LLM_API_KEY", "test-key")
         monkeypatch.setenv("LLM_MODEL", "gpt-4o-mini")
@@ -59,7 +59,7 @@ class TestInvestigationConfig:
 
         config = InvestigationConfig.from_env()
 
-        assert config.database_url == "postgres://test:test@localhost/test"
+        assert config.database_url == "postgres://test:***@localhost/test"
         assert config.llm_base_url == "https://api.openai.com/v1"
         assert config.llm_api_key == "test-key"
         assert config.llm_model == "gpt-4o-mini"
@@ -254,3 +254,4 @@ class TestSystemPrompt:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+

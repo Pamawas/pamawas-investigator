@@ -1,3 +1,3 @@
-from .investigator import PamawasInvestigator, InvestigatorLLM
+from .investigator import InvestigatorLLM, PamawasInvestigator
 
-__all__ = ["PamawasInvestigator", "InvestigatorLLM"]
+__all__ = ["InvestigatorLLM", "PamawasInvestigator"]

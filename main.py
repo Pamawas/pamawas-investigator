@@ -1,8 +1,7 @@
+#!/usr/bin/env python3
 """Main entry point for the Pamawas Investigator service."""
 
 import logging
-import os
-import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -11,8 +10,8 @@ from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
 from config import Config
+from metrics import set_running
 from service.investigator import PamawasInvestigator
-from metrics import set_running, set_uptime
 
 # Configure logging
 logging.basicConfig(
@@ -83,7 +82,7 @@ async def healthz():
         with investigator.db_conn.cursor() as cursor:
             cursor.execute("SELECT 1")
         return {"status": "healthy", "timestamp": time.time()}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Health check failed: {e}")
         return JSONResponse(
             status_code=503,
@@ -111,7 +110,7 @@ async def ready():
         with investigator.db_conn.cursor() as cursor:
             cursor.execute("SELECT 1")
         return {"status": "ready"}
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error(f"Readiness check failed: {e}")
         return JSONResponse(
             status_code=503,

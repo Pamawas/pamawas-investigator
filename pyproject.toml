@@ -1,0 +1,58 @@
+[project]
+name = "pamawas-investigator"
+version = "1.0.0"
+description = "Bounded tool-calling LLM investigation engine for infrastructure incidents"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "openai>=1.0.0",
+    "psycopg2-binary>=2.9.0",
+    "requests>=2.25.0",
+    "prometheus-client>=0.19.0",
+    "structlog>=24.1.0",
+    "fastapi>=0.110.0",
+    "uvicorn>=0.29.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7.4.0",
+    "pytest-mock>=3.12.0",
+    "pytest-asyncio>=0.21.0",
+    "respx>=0.21.0",
+    "httpx>=0.25.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["config*", "models*", "service*", "metrics*", "tools*"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "BLE", # flake8-blind-except
+    "DTZ", # flake8-datetimez
+    "RUF", # ruff-specific
+    "N",   # ruff-specific naming
+    "EXE", # executable files
+]
+ignore = [
+    "N999",  # Invalid module name (hyphen in package name)
+]
+fixable = [
+    "I",   # isort
+    "UP",  # pyupgrade
+    "RUF", # ruff-specific
+]

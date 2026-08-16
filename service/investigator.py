@@ -2,15 +2,13 @@
 
 import json
 import logging
-import os
 import time
-from typing import Any, Optional
-from datetime import datetime
 
 import psycopg2
 from openai import OpenAI
 
 from config import Config
+from metrics import increment_db_errors, increment_investigations
 from models import (
     EvidenceType,
     Finding,
@@ -19,14 +17,6 @@ from models import (
     ToolResult,
 )
 from tools import InvestigatorTools, ToolRegistry
-from metrics import (
-    increment_investigations,
-    increment_findings,
-    observe_loop_duration,
-    set_running,
-    set_uptime,
-    increment_db_errors,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +31,12 @@ class InvestigatorLLM:
         )
         self.model = config.llm_model
 
-    def chat_completion(self, messages: list[dict], tools: list[dict] | None = None, tool_choice: str = "auto"):
+    def chat_completion(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        tool_choice: str = "auto",
+    ):
         """Call the LLM with optional tool use."""
         try:
             response = self.client.chat.completions.create(
@@ -53,7 +48,7 @@ class InvestigatorLLM:
                 max_tokens=2000
             )
             return response.choices[0].message
-        except BaseException as e:
+        except Exception as e:
             logger.error(f"LLM call failed: {e}")
             raise
 
@@ -77,7 +72,7 @@ class PamawasInvestigator:
         try:
             self.db_conn = psycopg2.connect(self.config.database_url)
             logger.info("Connected to database")
-        except BaseException as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to connect to database: {e}")
             increment_db_errors()
             self.db_conn = None
@@ -147,7 +142,7 @@ class PamawasInvestigator:
                         for e in events
                     ]
                 )
-        except BaseException as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to get incident context: {e}")
             return IncidentContext(
                 incident_id=incident_id,
@@ -192,47 +187,54 @@ class PamawasInvestigator:
         )
 
         # System prompt that guides the investigator
-        system_prompt = """You are an expert infrastructure incident investigator. Your goal is to:
-1. Understand the symptom and blast radius
-2. Find the first abnormal signal, not just the loudest alert
-3. Check recent changes near the time of the incident
-4. Check dependencies
-5. Form and test competing hypotheses rather than confirming one
-6. Use tool calls deliberately - no duplicate queries, no unused fetches
-7. Prefer UNKNOWN over a fabricated-sounding conclusion when evidence is insufficient
-
-You have access to tools to query Prometheus, Loki, check recent deployments, and find related incidents.
-You must use the submit_findings tool to end the investigation with your final conclusions.
-
-Every finding must be classified as:
-- FACT: directly observed in metrics/logs
-- LIKELY_CAUSE: strongly supported by evidence, not certain
-- HYPOTHESIS: plausible, unverified
-- UNKNOWN: insufficient evidence; stated explicitly rather than guessed
-
-Always provide confidence scores (0.0 to 1.0) for your findings."""
+        system_prompt = (
+            "You are an expert infrastructure incident investigator. Your goal is to:\n"
+            "1. Understand the symptom and blast radius\n"
+            "2. Find the first abnormal signal, not just the loudest alert\n"
+            "3. Check recent changes near the time of the incident\n"
+            "4. Check dependencies\n"
+            "5. Form and test competing hypotheses rather than confirming one\n"
+            "6. Use tool calls deliberately - no duplicate queries, no unused fetches\n"
+            "7. Prefer UNKNOWN over a fabricated-sounding conclusion when evidence is "
+            "insufficient\n"
+            "\n"
+            "You have access to tools to query Prometheus, Loki, check recent "
+            "deployments, and find related incidents.\n"
+            "You must use the submit_findings tool to end the investigation with your "
+            "final conclusions.\n"
+            "\n"
+            "Every finding must be classified as:\n"
+            "- FACT: directly observed in metrics/logs\n"
+            "- LIKELY_CAUSE: strongly supported by evidence, not certain\n"
+            "- HYPOTHESIS: plausible, unverified\n"
+            "- UNKNOWN: insufficient evidence; stated explicitly rather than guessed\n"
+            "\n"
+            "Always provide confidence scores (0.0 to 1.0) for your findings."
+        )
 
         # Initial message with incident context
         messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"""Investigate this incident:
-
-Incident ID: {context.incident_id}
-Title: {context.title}
-Status: {context.status}
-Started at: {context.started_at}
-Severity: {context.severity}
-Affected services: {', '.join(context.affected_services)}
-
-Events in this incident:
-{json.dumps(context.events, indent=2)[:self.config.truncation_limit]}
-
-Begin your investigation by understanding what happened. Use your tools to gather evidence and form hypotheses."""}
-        ]
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": (
+                        f"Investigate this incident:\n\n"
+                        f"Incident ID: {context.incident_id}\n"
+                        f"Title: {context.title}\n"
+                        f"Status: {context.status}\n"
+                        f"Started at: {context.started_at}\n"
+                        f"Severity: {context.severity}\n"
+                        f"Affected services: {', '.join(context.affected_services or [])}\n\n"
+                        f"Events in this incident:\n"
+                        f"{json.dumps(context.events, indent=2)[:self.config.truncation_limit]}\n\n"
+                        "Begin your investigation by understanding what happened. Use your "
+                        "tools to gather evidence and form hypotheses."
+                    )}
+                ]
 
         # Investigation loop
         while state.tool_call_count < state.max_tool_calls:
-            logger.info(f"Investigation turn {state.tool_call_count + 1}/{state.max_tool_calls}")
+            logger.info(
+                f"Investigation turn {state.tool_call_count + 1}/{state.max_tool_calls}"
+            )
 
             # Determine if this is the final turn (force submit_findings)
             is_final_turn = (state.tool_call_count == state.max_tool_calls - 1)
@@ -258,7 +260,9 @@ Begin your investigation by understanding what happened. Use your tools to gathe
                         function_name = tool_call.function.name
                         function_args = json.loads(tool_call.function.arguments)
 
-                        logger.info(f"Calling tool: {function_name} with args: {function_args}")
+                        logger.info(
+                            f"Calling tool: {function_name} with args: {function_args}"
+                        )
 
                         # Execute the tool
                         tool_start = time.time()
@@ -309,7 +313,9 @@ Begin your investigation by understanding what happened. Use your tools to gathe
                         # Truncate result if too large
                         result_str = json.dumps(result)
                         if len(result_str) > self.config.truncation_limit:
-                            result_str = self._truncate_context(result_str, self.config.truncation_limit)
+                            result_str = self._truncate_context(
+                                result_str, self.config.truncation_limit
+                            )
                             result = json.loads(result_str)
 
                         # Add tool result to conversation
@@ -330,12 +336,20 @@ Begin your investigation by understanding what happened. Use your tools to gathe
 
                         # If we've hit the limit and haven't submitted findings yet,
                         # force a submission on the next turn
-                        if state.tool_call_count >= state.max_tool_calls and not is_final_turn:
-                            logger.info("Reached max tool calls, forcing findings submission")
+                        if (
+                            state.tool_call_count >= state.max_tool_calls
+                            and not is_final_turn
+                        ):
+                            logger.info(
+                                "Reached max tool calls, forcing findings submission"
+                            )
                             # Add a message prompting submission
                             messages.append({
                                 "role": "user",
-                                "content": "You have reached the maximum number of tool calls. Please submit your findings using the submit_findings tool."
+                                "content": (
+                                    "You have reached the maximum number of tool calls. "
+                                    "Please submit your findings using the submit_findings tool."
+                                )
                             })
 
                 else:
@@ -345,12 +359,19 @@ Begin your investigation by understanding what happened. Use your tools to gathe
                     if not is_final_turn:
                         messages.append({
                             "role": "user",
-                            "content": "Continue your investigation. Use your tools to gather more evidence, or submit your findings when ready."
+                            "content": (
+                                "Continue your investigation. Use your tools to gather more "
+                                "evidence, or submit your findings when ready."
+                            )
                         })
                     else:
-                        # Final turn with no tool calls - we need to extract findings from text
+                        # Final turn with no tool calls - we need to extract findings from
+                        # text
                         # This is a fallback - in practice, the LLM should use submit_findings
-                        logger.warning("Final turn reached without tool use - extracting findings from text")
+                        logger.warning(
+                            "Final turn reached without tool use - extracting findings "
+                            "from text"
+                        )
                         # Create a simple finding from the response
                         state.findings.append(Finding(
                             type=EvidenceType.HYPOTHESIS,
@@ -361,7 +382,7 @@ Begin your investigation by understanding what happened. Use your tools to gathe
                         state.completed = True
                         return state.findings
 
-            except BaseException as e:
+            except Exception as e:  # noqa: BLE001
                 logger.error(f"Error in investigation loop: {e}")
                 state.findings.append(Finding(
                     type=EvidenceType.UNKNOWN,
@@ -375,7 +396,9 @@ Begin your investigation by understanding what happened. Use your tools to gathe
         if not state.findings:
             state.findings.append(Finding(
                 type=EvidenceType.UNKNOWN,
-                content="Investigation reached maximum tool calls without submitting findings",
+                content=(
+                    "Investigation reached maximum tool calls without submitting findings"
+                ),
                 source="investigator_timeout",
                 confidence=0.0
             ))

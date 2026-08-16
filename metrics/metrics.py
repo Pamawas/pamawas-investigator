@@ -1,7 +1,6 @@
 """Metrics for the Investigator service."""
 
-from prometheus_client import Counter, Histogram, Gauge
-
+from prometheus_client import Counter, Gauge, Histogram
 
 # Counters
 investigations_total = Counter(
