@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Main entry point for the Pamawas Investigator service."""
 
-import logging
 import os
 import time
 from contextlib import asynccontextmanager
@@ -14,13 +13,10 @@ from config import Config as InvestigationConfig
 from metrics import set_running
 from service.investigator import PamawasInvestigator
 from otel import init_tracer, OTelConfig
+from logging_middleware import LoggingMiddleware, get_logger
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+# Configure structured logging
+log = get_logger()
 
 # Global investigator instance
 investigator: PamawasInvestigator = None
@@ -33,7 +29,7 @@ async def lifespan(app: FastAPI):
     global investigator
 
     # Startup
-    logger.info("Starting Pamawas Investigator")
+    log.info("starting_pamawas_investigator")
     
     # Initialize OpenTelemetry tracing
     otel_config = OTelConfig(
@@ -47,13 +43,13 @@ async def lifespan(app: FastAPI):
     
     try:
         config = InvestigationConfig.from_env()
-        logger.info(f"Loaded config: LLM={config.llm_model} via {config.llm_base_url}")
+        log.info("config_loaded", llm_model=config.llm_model, llm_base_url=config.llm_base_url)
 
         investigator = PamawasInvestigator(config)
         set_running(True)
-        logger.info("Investigator service is ready to process incidents")
+        log.info("investigator_ready")
     except Exception as e:
-        logger.error(f"Failed to initialize investigator: {e}")
+        log.error("investigator_init_failed", error=str(e))
         raise
 
     yield
@@ -61,7 +57,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if otel_shutdown:
         otel_shutdown()
-    logger.info("Shutting down Pamawas Investigator")
+    log.info("shutting_down_pamawas_investigator")
     set_running(False)
 
 
@@ -71,6 +67,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# Add structured logging middleware
+app.add_middleware(LoggingMiddleware, service_name="pamawas-investigator")
 
 # Mount Prometheus metrics endpoint
 metrics_app = make_asgi_app()
@@ -98,7 +97,7 @@ async def healthz():
             cursor.execute("SELECT 1")
         return {"status": "healthy", "timestamp": time.time()}
     except Exception as e:  # noqa: BLE001
-        logger.error(f"Health check failed: {e}")
+        log.error("health_check_failed", error=str(e))
         return JSONResponse(
             status_code=503,
             content={"status": "unhealthy", "error": str(e)}
@@ -126,7 +125,7 @@ async def ready():
             cursor.execute("SELECT 1")
         return {"status": "ready"}
     except Exception as e:  # noqa: BLE001
-        logger.error(f"Readiness check failed: {e}")
+        log.error("readiness_check_failed", error=str(e))
         return JSONResponse(
             status_code=503,
             content={"status": "not ready", "error": str(e)}
@@ -142,7 +141,7 @@ async def investigate(incident_id: str):
             content={"error": "Investigator not initialized"}
         )
 
-    logger.info(f"Starting investigation for incident {incident_id}")
+    log.info("investigation_started", incident_id=incident_id)
     findings = investigator.investigate(incident_id)
 
     return {
@@ -172,8 +171,8 @@ def main():
     """Main entry point for running as a standalone service."""
     import uvicorn
 
-    config = Config.from_env()
-    logger.info(f"Starting Pamawas Investigator on port {config.port}")
+    config = InvestigationConfig.from_env()
+    log.info("starting_server", port=config.port)
 
     uvicorn.run(
         "main:app",
