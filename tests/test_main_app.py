@@ -93,6 +93,9 @@ def test_status_reports_uptime(monkeypatch):
 
 def test_lifespan_initializes_and_shuts_down(config):
     service = MagicMock()
+    # Mock the async close method as AsyncMock
+    from unittest.mock import AsyncMock
+    service.close = AsyncMock()  # Mock the async close method
     shutdown = MagicMock()
     with (
         patch("main.InvestigationConfig.from_env", return_value=config),
@@ -104,6 +107,7 @@ def test_lifespan_initializes_and_shuts_down(config):
             assert main.investigator is service
     assert [call.args[0] for call in set_running.call_args_list] == [True, False]
     shutdown.assert_called_once_with()
+    service.close.assert_awaited_once()
 
 
 def test_main_runs_uvicorn_with_config(config):

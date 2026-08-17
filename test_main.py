@@ -7,6 +7,7 @@ import pytest
 # Import the investigator modules
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from adapters.fake import create_fake_transports
 from config import Config as InvestigationConfig
 from models import EvidenceType, Finding
 from service import PamawasInvestigator
@@ -101,7 +102,7 @@ class TestInvestigatorLLM:
 
 
 class TestInvestigatorTools:
-    """Test investigator tools"""
+    """Test investigator tools using fake transports"""
 
     def setup_method(self):
         self.config = InvestigationConfig(
@@ -112,7 +113,13 @@ class TestInvestigatorTools:
             prometheus_url="http://prometheus:9090",
             loki_url="http://loki:3100",
         )
+        self.fake_transports = create_fake_transports()
         self.tools = InvestigatorTools(self.config)
+        # Replace real adapters with fake transports
+        self.tools._prometheus_adapter = self.fake_transports["prometheus"]
+        self.tools._loki_adapter = self.fake_transports["loki"]
+        self.tools._deployment_adapter = self.fake_transports["deployments"]
+        self.tools._related_incidents_adapter = self.fake_transports["related_incidents"]
 
     def test_query_prometheus(self):
         result = self.tools.query_prometheus(
@@ -238,7 +245,7 @@ class TestSystemPrompt:
         # This is a documentation test - the system prompt is in the investigate method
         # We verify the key instructions are present by checking the source
         import inspect
-        source = inspect.getsource(PamawasInvestigator.investigate)
+        source = inspect.getsource(PamawasInvestigator.investigate_async)
 
         assert "Understand the symptom and blast radius" in source
         assert "Find the first abnormal signal" in source
@@ -254,4 +261,3 @@ class TestSystemPrompt:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

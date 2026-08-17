@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI):
     # Shutdown
     if otel_shutdown:
         otel_shutdown()
+    # Close investigator
+    if investigator is not None:
+        await investigator.close()
     log.info("shutting_down_pamawas_investigator")
     set_running(False)
 

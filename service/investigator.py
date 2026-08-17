@@ -1,5 +1,6 @@
 """Main Investigator Service."""
 
+import asyncio
 import json
 import logging
 import time
@@ -76,6 +77,12 @@ class PamawasInvestigator:
             logger.error(f"Failed to connect to database: {e}")
             increment_db_errors()
             self.db_conn = None
+
+    async def close(self):
+        """Close investigator and all tools."""
+        await self.tools.close()
+        if self.db_conn and not self.db_conn.closed:
+            self.db_conn.close()
 
     def _get_incident_context(self, incident_id: str) -> IncidentContext:
         """Retrieve incident context from the database."""
@@ -162,8 +169,8 @@ class PamawasInvestigator:
         half = (limit - marker_len) // 2
         return text[:half] + marker + text[-half:]
 
-    def investigate(self, incident_id: str) -> list[Finding]:
-        """Main investigation loop with bounded tool-calling."""
+    async def investigate_async(self, incident_id: str) -> list[Finding]:
+        """Main investigation loop with bounded tool-calling (async version)."""
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
 
@@ -264,29 +271,29 @@ class PamawasInvestigator:
                             f"Calling tool: {function_name} with args: {function_args}"
                         )
 
-                        # Execute the tool
+                        # Execute the tool (async)
                         tool_start = time.time()
                         if function_name == "query_prometheus":
-                            result = self.tools.query_prometheus(
+                            result = await self.tools._prometheus_adapter.query_range(
                                 function_args["promql"],
                                 function_args["start"],
                                 function_args["end"]
                             )
                         elif function_name == "query_loki":
-                            result = self.tools.query_loki(
+                            result = await self.tools._loki_adapter.query_range(
                                 function_args["logql"],
                                 function_args["start"],
                                 function_args["end"],
                                 function_args.get("limit", 100)
                             )
                         elif function_name == "get_recent_deployments":
-                            result = self.tools.get_recent_deployments(
+                            result = await self.tools._deployment_adapter.get_recent_deployments(
                                 function_args["service"],
                                 function_args["start"],
                                 function_args["end"]
                             )
                         elif function_name == "get_related_incidents":
-                            result = self.tools.get_related_incidents(
+                            result = await self.tools._related_incidents_adapter.find_related(
                                 function_args["service"],
                                 function_args["symptom_keywords"]
                             )
@@ -404,3 +411,13 @@ class PamawasInvestigator:
             ))
 
         return state.findings
+
+    def investigate(self, incident_id: str) -> list[Finding]:
+        """Sync wrapper for investigate_async."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+        return loop.run_until_complete(self.investigate_async(incident_id))

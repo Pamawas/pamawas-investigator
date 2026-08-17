@@ -1,9 +1,20 @@
-"""Tool implementations for the Investigator."""
+"""Tool implementations for the Investigator - using real bounded adapters."""
 
 import logging
 import time
 from typing import Any
 
+from adapters import (
+    DeploymentAdapter,
+    DeploymentConfig,
+    LokiAdapter,
+    LokiConfig,
+    PrometheusAdapter,
+    PrometheusConfig,
+    RelatedIncidentsAdapter,
+    RelatedIncidentsConfig,
+)
+from config import Config as InvestigationConfig
 from metrics import increment_tool_calls, observe_tool_call_duration
 from models import Finding
 
@@ -11,39 +22,84 @@ logger = logging.getLogger(__name__)
 
 
 class InvestigatorTools:
-    """Tool implementations that the LLM can call."""
+    """Tool implementations that the LLM can call - using real adapters."""
 
-    def __init__(self, config):
+    def __init__(self, config: InvestigationConfig):
         self.config = config
 
+        # Initialize real adapters
+        self._prometheus_adapter = PrometheusAdapter(
+            PrometheusConfig(
+                base_url=config.prometheus_url,
+                timeout_seconds=config.prometheus_timeout_seconds,
+                max_response_bytes=config.prometheus_max_response_bytes,
+                max_series=config.prometheus_max_series,
+                max_samples_per_series=config.prometheus_max_samples_per_series,
+                allowed_time_range_hours=config.prometheus_allowed_time_range_hours,
+            )
+        )
+
+        self._loki_adapter = LokiAdapter(
+            LokiConfig(
+                base_url=config.loki_url,
+                timeout_seconds=config.loki_timeout_seconds,
+                max_response_bytes=config.loki_max_response_bytes,
+                max_log_lines=config.loki_max_log_lines,
+                max_log_line_length=config.loki_max_log_line_length,
+                allowed_time_range_hours=config.loki_allowed_time_range_hours,
+            )
+        )
+
+        self._deployment_adapter = DeploymentAdapter(
+            DeploymentConfig(
+                base_url=config.deployment_url or None,
+                timeout_seconds=config.deployment_timeout_seconds,
+                max_results=config.deployment_max_results,
+                api_key=config.deployment_api_key or None,
+            )
+        )
+
+        self._related_incidents_adapter = RelatedIncidentsAdapter(
+            RelatedIncidentsConfig(
+                database_url=config.database_url,
+                max_results=config.related_incidents_max_results,
+                max_symptom_keywords=config.related_incidents_max_symptom_keywords,
+            )
+        )
+
+    async def close(self):
+        """Close all adapter connections."""
+        await self._prometheus_adapter.close()
+        await self._loki_adapter.close()
+        await self._deployment_adapter.close()
+        self._related_incidents_adapter.close()
+
     def query_prometheus(self, promql: str, start: str, end: str) -> dict[str, Any]:
-        """Query Prometheus for metrics data."""
+        """Query Prometheus for metrics data (sync wrapper for async adapter)."""
         logger.info("Querying Prometheus: %s [%s to %s]", promql, start, end)
         start_time = time.time()
 
         try:
-            # In a real implementation, this would make an HTTP request to Prometheus
-            # For now, return mock data
-            result = {
-                "status": "success",
-                "data": {
-                    "resultType": "matrix",
-                    "result": [
-                        {
-                            "metric": {
-                                "__name__": "http_requests_total",
-                                "job": "api-server"
-                            },
-                            "values": [[start, "100"], [end, "150"]]
-                        }
-                    ]
-                }
-            }
-            observe_tool_call_duration("prometheus", time.time() - start_time)
+            import asyncio
+            # Run async adapter in sync context
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(
+                self._prometheus_adapter.query_range(promql, start, end)
+            )
+
+            duration = time.time() - start_time
+            observe_tool_call_duration("prometheus", duration)
             increment_tool_calls("prometheus", "success")
             return result
+
         except Exception as e:  # noqa: BLE001
-            observe_tool_call_duration("prometheus", time.time() - start_time)
+            duration = time.time() - start_time
+            observe_tool_call_duration("prometheus", duration)
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus query failed: %s", e)
             return {"status": "error", "error": str(e)}
@@ -51,36 +107,32 @@ class InvestigatorTools:
     def query_loki(
         self, logql: str, start: str, end: str, limit: int = 100
     ) -> dict[str, Any]:
-        """Query Loki for logs data."""
+        """Query Loki for logs data (sync wrapper for async adapter)."""
         logger.info(
             "Querying Loki: %s [%s to %s] limit=%d", logql, start, end, limit
         )
         start_time = time.time()
 
         try:
-            # In a real implementation, this would make an HTTP request to Loki
-            result = {
-                "status": "success",
-                "data": {
-                    "result": [
-                        {
-                            "stream": {
-                                "job": "api-server",
-                                "level": "error"
-                            },
-                            "values": [
-                                [start, "Error: connection refused"],
-                                [end, "Error: timeout"]
-                            ]
-                        }
-                    ]
-                }
-            }
-            observe_tool_call_duration("loki", time.time() - start_time)
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(
+                self._loki_adapter.query_range(logql, start, end, limit)
+            )
+
+            duration = time.time() - start_time
+            observe_tool_call_duration("loki", duration)
             increment_tool_calls("loki", "success")
             return result
+
         except Exception as e:  # noqa: BLE001
-            observe_tool_call_duration("loki", time.time() - start_time)
+            duration = time.time() - start_time
+            observe_tool_call_duration("loki", duration)
             increment_tool_calls("loki", "error")
             logger.error("Loki query failed: %s", e)
             return {"status": "error", "error": str(e)}
@@ -88,30 +140,34 @@ class InvestigatorTools:
     def get_recent_deployments(
         self, service: str, start: str, end: str
     ) -> dict[str, Any]:
-        """Get recent deployments for a service."""
+        """Get recent deployments for a service (sync wrapper for async adapter)."""
         logger.info(
             "Getting recent deployments for %s [%s to %s]", service, start, end
         )
         start_time = time.time()
 
         try:
-            # Mock data - in reality would query deployment service
-            result = {
-                "status": "success",
-                "data": [
-                    {
-                        "service": service,
-                        "version": "v1.2.3",
-                        "deployed_at": start,
-                        "image": f"{service}:v1.2.3"
-                    }
-                ]
-            }
-            observe_tool_call_duration("deployments", time.time() - start_time)
-            increment_tool_calls("deployments", "success")
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(
+                self._deployment_adapter.get_recent_deployments(service, start, end)
+            )
+
+            duration = time.time() - start_time
+            observe_tool_call_duration("deployments", duration)
+            increment_tool_calls(
+                "deployments", "success" if result.get("status") == "success" else "error"
+            )
             return result
+
         except Exception as e:  # noqa: BLE001
-            observe_tool_call_duration("deployments", time.time() - start_time)
+            duration = time.time() - start_time
+            observe_tool_call_duration("deployments", duration)
             increment_tool_calls("deployments", "error")
             logger.error("Get deployments failed: %s", e)
             return {"status": "error", "error": str(e)}
@@ -119,37 +175,34 @@ class InvestigatorTools:
     def get_related_incidents(
         self, service: str, symptom_keywords: list[str]
     ) -> dict[str, Any]:
-        """Find related incidents from the database."""
+        """Find related incidents from the database (sync wrapper for async adapter)."""
         logger.info(
             "Finding related incidents for %s with keywords %s",
             service,
-            symptom_keywords
+            symptom_keywords,
         )
         start_time = time.time()
 
         try:
-            # Mock data - in reality would query database
-            result = {
-                "status": "success",
-                "data": [
-                    {
-                        "incident_id": "inc_123",
-                        "title": f"High latency in {service}",
-                        "started_at": "2026-08-13T02:00:00Z",
-                        "resolved_at": "2026-08-13T03:30:00Z",
-                        "symptom_keywords": symptom_keywords
-                    }
-                ]
-            }
-            observe_tool_call_duration(
-                "related_incidents", time.time() - start_time
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            result = loop.run_until_complete(
+                self._related_incidents_adapter.find_related(service, symptom_keywords)
             )
+
+            duration = time.time() - start_time
+            observe_tool_call_duration("related_incidents", duration)
             increment_tool_calls("related_incidents", "success")
             return result
+
         except Exception as e:  # noqa: BLE001
-            observe_tool_call_duration(
-                "related_incidents", time.time() - start_time
-            )
+            duration = time.time() - start_time
+            observe_tool_call_duration("related_incidents", duration)
             increment_tool_calls("related_incidents", "error")
             logger.error("Get related incidents failed: %s", e)
             return {"status": "error", "error": str(e)}
@@ -164,17 +217,15 @@ class InvestigatorTools:
             result = {
                 "status": "success",
                 "message": f"Submitted {len(findings)} findings",
-                "findings": [f.to_dict() for f in findings]
+                "findings": [f.to_dict() for f in findings],
             }
-            observe_tool_call_duration(
-                "submit_findings", time.time() - start_time
-            )
+            duration = time.time() - start_time
+            observe_tool_call_duration("submit_findings", duration)
             increment_tool_calls("submit_findings", "success")
             return result
         except Exception as e:  # noqa: BLE001
-            observe_tool_call_duration(
-                "submit_findings", time.time() - start_time
-            )
+            duration = time.time() - start_time
+            observe_tool_call_duration("submit_findings", duration)
             increment_tool_calls("submit_findings", "error")
             logger.error("Submit findings failed: %s", e)
             return {"status": "error", "error": str(e)}
@@ -199,11 +250,11 @@ class ToolRegistry:
                             },
                             "start": {
                                 "type": "string",
-                                "description": "Start timestamp (ISO 8601)"
+                                "description": "Start timestamp (ISO 8601/RFC3339)"
                             },
                             "end": {
                                 "type": "string",
-                                "description": "End timestamp (ISO 8601)"
+                                "description": "End timestamp (ISO 8601/RFC3339)"
                             }
                         },
                         "required": ["promql", "start", "end"]
@@ -224,11 +275,11 @@ class ToolRegistry:
                             },
                             "start": {
                                 "type": "string",
-                                "description": "Start timestamp (ISO 8601)"
+                                "description": "Start timestamp (ISO 8601/RFC3339)"
                             },
                             "end": {
                                 "type": "string",
-                                "description": "End timestamp (ISO 8601)"
+                                "description": "End timestamp (ISO 8601/RFC3339)"
                             },
                             "limit": {
                                 "type": "integer",
@@ -255,11 +306,11 @@ class ToolRegistry:
                             },
                             "start": {
                                 "type": "string",
-                                "description": "Start timestamp (ISO 8601)"
+                                "description": "Start timestamp (ISO 8601/RFC3339)"
                             },
                             "end": {
                                 "type": "string",
-                                "description": "End timestamp (ISO 8601)"
+                                "description": "End timestamp (ISO 8601/RFC3339)"
                             }
                         },
                         "required": ["service", "start", "end"]

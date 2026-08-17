@@ -116,7 +116,11 @@ def test_investigate_returns_context_error(investigator):
 
 def test_investigate_executes_tool_then_submits_findings(investigator):
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
-    investigator.tools.query_prometheus = MagicMock(return_value={"status": "success", "data": [1]})
+    # Mock the async adapters directly - use AsyncMock for async methods
+    from unittest.mock import AsyncMock
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": [1]}
+    )
     investigator.tools.submit_findings = MagicMock(return_value={"status": "success"})
     investigator.llm.chat_completion = MagicMock(
         side_effect=[
@@ -148,7 +152,7 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     findings = investigator.investigate("inc")
 
     assert findings[0].type is EvidenceType.FACT
-    investigator.tools.query_prometheus.assert_called_once_with("up", "s", "e")
+    investigator.tools._prometheus_adapter.query_range.assert_called_once_with("up", "s", "e")
     assert investigator.llm.chat_completion.call_count == 2
 
 
