@@ -5,7 +5,8 @@ import os
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+import psycopg2
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
 
@@ -140,6 +141,93 @@ async def investigate(incident_id: str):
         "incident_id": incident_id,
         "findings": [f.to_dict() for f in findings],
         "completed": True,
+    }
+
+
+async def _verify_service_token(x_service_token: str | None = Header(None)) -> str:
+    """Verify the service token for internal mutation endpoints."""
+    expected_token = os.getenv("PAMAWAS_SERVICE_TOKEN", "")
+    if not expected_token:
+        log.error("service_token_not_configured")
+        raise HTTPException(status_code=503, detail="Service token not configured")
+    if not x_service_token or x_service_token != expected_token:
+        log.warning("service_token_invalid")
+        raise HTTPException(status_code=401, detail="Invalid service token")
+    return x_service_token
+
+
+@app.post("/v1/investigations")
+async def create_investigation(
+    contract_version: int,
+    incident_id: str,
+    reason: str,
+    correlation_version: int,
+    x_service_token: str | None = Header(None),
+):
+    """Create an investigation run (idempotent on request_key_hash)."""
+    # Verify service token
+    await _verify_service_token(x_service_token)
+
+    if investigator is None:
+        return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
+
+    # Generate deterministic request key hash
+    import hashlib
+    request_key = f"{incident_id}:{reason}:{correlation_version}"
+    request_key_hash = hashlib.sha256(request_key.encode()).hexdigest()
+
+    # Check if investigation run already exists (idempotency)
+    if investigator.persistence:
+        existing_run_id = None
+        existing_status = None
+        try:
+            conn = investigator.persistence._get_connection()
+            with conn.cursor() as cursor:
+                query = (
+                    "SELECT id, status FROM investigation_runs "
+                    "WHERE incident_id = %s AND request_key_hash = %s"
+                )
+                cursor.execute(query, (incident_id, request_key_hash))
+                existing = cursor.fetchone()
+                if existing:
+                    existing_run_id, existing_status = existing
+        except (psycopg2.Error, RuntimeError) as e:
+            log.error("failed_to_check_existing_run", error=str(e))
+            return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+        if existing_run_id:
+            # Run already exists - return conflict per contract
+            log.info(
+                "investigation_already_exists",
+                incident_id=incident_id,
+                run_id=existing_run_id,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": "Investigation already exists",
+                    "request_id": f"req_{request_key_hash[:26]}",
+                    "data": {
+                        "run_id": existing_run_id,
+                        "incident_id": incident_id,
+                        "status": existing_status or "unknown",
+                    },
+                },
+            )
+
+    # Run investigation asynchronously
+    log.info("investigation_started", incident_id=incident_id, reason=reason)
+    investigator.investigate(incident_id, request_key_hash=request_key_hash)
+
+    run_id = f"irun_{request_key_hash[:26]}"
+
+    return {
+        "request_id": f"req_{request_key_hash[:26]}",
+        "data": {
+            "run_id": run_id,
+            "incident_id": incident_id,
+            "status": "completed"
+        }
     }
 
 

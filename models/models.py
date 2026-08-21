@@ -86,3 +86,4 @@ class InvestigationState:
     max_tool_calls: int = 6
     completed: bool = False
     error: str | None = None
+    request_key_hash: str | None = None

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+from datetime import UTC, datetime
 
 import psycopg2
 from openai import OpenAI
@@ -17,6 +18,7 @@ from models import (
     InvestigationState,
     ToolResult,
 )
+from service.persistence import InvestigationPersistence
 from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,7 @@ class PamawasInvestigator:
         self.llm = InvestigatorLLM(config)
         self.tools = InvestigatorTools(config)
         self.db_conn = None
+        self.persistence = None
         self._connect_db()
 
     def _connect_db(self):
@@ -72,6 +75,7 @@ class PamawasInvestigator:
 
         try:
             self.db_conn = psycopg2.connect(self.config.database_url)
+            self.persistence = InvestigationPersistence(self.config.database_url)
             logger.info("Connected to database")
         except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to connect to database: {e}")
@@ -169,7 +173,9 @@ class PamawasInvestigator:
         half = (limit - marker_len) // 2
         return text[:half] + marker + text[-half:]
 
-    async def investigate_async(self, incident_id: str) -> list[Finding]:
+    async def investigate_async(
+        self, incident_id: str, request_key_hash: str = ""
+    ) -> list[Finding]:
         """Main investigation loop with bounded tool-calling (async version)."""
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
@@ -190,7 +196,8 @@ class PamawasInvestigator:
             incident_id=incident_id,
             findings=[],
             tool_calls=[],
-            max_tool_calls=self.config.max_tool_calls
+            max_tool_calls=self.config.max_tool_calls,
+            request_key_hash=request_key_hash,
         )
 
         # System prompt that guides the investigator
@@ -313,6 +320,21 @@ class PamawasInvestigator:
                             logger.info("Investigation completed via submit_findings")
                             state.findings = findings
                             state.completed = True
+
+                            # Persist investigation run, tool executions, and evidence
+                            if self.persistence:
+                                await self._persist_investigation(
+                                    incident_id=incident_id,
+                                    request_key_hash=request_key_hash,
+                                    findings=findings,
+                                    tool_calls=state.tool_calls,
+                                    model_provider=self.config.llm_base_url,
+                                    model_name=self.config.llm_model,
+                                    prompt_version="pamawas-investigator-v1",
+                                    tool_contract=1,
+                                    max_tool_calls=self.config.max_tool_calls,
+                                )
+
                             return findings
                         else:
                             result = {"error": f"Unknown tool: {function_name}"}
@@ -412,7 +434,81 @@ class PamawasInvestigator:
 
         return state.findings
 
-    def investigate(self, incident_id: str) -> list[Finding]:
+    async def _persist_investigation(
+        self,
+        incident_id: str,
+        request_key_hash: str,
+        findings: list[Finding],
+        tool_calls: list[ToolResult],
+        model_provider: str,
+        model_name: str,
+        prompt_version: str,
+        tool_contract: int,
+        max_tool_calls: int,
+    ):
+        """Persist investigation run, tool executions, and evidence in a transaction."""
+        if not self.persistence:
+            logger.warning("No persistence layer available, skipping investigation persistence")
+            return
+
+        try:
+            # Create or get investigation run
+            run_id, created_new = self.persistence.create_investigation_run(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                model_provider=model_provider,
+                model_name=model_name,
+                prompt_version=prompt_version,
+                tool_contract=tool_contract,
+                max_tool_calls=max_tool_calls,
+            )
+
+            # Update status to running
+            self.persistence.update_run_status(run_id, "running")
+
+            # Insert tool executions
+            for i, tool_call in enumerate(tool_calls):
+                self.persistence.insert_tool_execution(
+                    run_id=run_id,
+                    sequence_no=i,
+                    tool_name=tool_call.tool_name,
+                    arguments=tool_call.arguments,
+                    result=tool_call.result,
+                    status="completed",
+                    duration_ms=int(tool_call.duration_ms),
+                )
+
+            # Insert evidence
+            self.persistence.insert_evidence(
+                incident_id=incident_id,
+                run_id=run_id,
+                findings=findings,
+            )
+
+            # Mark run as completed
+            self.persistence.update_run_status(
+                run_id=run_id,
+                status="completed",
+                completed_at=datetime.now(UTC),
+            )
+
+            logger.info(f"Persisted investigation run {run_id} with {len(findings)} findings")
+
+        except Exception as e:
+            logger.error(f"Failed to persist investigation: {e}")
+            # Try to mark run as failed
+            if 'run_id' in locals():
+                try:
+                    self.persistence.update_run_status(
+                        run_id=run_id,
+                        status="failed_terminal",
+                        safe_error_code="PERSISTENCE_ERROR",
+                    )
+                except (psycopg2.Error, RuntimeError):
+                    pass
+            raise
+
+    def investigate(self, incident_id: str, request_key_hash: str = "") -> list[Finding]:
         """Sync wrapper for investigate_async."""
         try:
             loop = asyncio.get_running_loop()
@@ -420,4 +516,4 @@ class PamawasInvestigator:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
 
-        return loop.run_until_complete(self.investigate_async(incident_id))
+        return loop.run_until_complete(self.investigate_async(incident_id, request_key_hash))
