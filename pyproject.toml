@@ -57,6 +57,7 @@ select = [
     "RUF", # ruff-specific
     "N",   # ruff-specific naming
     "EXE", # executable files
+    "C",   # mccabe cyclomatic complexity (C901)
 ]
 ignore = [
     "N999",  # Invalid module name (hyphen in package name)
