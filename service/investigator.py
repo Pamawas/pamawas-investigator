@@ -1,6 +1,5 @@
 """Main Investigator Service."""
 
-import asyncio
 import json
 import logging
 import time
@@ -173,35 +172,9 @@ class PamawasInvestigator:
         half = (limit - marker_len) // 2
         return text[:half] + marker + text[-half:]
 
-    async def investigate_async(
-        self, incident_id: str, request_key_hash: str = ""
-    ) -> list[Finding]:
-        """Main investigation loop with bounded tool-calling (async version)."""
-        logger.info(f"Starting investigation for incident {incident_id}")
-        increment_investigations()
-
-        # Get incident context
-        context = self._get_incident_context(incident_id)
-        if hasattr(context, 'error') and context.error:
-            logger.error(f"Failed to get incident context: {context.error}")
-            return [Finding(
-                type=EvidenceType.UNKNOWN,
-                content=f"Failed to load incident context: {context.error}",
-                source="investigator",
-                confidence=0.0
-            )]
-
-        # Initialize investigation state
-        state = InvestigationState(
-            incident_id=incident_id,
-            findings=[],
-            tool_calls=[],
-            max_tool_calls=self.config.max_tool_calls,
-            request_key_hash=request_key_hash,
-        )
-
-        # System prompt that guides the investigator
-        system_prompt = (
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt for the investigator."""
+        return (
             "You are an expert infrastructure incident investigator. Your goal is to:\n"
             "1. Understand the symptom and blast radius\n"
             "2. Find the first abnormal signal, not just the loudest alert\n"
@@ -226,23 +199,206 @@ class PamawasInvestigator:
             "Always provide confidence scores (0.0 to 1.0) for your findings."
         )
 
-        # Initial message with incident context
+    def _build_initial_message(self, context: IncidentContext) -> dict:
+        """Build the initial user message with incident context."""
+        return {
+            "role": "user",
+            "content": (
+                f"Investigate this incident:\n\n"
+                f"Incident ID: {context.incident_id}\n"
+                f"Title: {context.title}\n"
+                f"Status: {context.status}\n"
+                f"Started at: {context.started_at}\n"
+                f"Severity: {context.severity}\n"
+                f"Affected services: {', '.join(context.affected_services or [])}\n\n"
+                f"Events in this incident:\n"
+                f"{json.dumps(context.events, indent=2)[:self.config.truncation_limit]}\n\n"
+                "Begin your investigation by understanding what happened. Use your "
+                "tools to gather evidence and form hypotheses."
+            )
+        }
+
+    def _handle_error_context(self, context: IncidentContext) -> list[Finding]:
+        """Handle error context and return error finding."""
+        logger.error(f"Failed to get incident context: {context.error}")
+        return [Finding(
+            type=EvidenceType.UNKNOWN,
+            content=f"Failed to load incident context: {context.error}",
+            source="investigator",
+            confidence=0.0
+        )]
+
+    async def _execute_tool(self, function_name: str, function_args: dict):
+        """Execute a tool call and return the result."""
+        if function_name == "query_prometheus":
+            return await self.tools._prometheus_adapter.query_range(
+                function_args["promql"],
+                function_args["start"],
+                function_args["end"]
+            )
+        elif function_name == "query_loki":
+            return await self.tools._loki_adapter.query_range(
+                function_args["logql"],
+                function_args["start"],
+                function_args["end"],
+                function_args.get("limit", 100)
+            )
+        elif function_name == "get_recent_deployments":
+            return await self.tools._deployment_adapter.get_recent_deployments(
+                function_args["service"],
+                function_args["start"],
+                function_args["end"]
+            )
+        elif function_name == "get_related_incidents":
+            return await self.tools._related_incidents_adapter.find_related(
+                function_args["service"],
+                function_args["symptom_keywords"]
+            )
+        elif function_name == "submit_findings":
+            findings = [
+                Finding(
+                    type=EvidenceType(f["type"]),
+                    content=f["content"],
+                    source=f["source"],
+                    confidence=f["confidence"]
+                )
+                for f in function_args["findings"]
+            ]
+            result = self.tools.submit_findings(findings)
+            return result, findings, True  # result, findings, is_final
+        else:
+            return {"error": f"Unknown tool: {function_name}"}, None, False
+
+    def _truncate_result(self, result: any) -> str:
+        """Truncate result if too large."""
+        result_str = json.dumps(result)
+        if len(result_str) > self.config.truncation_limit:
+            result_str = self._truncate_context(result_str, self.config.truncation_limit)
+            result = {"truncated": result_str}
+        return result_str
+
+    def _handle_tool_result(
+        self,
+        tool_call,
+        function_name: str,
+        result: any,
+        tool_start: float,
+        state: InvestigationState,
+        messages: list[dict]
+    ):
+        """Process tool result and update state."""
+        result_str = self._truncate_result(result)
+
+        # Add tool result to conversation
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_call.id,
+            "content": result_str
+        })
+
+        state.tool_calls.append(ToolResult(
+            tool_name=function_name,
+            arguments=json.loads(tool_call.function.arguments),
+            result=result,
+            duration_ms=(time.time() - tool_start) * 1000
+        ))
+
+        state.tool_call_count += 1
+
+    def _check_max_tools_reached(
+        self, state: InvestigationState, is_final_turn: bool, messages: list[dict]
+    ):
+        """Check if max tool calls reached and prompt for submission if needed."""
+        if state.tool_call_count >= state.max_tool_calls and not is_final_turn:
+            logger.info("Reached max tool calls, forcing findings submission")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "You have reached the maximum number of tool calls. "
+                    "Please submit your findings using the submit_findings tool."
+                )
+            })
+
+    def _handle_text_response(
+        self, response, state: InvestigationState, is_final_turn: bool, messages: list[dict]
+    ):
+        """Handle text response (no tool calls)."""
+        logger.info(f"LLM response (no tool calls): {response.content[:100]}...")
+        if not is_final_turn:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "Continue your investigation. Use your tools to gather more "
+                    "evidence, or submit your findings when ready."
+                )
+            })
+        else:
+            logger.warning(
+                "Final turn reached without tool use - extracting findings "
+                "from text"
+            )
+            state.findings.append(Finding(
+                type=EvidenceType.HYPOTHESIS,
+                content=response.content or "Investigation completed via text response",
+                source="llm_direct_response",
+                confidence=0.3
+            ))
+            state.completed = True
+
+    async def _handle_submit_findings(
+        self,
+        findings: list[Finding],
+        incident_id: str,
+        request_key_hash: str,
+        state: InvestigationState
+    ):
+        """Handle submit_findings tool call."""
+        logger.info("Investigation completed via submit_findings")
+        state.findings = findings
+        state.completed = True
+
+        if self.persistence:
+            await self._persist_investigation(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                findings=findings,
+                tool_calls=state.tool_calls,
+                model_provider=self.config.llm_base_url,
+                model_name=self.config.llm_model,
+                prompt_version="pamawas-investigator-v1",
+                tool_contract=1,
+                max_tool_calls=self.config.max_tool_calls,
+            )
+
+    async def investigate_async(
+        self, incident_id: str, request_key_hash: str = ""
+    ) -> list[Finding]:
+        """Main investigation loop with bounded tool-calling (async version)."""
+        logger.info(f"Starting investigation for incident {incident_id}")
+        increment_investigations()
+
+        # Get incident context
+        context = self._get_incident_context(incident_id)
+        if hasattr(context, 'error') and context.error:
+            return self._handle_error_context(context)
+
+        # Initialize investigation state
+        state = InvestigationState(
+            incident_id=incident_id,
+            findings=[],
+            tool_calls=[],
+            max_tool_calls=self.config.max_tool_calls,
+            request_key_hash=request_key_hash,
+        )
+
+        # Build system prompt and initial message
+        system_prompt = self._build_system_prompt()
+        initial_message = self._build_initial_message(context)
+
         messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": (
-                        f"Investigate this incident:\n\n"
-                        f"Incident ID: {context.incident_id}\n"
-                        f"Title: {context.title}\n"
-                        f"Status: {context.status}\n"
-                        f"Started at: {context.started_at}\n"
-                        f"Severity: {context.severity}\n"
-                        f"Affected services: {', '.join(context.affected_services or [])}\n\n"
-                        f"Events in this incident:\n"
-                        f"{json.dumps(context.events, indent=2)[:self.config.truncation_limit]}\n\n"
-                        "Begin your investigation by understanding what happened. Use your "
-                        "tools to gather evidence and form hypotheses."
-                    )}
-                ]
+            {"role": "system", "content": system_prompt},
+            initial_message
+        ]
 
         # Investigation loop
         while state.tool_call_count < state.max_tool_calls:
@@ -250,11 +406,8 @@ class PamawasInvestigator:
                 f"Investigation turn {state.tool_call_count + 1}/{state.max_tool_calls}"
             )
 
-            # Determine if this is the final turn (force submit_findings)
             is_final_turn = (state.tool_call_count == state.max_tool_calls - 1)
             tool_choice = "submit_findings" if is_final_turn else "auto"
-
-            # Get LLM response with available tools
             tools = ToolRegistry.get_tools()
 
             try:
@@ -278,137 +431,26 @@ class PamawasInvestigator:
                             f"Calling tool: {function_name} with args: {function_args}"
                         )
 
-                        # Execute the tool (async)
                         tool_start = time.time()
-                        if function_name == "query_prometheus":
-                            result = await self.tools._prometheus_adapter.query_range(
-                                function_args["promql"],
-                                function_args["start"],
-                                function_args["end"]
-                            )
-                        elif function_name == "query_loki":
-                            result = await self.tools._loki_adapter.query_range(
-                                function_args["logql"],
-                                function_args["start"],
-                                function_args["end"],
-                                function_args.get("limit", 100)
-                            )
-                        elif function_name == "get_recent_deployments":
-                            result = await self.tools._deployment_adapter.get_recent_deployments(
-                                function_args["service"],
-                                function_args["start"],
-                                function_args["end"]
-                            )
-                        elif function_name == "get_related_incidents":
-                            result = await self.tools._related_incidents_adapter.find_related(
-                                function_args["service"],
-                                function_args["symptom_keywords"]
-                            )
-                        elif function_name == "submit_findings":
-                            # Convert findings dicts back to Finding objects
-                            findings = [
-                                Finding(
-                                    type=EvidenceType(f["type"]),
-                                    content=f["content"],
-                                    source=f["source"],
-                                    confidence=f["confidence"]
-                                )
-                                for f in function_args["findings"]
-                            ]
-                            result = self.tools.submit_findings(findings)
-                            # This is the final call - we're done
-                            logger.info("Investigation completed via submit_findings")
-                            state.findings = findings
-                            state.completed = True
+                        result, findings, is_final = await self._execute_tool(
+                            function_name, function_args
+                        )
 
-                            # Persist investigation run, tool executions, and evidence
-                            if self.persistence:
-                                await self._persist_investigation(
-                                    incident_id=incident_id,
-                                    request_key_hash=request_key_hash,
-                                    findings=findings,
-                                    tool_calls=state.tool_calls,
-                                    model_provider=self.config.llm_base_url,
-                                    model_name=self.config.llm_model,
-                                    prompt_version="pamawas-investigator-v1",
-                                    tool_contract=1,
-                                    max_tool_calls=self.config.max_tool_calls,
-                                )
-
+                        if is_final:
+                            await self._handle_submit_findings(
+                                findings, incident_id, request_key_hash, state
+                            )
                             return findings
-                        else:
-                            result = {"error": f"Unknown tool: {function_name}"}
 
-                        # Truncate result if too large
-                        result_str = json.dumps(result)
-                        if len(result_str) > self.config.truncation_limit:
-                            result_str = self._truncate_context(
-                                result_str, self.config.truncation_limit
-                            )
-                            result = {"truncated": result_str}
+                        self._handle_tool_result(
+                            tool_call, function_name, result, tool_start, state, messages
+                        )
 
-                        # Add tool result to conversation
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result_str
-                        })
-
-                        state.tool_calls.append(ToolResult(
-                            tool_name=function_name,
-                            arguments=function_args,
-                            result=result,
-                            duration_ms=(time.time() - tool_start) * 1000
-                        ))
-
-                        state.tool_call_count += 1
-
-                        # If we've hit the limit and haven't submitted findings yet,
-                        # force a submission on the next turn
-                        if (
-                            state.tool_call_count >= state.max_tool_calls
-                            and not is_final_turn
-                        ):
-                            logger.info(
-                                "Reached max tool calls, forcing findings submission"
-                            )
-                            # Add a message prompting submission
-                            messages.append({
-                                "role": "user",
-                                "content": (
-                                    "You have reached the maximum number of tool calls. "
-                                    "Please submit your findings using the submit_findings tool."
-                                )
-                            })
+                        self._check_max_tools_reached(state, is_final_turn, messages)
 
                 else:
-                    # No tool calls, just text response
-                    logger.info(f"LLM response (no tool calls): {response.content[:100]}...")
-                    # Continue the conversation - the LLM might want to think more
-                    if not is_final_turn:
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "Continue your investigation. Use your tools to gather more "
-                                "evidence, or submit your findings when ready."
-                            )
-                        })
-                    else:
-                        # Final turn with no tool calls - we need to extract findings from
-                        # text
-                        # This is a fallback - in practice, the LLM should use submit_findings
-                        logger.warning(
-                            "Final turn reached without tool use - extracting findings "
-                            "from text"
-                        )
-                        # Create a simple finding from the response
-                        state.findings.append(Finding(
-                            type=EvidenceType.HYPOTHESIS,
-                            content=response.content or "Investigation completed via text response",
-                            source="llm_direct_response",
-                            confidence=0.3
-                        ))
-                        state.completed = True
+                    self._handle_text_response(response, state, is_final_turn, messages)
+                    if state.completed:
                         return state.findings
 
             except Exception as e:  # noqa: BLE001
@@ -494,26 +536,11 @@ class PamawasInvestigator:
 
             logger.info(f"Persisted investigation run {run_id} with {len(findings)} findings")
 
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.error(f"Failed to persist investigation: {e}")
             # Try to mark run as failed
             if 'run_id' in locals():
                 try:
-                    self.persistence.update_run_status(
-                        run_id=run_id,
-                        status="failed_terminal",
-                        safe_error_code="PERSISTENCE_ERROR",
-                    )
-                except (psycopg2.Error, RuntimeError):
+                    self.persistence.update_run_status(run_id, "failed")
+                except Exception:  # noqa: BLE001
                     pass
-            raise
-
-    def investigate(self, incident_id: str, request_key_hash: str = "") -> list[Finding]:
-        """Sync wrapper for investigate_async."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-        return loop.run_until_complete(self.investigate_async(incident_id, request_key_hash))
