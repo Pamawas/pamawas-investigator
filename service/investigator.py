@@ -231,29 +231,33 @@ class PamawasInvestigator:
     async def _execute_tool(self, function_name: str, function_args: dict):
         """Execute a tool call and return the result."""
         if function_name == "query_prometheus":
-            return await self.tools._prometheus_adapter.query_range(
+            result = await self.tools._prometheus_adapter.query_range(
                 function_args["promql"],
                 function_args["start"],
                 function_args["end"]
             )
+            return result, None, False
         elif function_name == "query_loki":
-            return await self.tools._loki_adapter.query_range(
+            result = await self.tools._loki_adapter.query_range(
                 function_args["logql"],
                 function_args["start"],
                 function_args["end"],
                 function_args.get("limit", 100)
             )
+            return result, None, False
         elif function_name == "get_recent_deployments":
-            return await self.tools._deployment_adapter.get_recent_deployments(
+            result = await self.tools._deployment_adapter.get_recent_deployments(
                 function_args["service"],
                 function_args["start"],
                 function_args["end"]
             )
+            return result, None, False
         elif function_name == "get_related_incidents":
-            return await self.tools._related_incidents_adapter.find_related(
+            result = await self.tools._related_incidents_adapter.find_related(
                 function_args["service"],
                 function_args["symptom_keywords"]
             )
+            return result, None, False
         elif function_name == "submit_findings":
             findings = [
                 Finding(
@@ -544,3 +548,23 @@ class PamawasInvestigator:
                     self.persistence.update_run_status(run_id, "failed")
                 except Exception:  # noqa: BLE001
                     pass
+
+    def investigate(self, incident_id: str, request_key_hash: str = "") -> list[Finding]:
+        """Synchronous wrapper for investigate_async (backwards compatibility)."""
+        import asyncio
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # If we're already in an async context, we can't use run_until_complete
+            # This shouldn't happen in tests, but just in case
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(asyncio.run, self.investigate_async(incident_id, request_key_hash))
+                return future.result()
+        else:
+            return asyncio.run(self.investigate_async(incident_id, request_key_hash))

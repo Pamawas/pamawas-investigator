@@ -242,10 +242,10 @@ class TestSystemPrompt:
     """Test system prompt content"""
 
     def test_system_prompt_contains_key_instructions(self):
-        # This is a documentation test - the system prompt is in the investigate method
+        # This is a documentation test - the system prompt is in the _build_system_prompt method
         # We verify the key instructions are present by checking the source
         import inspect
-        source = inspect.getsource(PamawasInvestigator.investigate_async)
+        source = inspect.getsource(PamawasInvestigator._build_system_prompt)
 
         assert "Understand the symptom and blast radius" in source
         assert "Find the first abnormal signal" in source
