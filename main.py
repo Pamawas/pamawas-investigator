@@ -4,6 +4,7 @@
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException
@@ -18,6 +19,53 @@ from service.investigator import PamawasInvestigator
 
 # Configure structured logging
 log = get_logger()
+VERSION_FILE = Path(__file__).with_name("version.txt")
+
+
+def get_app_version() -> str:
+    version = os.getenv("APP_VERSION")
+    if version:
+        return version
+    if VERSION_FILE.is_file():
+        return VERSION_FILE.read_text(encoding="utf-8").strip() or "1.0.0"
+    return "1.0.0"
+
+
+APP_VERSION = get_app_version()
+
+
+def print_startup_banner(version: str, port: int) -> None:
+    font = {
+        "a": (".#.", "#.#", "###", "#.#", "#.#"),
+        "c": ("###", "#..", "#..", "#..", "###"),
+        "d": ("##.", "#.#", "#.#", "#.#", "##."),
+        "e": ("###", "#..", "##.", "#..", "###"),
+        "g": ("###", "#..", "#.#", "###", "..#"),
+        "h": ("#.#", "#.#", "###", "#.#", "#.#"),
+        "i": ("###", ".#.", ".#.", ".#.", "###"),
+        "l": ("#..", "#..", "#..", "#..", "###"),
+        "m": ("#.#", "###", "###", "#.#", "#.#"),
+        "n": ("##.", "#.#", "#.#", "#.#", "#.#"),
+        "o": ("###", "#.#", "#.#", "#.#", "###"),
+        "p": ("##.", "#.#", "##.", "#..", "#.."),
+        "r": ("##.", "#.#", "##.", "#.#", "#.#"),
+        "s": ("###", "#..", "###", "..#", "###"),
+        "t": ("###", ".#.", ".#.", ".#.", ".#."),
+        "u": ("#.#", "#.#", "#.#", "#.#", "###"),
+        "v": ("#.#", "#.#", "#.#", "#.#", ".#."),
+        "w": ("#.#", "#.#", "###", "###", "#.#"),
+        "-": ("...", "...", "###", "...", "..."),
+        " ": ("   ", "   ", "   ", "   ", "   "),
+    }
+    rows = ["", "", "", "", ""]
+    for char in "Pamawas Investigator".lower():
+        glyph = font.get(char)
+        if glyph:
+            for index in range(5):
+                rows[index] += glyph[index] + " "
+    banner = "\n".join(rows)
+    print(f"\033[1;36m{banner}\033[0m\nVersion: {version} | Port: :{port}\n")
+
 
 # Global investigator instance
 investigator: PamawasInvestigator = None
@@ -44,9 +92,12 @@ async def lifespan(app: FastAPI):
 
     try:
         config = InvestigationConfig.from_env()
-        # Use version from env (set at build time) or default
-        version = os.getenv("APP_VERSION", "1.0.0")
-        log.info("config_loaded", llm_model=config.llm_model, llm_base_url=config.llm_base_url, version=version)
+        log.info(
+            "config_loaded",
+            llm_model=config.llm_model,
+            llm_base_url=config.llm_base_url,
+            version=APP_VERSION,
+        )
 
         investigator = PamawasInvestigator(config)
         set_running(True)
@@ -70,7 +121,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pamawas Investigator",
     description="Bounded tool-calling LLM investigation engine for infrastructure incidents",
-    version=os.getenv("APP_VERSION", "1.0.0"),
+    version=APP_VERSION,
     lifespan=lifespan,
 )
 
@@ -242,7 +293,7 @@ async def status():
     return {
         "running": True,
         "uptime_seconds": time.time() - start_time,
-        "version": "1.0.0",
+        "version": APP_VERSION,
     }
 
 
@@ -251,6 +302,7 @@ def main():
     import uvicorn
 
     config = InvestigationConfig.from_env()
+    print_startup_banner(APP_VERSION, config.port)
     log.info("starting_server", port=config.port)
 
     uvicorn.run(

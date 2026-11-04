@@ -1,17 +1,21 @@
-# Use the official Python image to build the application
+# syntax=docker/dockerfile:1
 FROM python:3.14-slim AS builder
 
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --disable-pip-version-check -r requirements.txt
 
 COPY . .
 
-ARG APP_VERSION=dev
-ENV APP_VERSION=${APP_VERSION}
+ARG VERSION=""
+RUN if [ -n "$VERSION" ]; then printf '%s\n' "$VERSION" > /app/version.txt; elif [ ! -f /app/version.txt ]; then printf 'dev-unknown\n' > /app/version.txt; fi
 
 FROM python:3.14-slim
+
+ARG VERSION=""
+ENV APP_VERSION=${VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
