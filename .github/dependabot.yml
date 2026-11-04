@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "daily"
+      time: "04:00"
+    target-branch: "dev"
+    groups:
+      go-dependencies:
+        patterns:
+          - "*"
+    allow:
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    commit-message:
+      prefix: "chore(deps)"
+    rebase-strategy: "disabled"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "04:00"
+    target-branch: "dev"
+    allow:
+      - dependency-type: "direct"
+      - dependency-type: "indirect"
+    commit-message:
+      prefix: "chore(deps)"
