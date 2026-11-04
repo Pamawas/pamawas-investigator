@@ -43,9 +43,15 @@ class Config:
         if not database_url:
             raise ValueError("DATABASE_URL environment variable not set")
 
+        # Kubernetes injects PAMAWAS_INVESTIGATOR_PORT=tcp://IP:PORT, avoid it
+        port_str = os.getenv("PORT", "8080")
+        # Strip any tcp:// prefix if injected by Kubernetes
+        if port_str.startswith("tcp://"):
+            port_str = port_str.split(":")[-1]
+
         return cls(
             database_url=database_url,
-            port=int(os.getenv("PORT", "8080")),
+            port=int(port_str),
             llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
             llm_api_key=os.getenv("LLM_API_KEY", ""),
             llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
