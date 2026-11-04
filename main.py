@@ -75,9 +75,9 @@ app = FastAPI(
 # Add structured logging middleware
 app.add_middleware(LoggingMiddleware, service_name="pamawas-investigator")
 
-# Mount Prometheus metrics endpoint
+# Mount Prometheus metrics endpoint under /api/v1
 metrics_app = make_asgi_app()
-app.mount("/metrics", metrics_app)
+app.mount("/api/v1/metrics", metrics_app)
 
 
 @app.get("/healthz")
@@ -128,7 +128,7 @@ async def ready():
         return JSONResponse(status_code=503, content={"status": "not ready", "error": str(e)})
 
 
-@app.post("/investigate")
+@app.post("/api/v1/investigate")
 async def investigate(incident_id: str):
     """Trigger investigation for an incident."""
     if investigator is None:
@@ -156,7 +156,7 @@ async def _verify_service_token(x_service_token: str | None = Header(None)) -> s
     return x_service_token
 
 
-@app.post("/v1/investigations")
+@app.post("/api/v1/investigations")
 async def create_investigation(
     contract_version: int,
     incident_id: str,
@@ -231,7 +231,7 @@ async def create_investigation(
     }
 
 
-@app.get("/status")
+@app.get("/api/v1/status")
 async def status():
     """Status endpoint."""
     if investigator is None:
