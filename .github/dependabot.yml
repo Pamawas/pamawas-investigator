@@ -10,10 +10,15 @@ updates:
       go-dependencies:
         patterns:
           - "*"
-    ignore:
-      - dependency-name: "*"
-        update-type: "version-update:semver-major"
-    auto-merge: true
+    allow:
+      - dependency-type: "direct"
+        update-types:
+          - "version-update:semver-patch"
+          - "version-update:semver-minor"
+      - dependency-type: "indirect"
+        update-types:
+          - "version-update:semver-patch"
+          - "version-update:semver-minor"
     commit-message:
       prefix: "chore(deps)"
     rebase-strategy: "disabled"
@@ -25,9 +30,14 @@ updates:
       day: "monday"
       time: "04:00"
     target-branch: "dev"
-    ignore:
-      - dependency-name: "*"
-        update-type: "version-update:semver-major"
-    auto-merge: true
+    allow:
+      - dependency-type: "direct"
+        update-types:
+          - "version-update:semver-patch"
+          - "version-update:semver-minor"
+      - dependency-type: "indirect"
+        update-types:
+          - "version-update:semver-patch"
+          - "version-update:semver-minor"
     commit-message:
       prefix: "chore(deps)"
