@@ -126,9 +126,8 @@ app = FastAPI(
 # Add structured logging middleware
 app.add_middleware(LoggingMiddleware, service_name="pamawas-investigator")
 
-# Mount Prometheus metrics endpoint under /api/v1
 metrics_app = make_asgi_app()
-app.mount("/api/v1/metrics", metrics_app)
+app.mount("/metrics", metrics_app)
 
 
 @app.get("/healthz")
