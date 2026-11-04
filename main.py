@@ -44,7 +44,9 @@ async def lifespan(app: FastAPI):
 
     try:
         config = InvestigationConfig.from_env()
-        log.info("config_loaded", llm_model=config.llm_model, llm_base_url=config.llm_base_url)
+        # Use version from env (set at build time) or default
+        version = os.getenv("APP_VERSION", "1.0.0")
+        log.info("config_loaded", llm_model=config.llm_model, llm_base_url=config.llm_base_url, version=version)
 
         investigator = PamawasInvestigator(config)
         set_running(True)
@@ -68,7 +70,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Pamawas Investigator",
     description="Bounded tool-calling LLM investigation engine for infrastructure incidents",
-    version="1.0.0",
+    version=os.getenv("APP_VERSION", "1.0.0"),
     lifespan=lifespan,
 )
 

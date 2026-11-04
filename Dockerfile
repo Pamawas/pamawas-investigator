@@ -8,6 +8,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+ARG APP_VERSION=dev
+ENV APP_VERSION=${APP_VERSION}
+
 FROM python:3.14-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
