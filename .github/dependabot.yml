@@ -10,9 +10,10 @@ updates:
       go-dependencies:
         patterns:
           - "*"
-    allow:
-      - dependency-type: "direct"
-      - dependency-type: "indirect"
+    ignore:
+      - dependency-name: "*"
+        update-type: "version-update:semver-major"
+    auto-merge: true
     commit-message:
       prefix: "chore(deps)"
     rebase-strategy: "disabled"
@@ -24,8 +25,9 @@ updates:
       day: "monday"
       time: "04:00"
     target-branch: "dev"
-    allow:
-      - dependency-type: "direct"
-      - dependency-type: "indirect"
+    ignore:
+      - dependency-name: "*"
+        update-type: "version-update:semver-major"
+    auto-merge: true
     commit-message:
       prefix: "chore(deps)"
