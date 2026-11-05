@@ -10,6 +10,7 @@ import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from prometheus_client import make_asgi_app
+from pydantic import BaseModel
 
 from config import Config as InvestigationConfig
 from logging_middleware import LoggingMiddleware, get_logger
@@ -179,6 +180,15 @@ async def investigate(incident_id: str):
     }
 
 
+class InvestigationRequest(BaseModel):
+    """Typed request body for POST /api/v1/investigations (frozen v1 contract)."""
+
+    contract_version: int
+    incident_id: str
+    reason: str
+    correlation_version: int
+
+
 async def _verify_service_token(x_service_token: str | None = Header(None)) -> str:
     """Verify the service token for internal mutation endpoints."""
     expected_token = os.getenv("PAMAWAS_SERVICE_TOKEN", "")
@@ -193,10 +203,7 @@ async def _verify_service_token(x_service_token: str | None = Header(None)) -> s
 
 @app.post("/api/v1/investigations")
 async def create_investigation(
-    contract_version: int,
-    incident_id: str,
-    reason: str,
-    correlation_version: int,
+    request: InvestigationRequest,
     x_service_token: str | None = Header(None),
 ):
     """Create an investigation run (idempotent on request_key_hash)."""
@@ -205,6 +212,11 @@ async def create_investigation(
 
     if investigator is None:
         return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
+
+    contract_version = request.contract_version
+    incident_id = request.incident_id
+    reason = request.reason
+    correlation_version = request.correlation_version
 
     # Generate deterministic request key hash
     import hashlib

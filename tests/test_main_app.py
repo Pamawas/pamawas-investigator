@@ -68,7 +68,7 @@ def test_investigate_endpoint_serializes_findings():
     service.investigate.return_value = [Finding(EvidenceType.FACT, "observed", "metrics", 0.9)]
     service.db_conn = MagicMock()
     with client_with(service) as client:
-        response = client.post("/investigate", params={"incident_id": "inc-1"})
+        response = client.post("/api/v1/investigate", params={"incident_id": "inc-1"})
     assert response.status_code == 200
     assert response.json() == {
         "incident_id": "inc-1",
@@ -84,7 +84,7 @@ def test_status_reports_uptime(monkeypatch):
     monkeypatch.setattr(main, "start_time", 100.0)
     monkeypatch.setattr(main.time, "time", lambda: 112.5)
     with client_with(SimpleNamespace()) as client:
-        assert client.get("/status").json() == {
+        assert client.get("/api/v1/status").json() == {
             "running": True,
             "uptime_seconds": 12.5,
             "version": "1.0.0",
@@ -120,7 +120,7 @@ def test_main_runs_uvicorn_with_config(config):
 
 
 def test_create_investigation_requires_service_token():
-    """Test that /v1/investigations requires valid service token."""
+    """Test that /api/v1/investigations requires valid service token."""
     import os
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
@@ -130,8 +130,8 @@ def test_create_investigation_requires_service_token():
     with client_with(service) as client:
         # No token
         response = client.post(
-            "/v1/investigations",
-            params={
+            "/api/v1/investigations",
+            json={
                 "contract_version": 1,
                 "incident_id": "inc-1",
                 "reason": "incident_created",
@@ -143,8 +143,8 @@ def test_create_investigation_requires_service_token():
 
         # Invalid token
         response = client.post(
-            "/v1/investigations",
-            params={
+            "/api/v1/investigations",
+            json={
                 "contract_version": 1,
                 "incident_id": "inc-1",
                 "reason": "incident_created",
@@ -156,15 +156,15 @@ def test_create_investigation_requires_service_token():
 
 
 def test_create_investigation_token_not_configured(monkeypatch):
-    """Test that /v1/investigations returns 503 when token not configured."""
+    """Test that /api/v1/investigations returns 503 when token not configured."""
     monkeypatch.delenv("PAMAWAS_SERVICE_TOKEN", raising=False)
     service = MagicMock()
     service.persistence = None
     service.db_conn = MagicMock()
     with client_with(service) as client:
         response = client.post(
-            "/v1/investigations",
-            params={
+            "/api/v1/investigations",
+            json={
                 "contract_version": 1,
                 "incident_id": "inc-1",
                 "reason": "incident_created",
@@ -196,8 +196,8 @@ def test_create_investigation_idempotent_returns_409():
 
     with client_with(service) as client:
         response = client.post(
-            "/v1/investigations",
-            params={
+            "/api/v1/investigations",
+            json={
                 "contract_version": 1,
                 "incident_id": "inc-1",
                 "reason": "incident_created",
@@ -239,8 +239,8 @@ def test_create_investigation_success():
 
     with client_with(service) as client:
         response = client.post(
-            "/v1/investigations",
-            params={
+            "/api/v1/investigations",
+            json={
                 "contract_version": 1,
                 "incident_id": "inc-1",
                 "reason": "incident_created",
