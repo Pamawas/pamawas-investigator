@@ -564,7 +564,9 @@ class PamawasInvestigator:
             import concurrent.futures
 
             with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, self.investigate_async(incident_id, request_key_hash))
+                future = pool.submit(
+                    asyncio.run, self.investigate_async(incident_id, request_key_hash)
+                )
                 return future.result()
         else:
             return asyncio.run(self.investigate_async(incident_id, request_key_hash))
