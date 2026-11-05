@@ -46,7 +46,7 @@ def print_startup_banner(version: str, port: int) -> None:
   | |   |  \| |  \ \  / /  | |__    \___ \     | |      | |   | |  __    / /\ \      | |    | | | | | |__) |
   | |   | |\  |   \ \/ /   |  __|    ___) |    | |      | |   | | |_ |  / ____ \     | |    | |_| | |  _  /
  _| |_  |_| \_|    \__/    |______| |____/     |_|     _| |_   \_____| /_/    \_\    |_|     \___/  |_| \_\
-""".rstrip("\n")
+""".rstrip("\n")  # noqa: E501
     print(f"\033[1;36m{banner}\n{service_art}\033[0m\nVersion: {version} | Port: :{port}\n")
 
 
@@ -212,7 +212,7 @@ async def create_investigation(
     if investigator is None:
         return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
-    contract_version = request.contract_version
+    # contract_version = request.contract_version  # not used in v1 contract
     incident_id = request.incident_id
     reason = request.reason
     correlation_version = request.correlation_version
