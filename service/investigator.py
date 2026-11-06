@@ -458,7 +458,14 @@ class PamawasInvestigator:
                     if state.completed:
                         return state.findings
 
-            except (openai.OpenAIError, RuntimeError, ValueError, KeyError, TypeError, TimeoutError) as e:
+            except (
+                openai.OpenAIError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                TimeoutError,
+            ) as e:
                 logger.error("Error in investigation loop: %s", e)
                 state.findings.append(Finding(
                     type=EvidenceType.UNKNOWN,
