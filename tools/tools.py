@@ -6,13 +6,17 @@ from typing import Any
 
 from adapters import (
     DeploymentAdapter,
+    DeploymentAdapterError,
     DeploymentConfig,
     LokiAdapter,
     LokiConfig,
+    LokiError,
     PrometheusAdapter,
     PrometheusConfig,
+    PrometheusError,
     RelatedIncidentsAdapter,
     RelatedIncidentsConfig,
+    RelatedIncidentsError,
 )
 from config import Config as InvestigationConfig
 from metrics import increment_tool_calls, observe_tool_call_duration
@@ -97,7 +101,7 @@ class InvestigatorTools:
             increment_tool_calls("prometheus", "success")
             return result
 
-        except Exception as e:  # noqa: BLE001
+        except PrometheusError as e:
             duration = time.time() - start_time
             observe_tool_call_duration("prometheus", duration)
             increment_tool_calls("prometheus", "error")
@@ -130,7 +134,7 @@ class InvestigatorTools:
             increment_tool_calls("loki", "success")
             return result
 
-        except Exception as e:  # noqa: BLE001
+        except LokiError as e:
             duration = time.time() - start_time
             observe_tool_call_duration("loki", duration)
             increment_tool_calls("loki", "error")
@@ -165,7 +169,7 @@ class InvestigatorTools:
             )
             return result
 
-        except Exception as e:  # noqa: BLE001
+        except DeploymentAdapterError as e:
             duration = time.time() - start_time
             observe_tool_call_duration("deployments", duration)
             increment_tool_calls("deployments", "error")
@@ -200,7 +204,7 @@ class InvestigatorTools:
             increment_tool_calls("related_incidents", "success")
             return result
 
-        except Exception as e:  # noqa: BLE001
+        except RelatedIncidentsError as e:
             duration = time.time() - start_time
             observe_tool_call_duration("related_incidents", duration)
             increment_tool_calls("related_incidents", "error")
@@ -223,7 +227,7 @@ class InvestigatorTools:
             observe_tool_call_duration("submit_findings", duration)
             increment_tool_calls("submit_findings", "success")
             return result
-        except Exception as e:  # noqa: BLE001
+        except (ValueError, TypeError, KeyError) as e:
             duration = time.time() - start_time
             observe_tool_call_duration("submit_findings", duration)
             increment_tool_calls("submit_findings", "error")

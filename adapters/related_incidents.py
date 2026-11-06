@@ -196,7 +196,7 @@ class RelatedIncidentsAdapter:
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents query failed: %s", e)
             raise RelatedIncidentsError(f"Database query failed: {e}")
-        except Exception as e:  # noqa: BLE001
+        except (KeyError, ValueError, TypeError) as e:
             observe_tool_call_duration("related_incidents", time.time() - start_time)
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents query failed: %s", e)
@@ -310,7 +310,7 @@ class RelatedIncidentsAdapter:
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents time-range query failed: %s", e)
             raise RelatedIncidentsError(f"Database query failed: {e}")
-        except Exception as e:  # noqa: BLE001
+        except (KeyError, ValueError, TypeError) as e:
             observe_tool_call_duration(
                 "related_incidents", time.time() - query_start
             )

@@ -236,7 +236,7 @@ class PrometheusAdapter:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             raise
-        except Exception as e:  # noqa: BLE001
+        except (ValueError, KeyError, UnicodeDecodeError) as e:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus query failed: %s", e)
@@ -304,7 +304,7 @@ class PrometheusAdapter:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             raise
-        except Exception as e:  # noqa: BLE001
+        except (ValueError, KeyError, UnicodeDecodeError) as e:
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus instant query failed: %s", e)

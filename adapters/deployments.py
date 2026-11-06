@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import httpx
+
 from metrics import increment_tool_calls, observe_tool_call_duration
 
 logger = logging.getLogger(__name__)
@@ -152,7 +154,7 @@ class DeploymentAdapter:
                 "data": data,
             }
 
-        except Exception as e:  # noqa: BLE001
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "error")
             logger.error("Deployment query failed: %s", e)
@@ -197,7 +199,7 @@ class DeploymentAdapter:
                 "data": response.json(),
             }
 
-        except Exception as e:  # noqa: BLE001
+        except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
             logger.error("Deployment version query failed: %s", e)
             return {
                 "status": "error",

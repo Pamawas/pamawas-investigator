@@ -76,8 +76,8 @@ class PamawasInvestigator:
             self.db_conn = psycopg2.connect(self.config.database_url)
             self.persistence = InvestigationPersistence(self.config.database_url)
             logger.info("Connected to database")
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to connect to database: {e}")
+        except psycopg2.Error as e:
+            logger.error("Failed to connect to database: %s", e)
             increment_db_errors()
             self.db_conn = None
 
@@ -152,8 +152,8 @@ class PamawasInvestigator:
                         for e in events
                     ]
                 )
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to get incident context: {e}")
+        except psycopg2.Error as e:
+            logger.error("Failed to get incident context: %s", e)
             return IncidentContext(
                 incident_id=incident_id,
                 title="Error loading incident",
@@ -457,8 +457,8 @@ class PamawasInvestigator:
                     if state.completed:
                         return state.findings
 
-            except Exception as e:  # noqa: BLE001
-                logger.error(f"Error in investigation loop: {e}")
+            except (ValueError, KeyError, TypeError) as e:
+                logger.error("Error in investigation loop: %s", e)
                 state.findings.append(Finding(
                     type=EvidenceType.UNKNOWN,
                     content=f"Investigation error: {e!s}",
@@ -540,13 +540,13 @@ class PamawasInvestigator:
 
             logger.info(f"Persisted investigation run {run_id} with {len(findings)} findings")
 
-        except Exception as e:  # noqa: BLE001
-            logger.error(f"Failed to persist investigation: {e}")
+        except psycopg2.Error as e:
+            logger.error("Failed to persist investigation: %s", e)
             # Try to mark run as failed
             if 'run_id' in locals():
                 try:
                     self.persistence.update_run_status(run_id, "failed")
-                except Exception:  # noqa: BLE001
+                except psycopg2.Error:
                     pass
 
     def investigate(self, incident_id: str, request_key_hash: str = "") -> list[Finding]:

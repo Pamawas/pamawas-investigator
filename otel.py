@@ -106,7 +106,7 @@ def init_tracer(config: OTelConfig) -> Callable | None:
 
         return shutdown
 
-    except Exception as e:  # noqa: BLE001 - tracing must not prevent service startup
+    except (OSError, ValueError, RuntimeError) as e:
         logger.error("[otel] failed to initialize tracer: %s", e)
         return None
 
