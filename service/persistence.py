@@ -60,12 +60,19 @@ class InvestigationPersistence:
         self._conn: psycopg2.extensions.connection | None = None
 
     def _get_connection(self) -> psycopg2.extensions.connection:
-        """Get or create database connection."""
+        """Get or create database connection with timeout."""
         if self._conn is None or self._conn.closed:
             if not self.database_url:
                 raise RuntimeError("Database URL not configured")
-            self._conn = psycopg2.connect(self.database_url)
-            self._conn.autocommit = False  # We manage transactions explicitly
+            try:
+                self._conn = psycopg2.connect(
+                    self.database_url,
+                    connect_timeout=5,  # 5-second timeout to prevent startup block
+                )
+                self._conn.autocommit = False  # We manage transactions explicitly
+            except psycopg2.Error as e:
+                logger.error("Failed to connect to database with timeout: %s", e)
+                raise
         return self._conn
 
     def close(self):

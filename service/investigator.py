@@ -93,13 +93,18 @@ class PamawasInvestigator:
         self._connect_db()
 
     def _connect_db(self):
-        """Establish database connection."""
+        """Establish database connection with timeout."""
         if not self.config.database_url:
             logger.warning("No DATABASE_URL provided, database features disabled")
             return
 
         try:
-            self.db_conn = psycopg2.connect(self.config.database_url)
+            import psycopg2.extras
+            self.db_conn = psycopg2.connect(
+                self.config.database_url,
+                connection_factory=psycopg2.extras.DictConnection,
+                connect_timeout=5,  # 5-second timeout to prevent startup block
+            )
             self.persistence = InvestigationPersistence(self.config.database_url)
             logger.info("Connected to database")
         except (psycopg2.Error, RuntimeError) as e:
