@@ -101,7 +101,7 @@ class InvestigatorTools:
             increment_tool_calls("prometheus", "success")
             return result
 
-        except PrometheusError as e:
+        except (PrometheusError, TimeoutError, RuntimeError, OSError) as e:
             duration = time.time() - start_time
             observe_tool_call_duration("prometheus", duration)
             increment_tool_calls("prometheus", "error")
@@ -134,7 +134,7 @@ class InvestigatorTools:
             increment_tool_calls("loki", "success")
             return result
 
-        except LokiError as e:
+        except (LokiError, TimeoutError, RuntimeError, OSError) as e:
             duration = time.time() - start_time
             observe_tool_call_duration("loki", duration)
             increment_tool_calls("loki", "error")
@@ -169,7 +169,7 @@ class InvestigatorTools:
             )
             return result
 
-        except DeploymentAdapterError as e:
+        except (DeploymentAdapterError, TimeoutError, RuntimeError, OSError) as e:
             duration = time.time() - start_time
             observe_tool_call_duration("deployments", duration)
             increment_tool_calls("deployments", "error")
@@ -204,7 +204,7 @@ class InvestigatorTools:
             increment_tool_calls("related_incidents", "success")
             return result
 
-        except RelatedIncidentsError as e:
+        except (RelatedIncidentsError, TimeoutError, RuntimeError, OSError) as e:
             duration = time.time() - start_time
             observe_tool_call_duration("related_incidents", duration)
             increment_tool_calls("related_incidents", "error")

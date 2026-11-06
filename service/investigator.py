@@ -5,6 +5,7 @@ import logging
 import time
 from datetime import UTC, datetime
 
+import openai
 import psycopg2
 from openai import OpenAI
 
@@ -76,7 +77,7 @@ class PamawasInvestigator:
             self.db_conn = psycopg2.connect(self.config.database_url)
             self.persistence = InvestigationPersistence(self.config.database_url)
             logger.info("Connected to database")
-        except psycopg2.Error as e:
+        except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to connect to database: %s", e)
             increment_db_errors()
             self.db_conn = None
@@ -152,7 +153,7 @@ class PamawasInvestigator:
                         for e in events
                     ]
                 )
-        except psycopg2.Error as e:
+        except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to get incident context: %s", e)
             return IncidentContext(
                 incident_id=incident_id,
@@ -457,7 +458,7 @@ class PamawasInvestigator:
                     if state.completed:
                         return state.findings
 
-            except (ValueError, KeyError, TypeError) as e:
+            except (openai.OpenAIError, RuntimeError, ValueError, KeyError, TypeError, TimeoutError) as e:
                 logger.error("Error in investigation loop: %s", e)
                 state.findings.append(Finding(
                     type=EvidenceType.UNKNOWN,
@@ -540,13 +541,13 @@ class PamawasInvestigator:
 
             logger.info(f"Persisted investigation run {run_id} with {len(findings)} findings")
 
-        except psycopg2.Error as e:
+        except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to persist investigation: %s", e)
             # Try to mark run as failed
             if 'run_id' in locals():
                 try:
                     self.persistence.update_run_status(run_id, "failed")
-                except psycopg2.Error:
+                except (psycopg2.Error, RuntimeError):
                     pass
 
     def investigate(self, incident_id: str, request_key_hash: str = "") -> list[Finding]:

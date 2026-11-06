@@ -134,7 +134,7 @@ async def healthz():
         with investigator.db_conn.cursor() as cursor:
             cursor.execute("SELECT 1")
         return {"status": "healthy", "timestamp": time.time()}
-    except psycopg2.Error as e:
+    except (psycopg2.Error, RuntimeError) as e:
         log.error("health_check_failed", error=str(e))
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
@@ -158,7 +158,7 @@ async def ready():
         with investigator.db_conn.cursor() as cursor:
             cursor.execute("SELECT 1")
         return {"status": "ready"}
-    except psycopg2.Error as e:
+    except (psycopg2.Error, RuntimeError) as e:
         log.error("readiness_check_failed", error=str(e))
         return JSONResponse(status_code=503, content={"status": "not ready", "error": str(e)})
 

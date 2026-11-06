@@ -9,6 +9,10 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+from adapters.deployments import DeploymentAdapterError
+from adapters.loki import LokiError
+from adapters.prometheus import PrometheusError
+from adapters.related_incidents import RelatedIncidentsError
 from metrics import increment_tool_calls, observe_tool_call_duration
 
 
@@ -152,7 +156,9 @@ class FakePrometheusTransport:
         increment_tool_calls("prometheus", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, PrometheusError):
+                raise self._error
+            raise PrometheusError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -172,7 +178,9 @@ class FakePrometheusTransport:
         increment_tool_calls("prometheus", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, PrometheusError):
+                raise self._error
+            raise PrometheusError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -224,7 +232,9 @@ class FakeLokiTransport:
         increment_tool_calls("loki", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, LokiError):
+                raise self._error
+            raise LokiError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -245,7 +255,9 @@ class FakeLokiTransport:
         increment_tool_calls("loki", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, LokiError):
+                raise self._error
+            raise LokiError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -291,7 +303,9 @@ class FakeDeploymentTransport:
         increment_tool_calls("deployments", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, DeploymentAdapterError):
+                raise self._error
+            raise DeploymentAdapterError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -307,7 +321,9 @@ class FakeDeploymentTransport:
         increment_tool_calls("deployments", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, DeploymentAdapterError):
+                raise self._error
+            raise DeploymentAdapterError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -353,7 +369,9 @@ class FakeRelatedIncidentsTransport:
         increment_tool_calls("related_incidents", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, RelatedIncidentsError):
+                raise self._error
+            raise RelatedIncidentsError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 
@@ -378,7 +396,9 @@ class FakeRelatedIncidentsTransport:
         increment_tool_calls("related_incidents", "success" if not self._should_fail else "error")
 
         if self._should_fail:
-            raise self._error or Exception("Simulated error")
+            if isinstance(self._error, RelatedIncidentsError):
+                raise self._error
+            raise RelatedIncidentsError(str(self._error or "Simulated error"))
 
         return self._response.to_dict()
 

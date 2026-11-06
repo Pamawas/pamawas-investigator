@@ -245,7 +245,7 @@ class LokiAdapter:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             raise
-        except (ValueError, KeyError, UnicodeDecodeError) as e:
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error("Loki query failed: %s", e)
@@ -325,7 +325,7 @@ class LokiAdapter:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             raise
-        except (ValueError, KeyError, UnicodeDecodeError) as e:
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error("Loki instant query failed: %s", e)
@@ -367,7 +367,7 @@ class LokiAdapter:
             raise LokiError(
                 f"Loki HTTP error {e.response.status_code}: {e.response.text}"
             )
-        except (ValueError, KeyError, UnicodeDecodeError) as e:
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error("Loki labels query failed: %s", e)
