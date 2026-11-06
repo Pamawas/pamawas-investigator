@@ -450,7 +450,11 @@ class PamawasInvestigator:
             )
 
             is_final_turn = (state.tool_call_count == state.max_tool_calls - 1)
-            tool_choice = "submit_findings" if is_final_turn else "auto"
+            tool_choice = (
+                {"type": "function", "function": {"name": "submit_findings"}}
+                if is_final_turn
+                else "auto"
+            )
             tools = ToolRegistry.get_tools()
 
             try:
