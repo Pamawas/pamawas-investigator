@@ -118,13 +118,14 @@ class PamawasInvestigator:
                     )
 
                 # Get events for this incident
+                # NOTE: the column is `occurred_at`, not `timestamp`
                 cursor.execute("""
-                    SELECT e.id, e.source, e.type, e.timestamp, e.service, e.environment,
+                    SELECT e.id, e.source, e.type, e.occurred_at, e.service, e.environment,
                            e.severity, e.title, e.status, e.labels, e.raw_payload
                     FROM events e
                     JOIN incident_events ie ON e.id = ie.event_id
                     WHERE ie.incident_id = %s
-                    ORDER BY e.timestamp
+                    ORDER BY e.occurred_at
                 """, (incident_id,))
                 events = cursor.fetchall()
 
@@ -155,6 +156,11 @@ class PamawasInvestigator:
                 )
         except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to get incident context: %s", e)
+            # Roll back the aborted transaction so the connection remains usable
+            try:
+                self.db_conn.rollback()
+            except psycopg2.Error:
+                pass
             return IncidentContext(
                 incident_id=incident_id,
                 title="Error loading incident",

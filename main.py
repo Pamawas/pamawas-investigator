@@ -136,6 +136,10 @@ async def healthz():
         return {"status": "healthy", "timestamp": time.time()}
     except (psycopg2.Error, RuntimeError) as e:
         log.error("health_check_failed", error=str(e))
+        try:
+            investigator.db_conn.rollback()
+        except psycopg2.Error:
+            pass
         return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
 
 
@@ -160,6 +164,10 @@ async def ready():
         return {"status": "ready"}
     except (psycopg2.Error, RuntimeError) as e:
         log.error("readiness_check_failed", error=str(e))
+        try:
+            investigator.db_conn.rollback()
+        except psycopg2.Error:
+            pass
         return JSONResponse(status_code=503, content={"status": "not ready", "error": str(e)})
 
 
