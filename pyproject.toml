@@ -61,6 +61,7 @@ select = [
 ]
 ignore = [
     "N999",  # Invalid module name (hyphen in package name)
+    "UP017",  # Use datetime.UTC alias (our try/except fallback is intentional)
 ]
 fixable = [
     "I",   # isort

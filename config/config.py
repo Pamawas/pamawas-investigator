@@ -18,6 +18,9 @@ class Config:
     loki_url: str = "http://loki:3100"
     max_tool_calls: int = 6
     truncation_limit: int = 8192
+    # Query templates for evidence enrichment
+    prometheus_query_template: str = '{incident="%s"}'
+    loki_query_template: str = '{incident="%s"}'
     # Adapter settings
     prometheus_timeout_seconds: float = 10.0
     prometheus_max_response_bytes: int = 1_000_000
@@ -57,6 +60,12 @@ class Config:
             llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
             prometheus_url=os.getenv("PROMETHEUS_URL", "http://prometheus:9090"),
             loki_url=os.getenv("LOKI_URL", "http://loki:3100"),
+            prometheus_query_template=os.getenv(
+                "PROMETHEUS_QUERY_TEMPLATE", '{incident="%s"}'
+            ),
+            loki_query_template=os.getenv(
+                "LOKI_QUERY_TEMPLATE", '{incident="%s"}'
+            ),
             max_tool_calls=int(os.getenv("MAX_TOOL_CALLS", "6")),
             truncation_limit=int(os.getenv("TRUNCATION_LIMIT", "8192")),
             # Adapter settings from env

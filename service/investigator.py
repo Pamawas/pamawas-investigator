@@ -3,7 +3,8 @@
 import json
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import datetime
+from datetime import timezone as tz
 
 import openai
 import psycopg2
@@ -16,12 +17,22 @@ from models import (
     Finding,
     IncidentContext,
     InvestigationState,
+    LogEntry,
+    Metric,
     ToolResult,
 )
+from service.loki_fetcher import LogsFetcher, LokiFetcher
 from service.persistence import InvestigationPersistence
+from service.prometheus_fetcher import MetricsFetcher, PrometheusFetcher
 from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
+
+# Use datetime.UTC from Python 3.11+, fallback for older versions
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = tz.utc
 
 
 class InvestigatorLLM:
@@ -63,6 +74,20 @@ class PamawasInvestigator:
         self.config = config
         self.llm = InvestigatorLLM(config)
         self.tools = InvestigatorTools(config)
+
+        # Initialize fetchers for evidence enrichment
+        self.metrics_fetcher: MetricsFetcher = PrometheusFetcher(
+            base_url=config.prometheus_url,
+            query_template=config.prometheus_query_template or '{incident="%s"}',
+            timeout_seconds=config.prometheus_timeout_seconds,
+        )
+        self.logs_fetcher: LogsFetcher = LokiFetcher(
+            base_url=config.loki_url,
+            query_template=config.loki_query_template or '{incident="%s"}',
+            timeout_seconds=config.loki_timeout_seconds,
+            max_lines=config.loki_max_log_lines,
+        )
+
         self.db_conn = None
         self.persistence = None
         self._connect_db()
@@ -83,8 +108,10 @@ class PamawasInvestigator:
             self.db_conn = None
 
     async def close(self):
-        """Close investigator and all tools."""
+        """Close investigator, tools, and fetchers."""
         await self.tools.close()
+        await self.metrics_fetcher.close()
+        await self.logs_fetcher.close()
         if self.db_conn and not self.db_conn.closed:
             self.db_conn.close()
 
@@ -506,7 +533,10 @@ class PamawasInvestigator:
         tool_contract: int,
         max_tool_calls: int,
     ):
-        """Persist investigation run, tool executions, and evidence in a transaction."""
+        """Persist investigation run, tool executions, and evidence in a transaction.
+
+        Includes evidence enrichment with metrics and logs from Prometheus and Loki.
+        """
         if not self.persistence:
             logger.warning("No persistence layer available, skipping investigation persistence")
             return
@@ -538,11 +568,63 @@ class PamawasInvestigator:
                     duration_ms=int(tool_call.duration_ms),
                 )
 
-            # Insert evidence
+            # Fetch evidence enrichment (metrics and logs) from Prometheus and Loki
+            # Use a default time window for incident context enrichment
+            now = datetime.now(UTC)
+            five_minutes_ago = datetime.fromtimestamp(
+                now.timestamp() - 300, tz=UTC
+            )
+            start_time = five_minutes_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
+            end_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+            enrichment_data = {}
+            # Fetch metrics from Prometheus
+            if self.metrics_fetcher:
+                try:
+                    enriched_metrics = self.metrics_fetcher.fetch(
+                        incident_id=incident_id,
+                        start=start_time,
+                        end=end_time,
+                    )
+                    enrichment_data["metrics"] = enriched_metrics
+                    logger.info(f"Fetched {len(enriched_metrics)} metrics for enrichment")
+                except (OSError, ValueError, RuntimeError) as e:
+                    logger.warning(
+                        f"Failed to fetch Prometheus metrics for enrichment: {e}"
+                    )
+
+            # Fetch logs from Loki
+            if self.logs_fetcher:
+                try:
+                    enriched_logs = self.logs_fetcher.fetch(
+                        incident_id=incident_id,
+                        start=start_time,
+                        end=end_time,
+                        limit=self.config.loki_max_log_lines,
+                    )
+                    enrichment_data["logs"] = enriched_logs
+                    logger.info(f"Fetched {len(enriched_logs)} logs for enrichment")
+                except (OSError, ValueError, RuntimeError) as e:
+                    logger.warning(f"Failed to fetch Loki logs for enrichment: {e}")
+
+            # Convert Metric and LogEntry objects to dicts for persistence
+            metrics_for_persistence = [
+                m.to_dict() if isinstance(m, Metric) else m
+                for m in enrichment_data.get("metrics", [])
+            ]
+            log_entries = enrichment_data.get("logs", [])
+            logs_for_persistence = [
+                entry.to_dict() if isinstance(entry, LogEntry) else entry
+                for entry in log_entries
+            ]
+
+            # Insert evidence with enrichment
             self.persistence.insert_evidence(
                 incident_id=incident_id,
                 run_id=run_id,
                 findings=findings,
+                metrics=metrics_for_persistence,
+                logs=logs_for_persistence,
             )
 
             # Mark run as completed
@@ -552,7 +634,10 @@ class PamawasInvestigator:
                 completed_at=datetime.now(UTC),
             )
 
-            logger.info(f"Persisted investigation run {run_id} with {len(findings)} findings")
+            logger.info(
+                f"Persisted investigation run {run_id} with {len(findings)} findings, "
+                f"{len(metrics_for_persistence)} metrics, {len(logs_for_persistence)} logs"
+            )
 
         except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to persist investigation: %s", e)

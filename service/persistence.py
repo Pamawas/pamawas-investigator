@@ -4,13 +4,19 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import psycopg2
 import psycopg2.extras
 
 from models import Finding
+
+# Python 3.9 compatibility for datetime.UTC (added in 3.11)
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = timezone.utc
 
 logger = logging.getLogger(__name__)
 
@@ -231,11 +237,30 @@ class InvestigationPersistence:
         incident_id: str,
         run_id: str,
         findings: list[Finding],
+        metrics: list[dict[str, Any]] | None = None,
+        logs: list[dict[str, Any]] | None = None,
     ) -> list[str]:
-        """Insert evidence records for all findings in a transaction."""
+        """Insert evidence records for all findings in a transaction.
+
+        Args:
+            incident_id: The incident ID
+            run_id: The investigation run ID
+            findings: List of Finding objects
+            metrics: Optional list of metric dicts for enrichment (same across all evidence)
+            logs: Optional list of log entry dicts for enrichment (same across all evidence)
+
+        Returns:
+            List of evidence IDs created
+        """
+        from models import Evidence, Metric, LogEntry
+
         conn = self._get_connection()
         evidence_ids = []
         now = datetime.now(UTC)
+
+        # Prepare enriched data as JSON
+        metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in (metrics or [])])
+        logs_json = json.dumps([l.to_dict() if isinstance(l, LogEntry) else l for l in (logs or [])])
 
         with conn.cursor() as cursor:
             try:
@@ -246,8 +271,9 @@ class InvestigationPersistence:
                         INSERT INTO evidence (
                             id, incident_id, run_id, type, content,
                             source, confidence, supports_evidence,
-                            contradicts_evidence, ordinal, created_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            contradicts_evidence, ordinal, created_at,
+                            metrics, logs, version, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             evidence_id, incident_id, run_id,
@@ -255,6 +281,7 @@ class InvestigationPersistence:
                             finding.source, finding.confidence,
                             [], [],  # supports/contradicts empty for MVP
                             ordinal, now,
+                            metrics_json, logs_json, 1, now,
                         ),
                     )
                     evidence_ids.append(evidence_id)
@@ -266,6 +293,65 @@ class InvestigationPersistence:
                 conn.rollback()
                 logger.error(f"Failed to insert evidence: {e}")
                 raise
+
+    def update_evidence_enrichment(
+        self,
+        evidence_id: str,
+        metrics: list[dict[str, Any]] | None = None,
+        logs: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        """Update evidence with enriched metrics and logs.
+
+        Uses optimistic concurrency control via version column.
+
+        Args:
+            evidence_id: The evidence ID to update
+            metrics: Optional list of metric dicts
+            logs: Optional list of log entry dicts
+
+        Returns:
+            True if update was successful, False if version conflict
+        """
+        from models import Metric, LogEntry
+
+        conn = self._get_connection()
+        now = datetime.now(UTC)
+
+        # Get current version
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT version FROM evidence WHERE id = %s", (evidence_id,))
+            row = cursor.fetchone()
+            if not row:
+                logger.warning(f"Evidence {evidence_id} not found for enrichment")
+                return False
+            current_version = row[0]
+
+        # Prepare JSON values
+        metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in (metrics or [])])
+        logs_json = json.dumps([l.to_dict() if isinstance(l, LogEntry) else l for l in (logs or [])])
+
+        # Update with version check
+        with conn.cursor() as cursor:
+            try:
+                cursor.execute(
+                    """
+                    UPDATE evidence
+                    SET metrics = %s, logs = %s, version = version + 1, updated_at = %s
+                    WHERE id = %s AND version = %s
+                    """,
+                    (metrics_json, logs_json, now, evidence_id, current_version),
+                )
+                if cursor.rowcount == 0:
+                    logger.warning(f"Version conflict updating evidence {evidence_id}")
+                    return False
+
+                conn.commit()
+                logger.debug(f"Updated evidence {evidence_id} with enrichment")
+                return True
+            except Exception as e:
+                conn.rollback()
+                logger.error(f"Failed to update evidence enrichment: {e}")
+                return False
 
     def _redact_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Redact sensitive information from tool arguments."""
