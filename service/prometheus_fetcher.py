@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -69,7 +68,9 @@ class PrometheusFetcher(MetricsFetcher):
             if re.search(pattern, promql, re.IGNORECASE):
                 raise ValueError(f"PromQL query contains prohibited pattern: {pattern}")
 
-    async def _query_instant(self, promql: str, eval_time: str | None = None) -> dict[str, Any]:
+    async def _query_instant(
+        self, promql: str, eval_time: str | None = None
+    ) -> dict[str, Any]:
         """Execute a Prometheus instant query."""
         client = await self._get_client()
         params = {"query": promql}
@@ -80,7 +81,7 @@ class PrometheusFetcher(MetricsFetcher):
         response.raise_for_status()
 
         if len(response.content) > self.max_response_bytes:
-            raise ValueError(f"Response size exceeds limit")
+            raise ValueError("Response size exceeds limit")
 
         data = response.json()
         if data.get("status") != "success":
@@ -102,7 +103,8 @@ class PrometheusFetcher(MetricsFetcher):
             List of metric dictionaries with name, value, labels, at
         """
         # Build query using template
-        query = self.query_template % incident_id if "%s" in self.query_template else self.query_template
+        tmpl = self.query_template
+        query = tmpl % incident_id if "%s" in tmpl else tmpl
 
         # For instant query, we use the end time as evaluation time
         try:
@@ -121,7 +123,7 @@ class PrometheusFetcher(MetricsFetcher):
 
         try:
             result = await self._query_instant(query, eval_time)
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError) as e:
             logger.error(f"Prometheus query failed for incident {incident_id}: {e}")
             return []
 

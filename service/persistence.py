@@ -252,15 +252,22 @@ class InvestigationPersistence:
         Returns:
             List of evidence IDs created
         """
-        from models import Evidence, Metric, LogEntry
+        from models import LogEntry, Metric
 
         conn = self._get_connection()
         evidence_ids = []
         now = datetime.now(UTC)
 
         # Prepare enriched data as JSON
-        metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in (metrics or [])])
-        logs_json = json.dumps([l.to_dict() if isinstance(l, LogEntry) else l for l in (logs or [])])
+        mets = metrics or []
+        logs_list = logs or []
+        metrics_json = json.dumps(
+            [m.to_dict() if isinstance(m, Metric) else m for m in mets]
+        )
+        logs_json = json.dumps(
+            [log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
+             for log_entry in logs_list]
+        )
 
         with conn.cursor() as cursor:
             try:
@@ -312,7 +319,7 @@ class InvestigationPersistence:
         Returns:
             True if update was successful, False if version conflict
         """
-        from models import Metric, LogEntry
+        from models import LogEntry, Metric
 
         conn = self._get_connection()
         now = datetime.now(UTC)
@@ -327,8 +334,15 @@ class InvestigationPersistence:
             current_version = row[0]
 
         # Prepare JSON values
-        metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in (metrics or [])])
-        logs_json = json.dumps([l.to_dict() if isinstance(l, LogEntry) else l for l in (logs or [])])
+        mets = metrics or []
+        logs_list = logs or []
+        metrics_json = json.dumps(
+            [m.to_dict() if isinstance(m, Metric) else m for m in mets]
+        )
+        logs_json = json.dumps(
+            [log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
+             for log_entry in logs_list]
+        )
 
         # Update with version check
         with conn.cursor() as cursor:
@@ -348,7 +362,7 @@ class InvestigationPersistence:
                 conn.commit()
                 logger.debug(f"Updated evidence {evidence_id} with enrichment")
                 return True
-            except Exception as e:
+            except (OSError, ValueError, RuntimeError) as e:
                 conn.rollback()
                 logger.error(f"Failed to update evidence enrichment: {e}")
                 return False

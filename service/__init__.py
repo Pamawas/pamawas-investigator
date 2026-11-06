@@ -1,12 +1,9 @@
-from .investigator import InvestigatorLLM, PamawasInvestigator
-from .loki_fetcher import LokiFetcher, LogsFetcher
-from .prometheus_fetcher import PrometheusFetcher, MetricsFetcher
+"""Pamawas Investigator service package."""
+
+from service.investigator import PamawasInvestigator
+from service.prometheus_fetcher import PrometheusFetcher
 
 __all__ = [
-    "InvestigatorLLM",
     "PamawasInvestigator",
     "PrometheusFetcher",
-    "MetricsFetcher",
-    "LokiFetcher",
-    "LogsFetcher",
 ]

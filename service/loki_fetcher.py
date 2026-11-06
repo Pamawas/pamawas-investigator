@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
-import time
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,7 +16,9 @@ logger = logging.getLogger(__name__)
 class LogsFetcher:
     """Interface for fetching Loki logs."""
 
-    def fetch(self, incident_id: str, start: str, end: str, limit: int = 100) -> list[dict[str, Any]]:
+    def fetch(
+        self, incident_id: str, start: str, end: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
         """Fetch logs for an incident. Returns list of log entry dicts."""
         raise NotImplementedError
 
@@ -76,7 +76,9 @@ class LokiFetcher(LogsFetcher):
         """Parse Unix timestamp to datetime."""
         return datetime.fromtimestamp(ts, tz=timezone.utc)
 
-    async def _query_range(self, logql: str, start: str, end: str, limit: int) -> dict[str, Any]:
+    async def _query_range(
+        self, logql: str, start: str, end: str, limit: int
+    ) -> dict[str, Any]:
         """Execute a Loki query_range request."""
         client = await self._get_client()
 
@@ -105,7 +107,7 @@ class LokiFetcher(LogsFetcher):
         response.raise_for_status()
 
         if len(response.content) > self.max_response_bytes:
-            raise ValueError(f"Response size exceeds limit")
+            raise ValueError("Response size exceeds limit")
 
         return response.json()
 
@@ -124,13 +126,13 @@ class LokiFetcher(LogsFetcher):
             List of log entry dictionaries with timestamp, stream, line
         """
         # Build query using template
-        query = self.query_template % incident_id if "%s" in self.query_template else self.query_template
+        tmpl = self.query_template
+        query = tmpl % incident_id if "%s" in tmpl else tmpl
 
         # Default 5-minute window
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
             # Calculate start time as 5 minutes before end (300 seconds)
-            import time as time_module
             start_ts = end_dt.timestamp() - 300  # 5 minutes in seconds
             start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
         except ValueError:
@@ -144,7 +146,7 @@ class LokiFetcher(LogsFetcher):
 
         try:
             result = await self._query_range(query, start, end, limit)
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError) as e:
             logger.error(f"Loki query failed for incident {incident_id}: {e}")
             return []
 
@@ -182,7 +184,9 @@ class LokiFetcher(LogsFetcher):
 
         return logs
 
-    def fetch(self, incident_id: str, start: str, end: str, limit: int = 100) -> list[dict[str, Any]]:
+    def fetch(
+        self, incident_id: str, start: str, end: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
         """Synchronous wrapper for async fetch."""
         try:
             loop = asyncio.get_running_loop()

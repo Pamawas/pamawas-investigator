@@ -142,8 +142,9 @@ class LogEntry:
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
+        ts = self.timestamp
         return {
-            "timestamp": self.timestamp.isoformat() if isinstance(self.timestamp, datetime) else self.timestamp,
+            "timestamp": ts.isoformat() if isinstance(ts, datetime) else ts,
             "stream": self.stream,
             "line": self.line,
         }
