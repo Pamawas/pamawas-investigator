@@ -37,11 +37,14 @@ class RelatedIncidentsAdapter:
         self._conn: psycopg2.extensions.connection | None = None
 
     def _get_connection(self) -> psycopg2.extensions.connection:
-        """Get or create database connection."""
+        """Get or create database connection with timeout."""
         if self._conn is None or self._conn.closed:
             if not self.config.database_url:
                 raise RelatedIncidentsError("Database URL not configured")
-            self._conn = psycopg2.connect(self.config.database_url)
+            self._conn = psycopg2.connect(
+                self.config.database_url,
+                connect_timeout=5,  # 5-second timeout to prevent startup block
+            )
             self._conn.autocommit = True
         return self._conn
 

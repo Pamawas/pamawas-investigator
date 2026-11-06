@@ -99,10 +99,8 @@ class PamawasInvestigator:
             return
 
         try:
-            import psycopg2.extras
             self.db_conn = psycopg2.connect(
                 self.config.database_url,
-                connection_factory=psycopg2.extras.DictConnection,
                 connect_timeout=5,  # 5-second timeout to prevent startup block
             )
             self.persistence = InvestigationPersistence(self.config.database_url)
