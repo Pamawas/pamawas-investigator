@@ -76,10 +76,24 @@ class InvestigationPersistence:
         return self._conn
 
     def close(self):
-        """Close database connection."""
+        """Close database connection, rolling back any open transaction."""
         if self._conn and not self._conn.closed:
+            try:
+                self._conn.rollback()
+            except psycopg2.Error:
+                pass
             self._conn.close()
             self._conn = None
+
+    def commit(self):
+        """Commit any open transaction on the shared connection."""
+        if self._conn and not self._conn.closed:
+            self._conn.commit()
+
+    def rollback(self):
+        """Roll back any open transaction on the shared connection."""
+        if self._conn and not self._conn.closed:
+            self._conn.rollback()
 
     def create_investigation_run(
         self,

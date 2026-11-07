@@ -254,3 +254,78 @@ def test_create_investigation_success():
         assert data["data"]["status"] == "completed"
         assert data["data"]["run_id"].startswith("irun_")
         service.investigate.assert_called_once()
+
+
+def test_create_investigation_commits_idempotency_check():
+    """The idempotency SELECT must commit, not leak an open transaction.
+
+    autocommit is off, so a bare SELECT leaves the transaction open. Each
+    request must return the connection to a clean state or every call leaks a
+    connection that stays idle-in-transaction until the process exits.
+    """
+    import os
+    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.return_value = None  # No existing run
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    mock_persistence = MagicMock()
+    mock_persistence._get_connection.return_value = mock_conn
+
+    service = MagicMock()
+    service.persistence = mock_persistence
+    service.db_conn = MagicMock()
+    service.investigate.return_value = []
+
+    with client_with(service) as client:
+        response = client.post(
+            "/api/v1/investigations",
+            json={
+                "contract_version": 1,
+                "incident_id": "inc-1",
+                "reason": "incident_created",
+                "correlation_version": 1,
+            },
+            headers={"x-service-token": "test-token"}
+        )
+        assert response.status_code == 200
+
+    mock_conn.commit.assert_called_once()
+    mock_conn.rollback.assert_not_called()
+
+
+def test_create_investigation_rolls_back_on_idempotency_check_failure():
+    """A failed idempotency check must roll back, not leak the connection."""
+    import os
+    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
+
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.fetchone.side_effect = RuntimeError("db down")
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+
+    mock_persistence = MagicMock()
+    mock_persistence._get_connection.return_value = mock_conn
+
+    service = MagicMock()
+    service.persistence = mock_persistence
+    service.db_conn = MagicMock()
+
+    with client_with(service) as client:
+        response = client.post(
+            "/api/v1/investigations",
+            json={
+                "contract_version": 1,
+                "incident_id": "inc-1",
+                "reason": "incident_created",
+                "correlation_version": 1,
+            },
+            headers={"x-service-token": "test-token"}
+        )
+        assert response.status_code == 500
+        assert response.json()["error"] == "Internal server error"
+
+    mock_conn.commit.assert_not_called()
+    mock_conn.rollback.assert_called_once()

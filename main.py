@@ -245,8 +245,16 @@ async def create_investigation(
                 existing = cursor.fetchone()
                 if existing:
                     existing_run_id, existing_status = existing
+            # A read-only SELECT still opens a transaction because autocommit is
+            # off. Commit it so the connection is returned to a clean state and
+            # does not leak an open transaction on every request.
+            conn.commit()
         except (psycopg2.Error, RuntimeError) as e:
             log.error("failed_to_check_existing_run", error=str(e))
+            try:
+                conn.rollback()
+            except (psycopg2.Error, AttributeError):
+                pass
             return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
         if existing_run_id:

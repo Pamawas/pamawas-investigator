@@ -103,6 +103,10 @@ class PamawasInvestigator:
                 self.config.database_url,
                 connect_timeout=5,  # 5-second timeout to prevent startup block
             )
+            # This connection is used only for read-only lookups (incident
+            # context, health probes). autocommit keeps every statement out of
+            # an explicit transaction so reads never leak open transactions.
+            self.db_conn.autocommit = True
             self.persistence = InvestigationPersistence(self.config.database_url)
             logger.info("Connected to database")
         except (psycopg2.Error, RuntimeError) as e:
@@ -184,6 +188,10 @@ class PamawasInvestigator:
                         for e in events
                     ]
                 )
+            # autocommit is off, so this read-only SELECT opened a transaction.
+            # Commit it so the connection is returned to a clean state instead of
+            # leaking an open transaction on every investigation.
+            self.db_conn.commit()
         except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to get incident context: %s", e)
             # Roll back the aborted transaction so the connection remains usable
