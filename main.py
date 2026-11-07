@@ -291,6 +291,7 @@ def _get_run_status(run_id: str) -> str | None:
     """Fetch a run's status, or None on failure."""
     if not investigator or not investigator.persistence:
         return None
+    conn = None
     try:
         conn = investigator.persistence._get_connection()
         with conn.cursor() as cursor:
@@ -300,11 +301,15 @@ def _get_run_status(run_id: str) -> str | None:
         return row[0] if row else None
     except (psycopg2.Error, RuntimeError) as e:
         log.error("failed_to_get_run_status", error=str(e))
-        try:
-            investigator.persistence._get_connection().rollback()
-        except (psycopg2.Error, AttributeError):
-            pass
+        if conn is not None:
+            try:
+                conn.rollback()
+            except (psycopg2.Error, AttributeError):
+                pass
         return None
+    finally:
+        if conn is not None:
+            investigator.persistence._put_connection(conn)
 
 
 @app.post("/api/v1/investigations")

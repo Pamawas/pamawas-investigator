@@ -115,12 +115,14 @@ class PamawasInvestigator:
             self.db_conn = None
 
     async def close(self):
-        """Close investigator, tools, and fetchers."""
+        """Close investigator, tools, fetchers, and database connections."""
         await self.tools.close()
         await self.metrics_fetcher.close()
         await self.logs_fetcher.close()
         if self.db_conn and not self.db_conn.closed:
             self.db_conn.close()
+        if self.persistence:
+            self.persistence.close()
 
     def _get_incident_context(self, incident_id: str) -> IncidentContext:
         """Retrieve incident context from the database."""
@@ -188,10 +190,8 @@ class PamawasInvestigator:
                         for e in events
                     ]
                 )
-            # autocommit is off, so this read-only SELECT opened a transaction.
-            # Commit it so the connection is returned to a clean state instead of
-            # leaking an open transaction on every investigation.
-            self.db_conn.commit()
+            # db_conn runs in autocommit mode, so each statement completes
+            # immediately and no transaction is left open.
         except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to get incident context: %s", e)
             # Roll back the aborted transaction so the connection remains usable
