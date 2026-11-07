@@ -9,6 +9,8 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import pool
+
 
 from models import Finding
 
@@ -57,43 +59,47 @@ class InvestigationPersistence:
 
     def __init__(self, database_url: str):
         self.database_url = database_url
-        self._conn: psycopg2.extensions.connection | None = None
+        self._pool: psycopg2.pool.ThreadedConnectionPool | None = None
 
     def _get_connection(self) -> psycopg2.extensions.connection:
-        """Get or create database connection with timeout."""
-        if self._conn is None or self._conn.closed:
-            if not self.database_url:
-                raise RuntimeError("Database URL not configured")
+        """Get a database connection from the pool."""
+        if not self.database_url:
+            raise RuntimeError("Database URL not configured")
+
+        if self._pool is None:
             try:
-                self._conn = psycopg2.connect(
-                    self.database_url,
-                    connect_timeout=5,  # 5-second timeout to prevent startup block
+                self._pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=1,
+                    maxconn=10,
+                    dsn=self.database_url,
+                    connect_timeout=5,
                 )
-                self._conn.autocommit = False  # We manage transactions explicitly
             except psycopg2.Error as e:
-                logger.error("Failed to connect to database with timeout: %s", e)
+                logger.error("Failed to initialize database pool: %s", e)
                 raise
-        return self._conn
+
+        return self._pool.getconn()
+
+    def _put_connection(self, conn: psycopg2.extensions.connection):
+        """Return a database connection to the pool."""
+        if self._pool and conn:
+            self._pool.putconn(conn)
 
     def close(self):
-        """Close database connection, rolling back any open transaction."""
-        if self._conn and not self._conn.closed:
-            try:
-                self._conn.rollback()
-            except psycopg2.Error:
-                pass
-            self._conn.close()
-            self._conn = None
+        """Close the database pool."""
+        if self._pool:
+            self._pool.closeall()
+            self._pool = None
 
-    def commit(self):
-        """Commit any open transaction on the shared connection."""
-        if self._conn and not self._conn.closed:
-            self._conn.commit()
+    def commit(self, conn: psycopg2.extensions.connection):
+        """Commit a specific connection's transaction."""
+        if conn:
+            conn.commit()
 
-    def rollback(self):
-        """Roll back any open transaction on the shared connection."""
-        if self._conn and not self._conn.closed:
-            self._conn.rollback()
+    def rollback(self, conn: psycopg2.extensions.connection):
+        """Roll back a specific connection's transaction."""
+        if conn:
+            conn.rollback()
 
     def create_investigation_run(
         self,
@@ -114,8 +120,8 @@ class InvestigationPersistence:
         run_id = f"irun_{uuid.uuid4().hex[:26].upper()}"
         now = datetime.now(UTC)
 
-        with conn.cursor() as cursor:
-            try:
+        try:
+            with conn.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO investigation_runs (
@@ -156,10 +162,12 @@ class InvestigationPersistence:
                     # Should not happen
                     conn.rollback()
                     raise RuntimeError("Failed to create or find investigation run")
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Failed to create investigation run: {e}")
-                raise
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to create investigation run: {e}")
+            raise
+        finally:
+            self._put_connection(conn)
 
     def update_run_status(
         self,
@@ -172,8 +180,8 @@ class InvestigationPersistence:
         """Update investigation run status and timestamps."""
         conn = self._get_connection()
         now = datetime.now(UTC)
-        with conn.cursor() as cursor:
-            try:
+        try:
+            with conn.cursor() as cursor:
                 updates = ["status = %s", "updated_at = %s"]
                 params = [status, now]
 
@@ -201,10 +209,12 @@ class InvestigationPersistence:
                 cursor.execute(query, params)
                 conn.commit()
                 logger.info(f"Updated investigation run {run_id} status to {status}")
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Failed to update run status: {e}")
-                raise
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to update run status: {e}")
+            raise
+        finally:
+            self._put_connection(conn)
 
     def insert_tool_execution(
         self,
@@ -227,8 +237,8 @@ class InvestigationPersistence:
         result_summary = self._summarize_result(result)
         result_hash = self._hash_result(result)
 
-        with conn.cursor() as cursor:
-            try:
+        try:
+            with conn.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO tool_executions (
@@ -248,10 +258,12 @@ class InvestigationPersistence:
                 conn.commit()
                 logger.info(f"Inserted tool execution {exec_id} for run {run_id}")
                 return exec_id
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Failed to insert tool execution: {e}")
-                raise
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to insert tool execution: {e}")
+            raise
+        finally:
+            self._put_connection(conn)
 
     def insert_evidence(
         self,
@@ -290,8 +302,8 @@ class InvestigationPersistence:
              for log_entry in logs_list]
         )
 
-        with conn.cursor() as cursor:
-            try:
+        try:
+            with conn.cursor() as cursor:
                 for ordinal, finding in enumerate(findings):
                     evidence_id = f"evd_{uuid.uuid4().hex[:26].upper()}"
                     cursor.execute(
@@ -317,10 +329,12 @@ class InvestigationPersistence:
                 conn.commit()
                 logger.info(f"Inserted {len(evidence_ids)} evidence records for run {run_id}")
                 return evidence_ids
-            except Exception as e:
-                conn.rollback()
-                logger.error(f"Failed to insert evidence: {e}")
-                raise
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Failed to insert evidence: {e}")
+            raise
+        finally:
+            self._put_connection(conn)
 
     def update_evidence_enrichment(
         self,
@@ -345,29 +359,29 @@ class InvestigationPersistence:
         conn = self._get_connection()
         now = datetime.now(UTC)
 
-        # Get current version
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT version FROM evidence WHERE id = %s", (evidence_id,))
-            row = cursor.fetchone()
-            if not row:
-                logger.warning(f"Evidence {evidence_id} not found for enrichment")
-                return False
-            current_version = row[0]
+        try:
+            # Get current version
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT version FROM evidence WHERE id = %s", (evidence_id,))
+                row = cursor.fetchone()
+                if not row:
+                    logger.warning(f"Evidence {evidence_id} not found for enrichment")
+                    return False
+                current_version = row[0]
 
-        # Prepare JSON values
-        mets = metrics or []
-        logs_list = logs or []
-        metrics_json = json.dumps(
-            [m.to_dict() if isinstance(m, Metric) else m for m in mets]
-        )
-        logs_json = json.dumps(
-            [log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
-             for log_entry in logs_list]
-        )
+            # Prepare JSON values
+            mets = metrics or []
+            logs_list = logs or []
+            metrics_json = json.dumps(
+                [m.to_dict() if isinstance(m, Metric) else m for m in mets]
+            )
+            logs_json = json.dumps(
+                [log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
+                 for log_entry in logs_list]
+            )
 
-        # Update with version check
-        with conn.cursor() as cursor:
-            try:
+            # Update with version check
+            with conn.cursor() as cursor:
                 cursor.execute(
                     """
                     UPDATE evidence
@@ -383,10 +397,12 @@ class InvestigationPersistence:
                 conn.commit()
                 logger.debug(f"Updated evidence {evidence_id} with enrichment")
                 return True
-            except (OSError, ValueError, RuntimeError) as e:
-                conn.rollback()
-                logger.error(f"Failed to update evidence enrichment: {e}")
-                return False
+        except (OSError, ValueError, RuntimeError, psycopg2.Error) as e:
+            conn.rollback()
+            logger.error(f"Failed to update evidence enrichment: {e}")
+            return False
+        finally:
+            self._put_connection(conn)
 
     def _redact_arguments(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Redact sensitive information from tool arguments."""

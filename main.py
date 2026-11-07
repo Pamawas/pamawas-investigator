@@ -173,18 +173,61 @@ async def ready():
 
 @app.post("/api/v1/investigate")
 async def investigate(incident_id: str):
-    """Trigger investigation for an incident."""
+    """Legacy transitional endpoint (deprecated).
+
+    The v1 frozen contract for investigation creation is
+    POST /api/v1/investigations (async, idempotent, service-token protected).
+    This unversioned endpoint is transitional and MUST be removed after
+    clients migrate. See pamawas-docs/system-design/api-workflow-contracts.md
+    §12 Compatibility.
+
+    To preserve the "do not maintain two paths with different authorization
+    or idempotency semantics" rule, this shim mirrors the async v1 creation
+    contract: it persists a queued run and returns 202, never inline findings.
+    """
     if investigator is None:
         return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
-    log.info("investigation_started", incident_id=incident_id)
-    findings = investigator.investigate(incident_id)
+    log.info("legacy_investigate_deprecated", incident_id=incident_id)
 
-    return {
-        "incident_id": incident_id,
-        "findings": [f.to_dict() for f in findings],
-        "completed": True,
-    }
+    import hashlib
+    request_key = f"{incident_id}:incident_created:1"
+    request_key_hash = hashlib.sha256(request_key.encode()).hexdigest()
+
+    run_id, existing_status = await _ensure_investigation_run(incident_id, request_key_hash)
+
+    if run_id is None:
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Internal server error"},
+        )
+
+    if existing_status is not None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "Investigation already exists",
+                "request_id": f"req_{request_key_hash[:26]}",
+                "data": {
+                    "run_id": run_id,
+                    "incident_id": incident_id,
+                    "status": existing_status,
+                },
+            },
+        )
+
+    return JSONResponse(
+        status_code=202,
+        content={
+            "request_id": f"req_{request_key_hash[:26]}",
+            "data": {
+                "run_id": run_id,
+                "incident_id": incident_id,
+                "status": "queued",
+            },
+        },
+        headers={"Deprecation": "true", "Link": "</api/v1/investigations>; rel=\"successor-version\""},
+    )
 
 
 class InvestigationRequest(BaseModel):
@@ -208,19 +251,83 @@ async def _verify_service_token(x_service_token: str | None = Header(None)) -> s
     return x_service_token
 
 
+async def _ensure_investigation_run(
+    incident_id: str, request_key_hash: str
+) -> tuple[str | None, str | None]:
+    """Persist (or fetch) an investigation run. Returns (run_id, existing_status).
+
+    run_id is the DB-generated id returned by create_investigation_run — never a
+    locally fabricated `irun_...`. existing_status is set only when the run
+    already exists (idempotent retry), else None for a newly created run.
+    """
+    if investigator is None:
+        return None, None
+
+    if not investigator.persistence:
+        log.error("persistence_not_available")
+        return None, None
+
+    try:
+        run_id, created_new = investigator.persistence.create_investigation_run(
+            incident_id=incident_id,
+            request_key_hash=request_key_hash,
+            model_provider=investigator.config.llm_base_url,
+            model_name=investigator.config.llm_model,
+            prompt_version="pamawas-investigator-v1",
+            tool_contract=1,
+            max_tool_calls=investigator.config.max_tool_calls,
+        )
+        if created_new:
+            return run_id, None
+        # Existing run - fetch its current status
+        existing_status = _get_run_status(run_id)
+        return run_id, existing_status
+    except (psycopg2.Error, RuntimeError) as e:
+        log.error("failed_to_persist_investigation_run", error=str(e))
+        return None, None
+
+
+def _get_run_status(run_id: str) -> str | None:
+    """Fetch a run's status, or None on failure."""
+    if not investigator or not investigator.persistence:
+        return None
+    try:
+        conn = investigator.persistence._get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT status FROM investigation_runs WHERE id = %s", (run_id,))
+            row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except (psycopg2.Error, RuntimeError) as e:
+        log.error("failed_to_get_run_status", error=str(e))
+        try:
+            investigator.persistence._get_connection().rollback()
+        except (psycopg2.Error, AttributeError):
+            pass
+        return None
+
+
 @app.post("/api/v1/investigations")
 async def create_investigation(
     request: InvestigationRequest,
     x_service_token: str | None = Header(None),
 ):
-    """Create an investigation run (idempotent on request_key_hash)."""
+    """Create an investigation run (idempotent on request_key_hash).
+
+    Frozen v1 contract (api-workflow-contracts.md §5):
+    - Caller: correlator, audience investigator, scope investigator:investigate
+    - Body: contract_version, incident_id, reason, correlation_version
+    - Idempotency key is deterministic from incident_id:reason:correlation_version
+    - Accepted response: 202 with request_id, data.run_id, data.status == "queued"
+    - Idempotent retry returns the same run_id; a changed request under the
+      same key returns 409.
+    """
     # Verify service token
     await _verify_service_token(x_service_token)
 
     if investigator is None:
         return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
-    # contract_version = request.contract_version  # not used in v1 contract
     incident_id = request.incident_id
     reason = request.reason
     correlation_version = request.correlation_version
@@ -230,67 +337,55 @@ async def create_investigation(
     request_key = f"{incident_id}:{reason}:{correlation_version}"
     request_key_hash = hashlib.sha256(request_key.encode()).hexdigest()
 
-    # Check if investigation run already exists (idempotency)
-    if investigator.persistence:
-        existing_run_id = None
-        existing_status = None
-        try:
-            conn = investigator.persistence._get_connection()
-            with conn.cursor() as cursor:
-                query = (
-                    "SELECT id, status FROM investigation_runs "
-                    "WHERE incident_id = %s AND request_key_hash = %s"
-                )
-                cursor.execute(query, (incident_id, request_key_hash))
-                existing = cursor.fetchone()
-                if existing:
-                    existing_run_id, existing_status = existing
-            # A read-only SELECT still opens a transaction because autocommit is
-            # off. Commit it so the connection is returned to a clean state and
-            # does not leak an open transaction on every request.
-            conn.commit()
-        except (psycopg2.Error, RuntimeError) as e:
-            log.error("failed_to_check_existing_run", error=str(e))
-            try:
-                conn.rollback()
-            except (psycopg2.Error, AttributeError):
-                pass
-            return JSONResponse(status_code=500, content={"error": "Internal server error"})
+    # Persist (or fetch) the run first, capturing the real DB run_id. This
+    # closes the race where the async kick-off and the idempotency check
+    # previously both fabricated a run_id locally.
+    run_id, existing_status = await _ensure_investigation_run(
+        incident_id, request_key_hash
+    )
 
-        if existing_run_id:
-            # Run already exists - return conflict per contract
-            log.info(
-                "investigation_already_exists",
-                incident_id=incident_id,
-                run_id=existing_run_id,
-            )
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "error": "Investigation already exists",
-                    "request_id": f"req_{request_key_hash[:26]}",
-                    "data": {
-                        "run_id": existing_run_id,
-                        "incident_id": incident_id,
-                        "status": existing_status or "unknown",
-                    },
+    if run_id is None:
+        return JSONResponse(status_code=500, content={"error": "Internal server error"})
+
+    if existing_status is not None:
+        # Run already exists - return conflict per contract
+        log.info(
+            "investigation_already_exists",
+            incident_id=incident_id,
+            run_id=run_id,
+        )
+        return JSONResponse(
+            status_code=409,
+            content={
+                "error": "Investigation already exists",
+                "request_id": f"req_{request_key_hash[:26]}",
+                "data": {
+                    "run_id": run_id,
+                    "incident_id": incident_id,
+                    "status": existing_status,
                 },
-            )
+            },
+        )
 
-    # Run investigation asynchronously
+    # New run persisted. Kick off the investigation asynchronously in the
+    # background; return 202 with status "queued" per the frozen contract.
     log.info("investigation_started", incident_id=incident_id, reason=reason)
-    investigator.investigate(incident_id, request_key_hash=request_key_hash)
+    import asyncio
+    asyncio.get_running_loop().create_task(
+        investigator.investigate_async(incident_id, request_key_hash)
+    )
 
-    run_id = f"irun_{request_key_hash[:26]}"
-
-    return {
-        "request_id": f"req_{request_key_hash[:26]}",
-        "data": {
-            "run_id": run_id,
-            "incident_id": incident_id,
-            "status": "completed"
-        }
-    }
+    return JSONResponse(
+        status_code=202,
+        content={
+            "request_id": f"req_{request_key_hash[:26]}",
+            "data": {
+                "run_id": run_id,
+                "incident_id": incident_id,
+                "status": "queued",
+            },
+        },
+    )
 
 
 @app.get("/api/v1/status")
