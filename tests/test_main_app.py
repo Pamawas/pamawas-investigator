@@ -63,21 +63,26 @@ def test_health_returns_database_error(cursor):
     assert response.json()["error"] == "offline"
 
 
-def test_investigate_endpoint_serializes_findings():
+def test_investigate_endpoint_is_deprecated_shim():
+    """The legacy /api/v1/investigate endpoint is a deprecation shim that mirrors
+    the async v1 creation contract: persist a queued run and return 202, never
+    inline findings."""
+    from unittest.mock import AsyncMock
+
     service = MagicMock()
-    service.investigate.return_value = [Finding(EvidenceType.FACT, "observed", "metrics", 0.9)]
     service.db_conn = MagicMock()
+    service.persistence.create_investigation_run.return_value = ("irun_legacy1", True)
+    service.investigate_async = AsyncMock()
     with client_with(service) as client:
         response = client.post("/api/v1/investigate", params={"incident_id": "inc-1"})
-    assert response.status_code == 200
-    assert response.json() == {
-        "incident_id": "inc-1",
-        "findings": [
-            {"type": "fact", "content": "observed", "source": "metrics", "confidence": 0.9}
-        ],
-        "completed": True,
-    }
-    service.investigate.assert_called_once_with("inc-1")
+    assert response.status_code == 202
+    assert response.headers["Deprecation"] == "true"
+    body = response.json()
+    assert body["data"]["incident_id"] == "inc-1"
+    assert body["data"]["status"] == "queued"
+    assert body["data"]["run_id"] == "irun_legacy1"
+    # The shim must not invoke the synchronous investigator path.
+    service.investigate.assert_not_called()
 
 
 def test_status_reports_uptime(monkeypatch):
@@ -181,14 +186,17 @@ def test_create_investigation_idempotent_returns_409():
     import os
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
-    # Mock persistence that returns existing run
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = ("irun_existing123", "completed")
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-
+    # Mock persistence that reports an existing run (created_new=False).
+    # The idempotency SELECT lives inside create_investigation_run, so the
+    # endpoint mock is at the persistence-method level, not the connection level.
     mock_persistence = MagicMock()
-    mock_persistence._get_connection.return_value = mock_conn
+    mock_persistence.create_investigation_run.return_value = ("irun_existing123", False)
+    # _get_run_status reads the existing run's status on the idempotent-retry path
+    status_conn = MagicMock()
+    status_cursor = MagicMock()
+    status_cursor.fetchone.return_value = ("completed",)
+    status_conn.cursor.return_value.__enter__.return_value = status_cursor
+    mock_persistence._get_connection.return_value = status_conn
 
     service = MagicMock()
     service.persistence = mock_persistence
@@ -212,30 +220,20 @@ def test_create_investigation_idempotent_returns_409():
 
 
 def test_create_investigation_success():
-    """Test successful investigation creation."""
+    """Test successful investigation creation returns 202 queued per the frozen
+    v1 contract; the run is persisted before the async kick-off."""
     import os
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
+    from unittest.mock import AsyncMock
+
     mock_persistence = MagicMock()
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = None  # No existing run
-    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
-    mock_persistence._get_connection.return_value = mock_conn
+    mock_persistence.create_investigation_run.return_value = ("irun_new_run", True)
 
     service = MagicMock()
     service.persistence = mock_persistence
     service.db_conn = MagicMock()
-    service.investigate.return_value = [
-        MagicMock(
-            to_dict=lambda: {
-                "type": "fact",
-                "content": "CPU high",
-                "source": "prometheus",
-                "confidence": 0.9
-            }
-        )
-    ]
+    service.investigate_async = AsyncMock()
 
     with client_with(service) as client:
         response = client.post(
@@ -248,24 +246,27 @@ def test_create_investigation_success():
             },
             headers={"x-service-token": "test-token"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 202
         data = response.json()
         assert data["data"]["incident_id"] == "inc-1"
-        assert data["data"]["status"] == "completed"
-        assert data["data"]["run_id"].startswith("irun_")
-        service.investigate.assert_called_once()
+        assert data["data"]["status"] == "queued"
+        assert data["data"]["run_id"] == "irun_new_run"
+        # The endpoint must not invoke the synchronous investigator path.
+        service.investigate.assert_not_called()
 
 
 def test_create_investigation_commits_idempotency_check():
-    """The idempotency SELECT must commit, not leak an open transaction.
-
-    autocommit is off, so a bare SELECT leaves the transaction open. Each
-    request must return the connection to a clean state or every call leaks a
-    connection that stays idle-in-transaction until the process exits.
+    """The idempotency check lives inside create_investigation_run, which owns
+    the connection and must commit on success (autocommit is off, so a bare
+    SELECT leaves the transaction open). Each request must return the
+    connection to a clean state or every call leaks a connection that stays
+    idle-in-transaction until the process exits.
     """
     import os
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
+    from unittest.mock import AsyncMock
+
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_cursor.fetchone.return_value = None  # No existing run
@@ -273,11 +274,13 @@ def test_create_investigation_commits_idempotency_check():
 
     mock_persistence = MagicMock()
     mock_persistence._get_connection.return_value = mock_conn
+    # create_investigation_run owns the transaction; the endpoint delegates to it.
+    mock_persistence.create_investigation_run.return_value = ("irun_new_run", True)
 
     service = MagicMock()
     service.persistence = mock_persistence
     service.db_conn = MagicMock()
-    service.investigate.return_value = []
+    service.investigate_async = AsyncMock()
 
     with client_with(service) as client:
         response = client.post(
@@ -290,7 +293,7 @@ def test_create_investigation_commits_idempotency_check():
             },
             headers={"x-service-token": "test-token"}
         )
-        assert response.status_code == 200
+        assert response.status_code == 202
 
     mock_conn.commit.assert_called_once()
     mock_conn.rollback.assert_not_called()
