@@ -97,7 +97,8 @@ class TestInvestigatorLLM:
         assert llm.model == "gpt-4o-mini"
         mock_openai.assert_called_once_with(
             base_url="https://api.openai.com/v1",
-            api_key="test-key"
+            api_key="test-key",
+            timeout=30.0,
         )
 
 
