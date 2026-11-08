@@ -85,7 +85,7 @@ async def lifespan(app: FastAPI):
         investigator = PamawasInvestigator(config)
         set_running(True)
         log.info("investigator_ready")
-    except Exception as e:
+    except (psycopg2.Error, RuntimeError, ValueError, OSError) as e:
         log.error("investigator_init_failed", error=str(e))
         raise
 
@@ -226,7 +226,10 @@ async def investigate(incident_id: str):
                 "status": "queued",
             },
         },
-        headers={"Deprecation": "true", "Link": "</api/v1/investigations>; rel=\"successor-version\""},
+        headers={
+            "Deprecation": "true",
+            "Link": '</api/v1/investigations>; rel="successor-version"',
+        },
     )
 
 
@@ -377,7 +380,7 @@ async def create_investigation(
     log.info("investigation_started", incident_id=incident_id, reason=reason)
     import asyncio
     asyncio.get_running_loop().create_task(
-        investigator.investigate_async(incident_id, request_key_hash)
+        _run_investigation_task(run_id, incident_id, request_key_hash)
     )
 
     return JSONResponse(
@@ -404,6 +407,55 @@ async def status():
         "uptime_seconds": time.time() - start_time,
         "version": APP_VERSION,
     }
+
+
+@app.get("/api/v1/investigations/{run_id}")
+async def get_investigation_status(run_id: str):
+    """Fetch the current status of an investigation run.
+
+    Frozen v1 contract (api-workflow-contracts.md §6): callers poll this
+    endpoint after receiving 202 from POST /api/v1/investigations. The
+    investigation runs asynchronously, so the status transitions
+    queued -> running -> completed | failed.
+    """
+    if investigator is None or not investigator.persistence:
+        return JSONResponse(
+            status_code=503, content={"error": "Investigator not initialized"}
+        )
+
+    current_status = _get_run_status(run_id)
+    if current_status is None:
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Investigation not found", "run_id": run_id},
+        )
+
+    return {
+        "run_id": run_id,
+        "status": current_status,
+    }
+
+
+async def _run_investigation_task(run_id: str, incident_id: str, request_key_hash: str):
+    """Background wrapper around investigate_async.
+
+    The investigation runs in a fire-and-forget task spawned from the HTTP
+    endpoint. If it raises, the run is marked failed so the client does not
+    poll a stuck "queued" run forever. Exceptions are logged and swallowed —
+    the run status is the single source of truth for the client.
+    """
+    try:
+        await investigator.investigate_async(incident_id, request_key_hash)
+    except Exception as e:
+        log.error(
+            "investigation_task_failed",
+            run_id=run_id,
+            incident_id=incident_id,
+            error=str(e),
+        )
+        if investigator.persistence:
+            investigator.persistence.mark_run_failed(run_id, error=str(e))
+        raise
 
 
 def main():

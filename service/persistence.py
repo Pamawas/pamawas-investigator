@@ -9,8 +9,7 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extras
-from psycopg2 import pool
-
+import psycopg2.pool
 
 from models import Finding
 
@@ -154,20 +153,68 @@ class InvestigationPersistence:
                     cursor.execute(query, (incident_id, request_key_hash))
                     existing = cursor.fetchone()
                     if existing:
+                        conn.commit()
                         logger.info(
                             f"Investigation run {existing[0]} already exists for "
                             f"incident {incident_id}"
                         )
                         return existing[0], False
-                    # Should not happen
-                    conn.rollback()
+                    # Should not happen - the row should exist for this key
                     raise RuntimeError("Failed to create or find investigation run")
-        except Exception as e:
+        except (psycopg2.Error, RuntimeError) as e:
             conn.rollback()
             logger.error(f"Failed to create investigation run: {e}")
             raise
         finally:
             self._put_connection(conn)
+
+    def mark_run_failed(
+        self,
+        run_id: str,
+        error: str | None = None,
+    ) -> bool:
+        """Mark a run as failed.
+
+        Idempotent: a run already in a terminal state (completed, failed,
+        failed_terminal) is left untouched so a retry of a completed run
+        does not regress it to failed.
+
+        Returns True if the status was updated, False otherwise.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs
+                    SET status = 'failed', updated_at = %s,
+                        completed_at = %s, safe_error_code = %s
+                    WHERE id = %s
+                      AND status NOT IN ('completed', 'failed', 'failed_terminal')
+                    """,
+                    (now, now, error, run_id),
+                )
+                updated = cursor.rowcount > 0
+            conn.commit()
+            logger.info(
+                "Marked investigation run %s as failed (updated=%s)",
+                run_id,
+                updated,
+            )
+            return updated
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to mark run %s as failed: %s", run_id, e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return False
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
 
     def update_run_status(
         self,
@@ -209,7 +256,7 @@ class InvestigationPersistence:
                 cursor.execute(query, params)
                 conn.commit()
                 logger.info(f"Updated investigation run {run_id} status to {status}")
-        except Exception as e:
+        except (psycopg2.Error, RuntimeError) as e:
             conn.rollback()
             logger.error(f"Failed to update run status: {e}")
             raise
@@ -258,7 +305,7 @@ class InvestigationPersistence:
                 conn.commit()
                 logger.info(f"Inserted tool execution {exec_id} for run {run_id}")
                 return exec_id
-        except Exception as e:
+        except (psycopg2.Error, RuntimeError) as e:
             conn.rollback()
             logger.error(f"Failed to insert tool execution: {e}")
             raise
@@ -329,7 +376,7 @@ class InvestigationPersistence:
                 conn.commit()
                 logger.info(f"Inserted {len(evidence_ids)} evidence records for run {run_id}")
                 return evidence_ids
-        except Exception as e:
+        except (psycopg2.Error, RuntimeError) as e:
             conn.rollback()
             logger.error(f"Failed to insert evidence: {e}")
             raise

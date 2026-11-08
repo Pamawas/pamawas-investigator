@@ -27,7 +27,11 @@ def test_llm_initialization_and_completion(config):
         llm = InvestigatorLLM(config)
         result = llm.chat_completion([{"role": "user", "content": "hi"}], tools=[])
     assert result is message
-    openai.assert_called_once_with(base_url=config.llm_base_url, api_key=config.llm_api_key)
+    openai.assert_called_once_with(
+        base_url=config.llm_base_url,
+        api_key=config.llm_api_key,
+        timeout=30.0,
+    )
     client.chat.completions.create.assert_called_once_with(
         model="test-model",
         messages=[{"role": "user", "content": "hi"}],

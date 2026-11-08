@@ -38,12 +38,32 @@ except ImportError:
 class InvestigatorLLM:
     """OpenAI-compatible LLM client for the investigator."""
 
+    # Bounded retry policy: transient network/5xx errors are retried with
+    # exponential backoff; anything else fails fast.
+    MAX_RETRIES = 3
+    INITIAL_BACKOFF_SECONDS = 0.5
+    MAX_BACKOFF_SECONDS = 4.0
+    # SDK-level timeout (seconds) applied to every request. Without this a
+    # hung endpoint blocks the investigation loop with no wall-clock cap.
+    REQUEST_TIMEOUT = 30.0
+
     def __init__(self, config: Config):
         self.client = OpenAI(
             base_url=config.llm_base_url,
-            api_key=config.llm_api_key
+            api_key=config.llm_api_key,
+            timeout=self.REQUEST_TIMEOUT,
         )
         self.model = config.llm_model
+
+    def _is_retryable(self, error: Exception) -> bool:
+        """Return True for transient errors worth retrying."""
+        if isinstance(error, openai.APITimeoutError):
+            return True
+        if isinstance(error, openai.APIConnectionError):
+            return True
+        if isinstance(error, openai.APIStatusError) and error.status_code >= 500:
+            return True
+        return False
 
     def chat_completion(
         self,
@@ -51,20 +71,55 @@ class InvestigatorLLM:
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
     ):
-        """Call the LLM with optional tool use."""
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                temperature=0.1,  # Low temperature for more deterministic output
-                max_tokens=2000
-            )
-            return response.choices[0].message
-        except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            raise
+        """Call the LLM with optional tool use.
+
+        Retries transient errors (timeouts, connection failures, 5xx) with
+        bounded exponential backoff. Non-retryable errors (4xx, auth, bad
+        request) propagate immediately.
+        """
+        import time as _time
+
+        last_error: Exception | None = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    temperature=0.1,  # Low temperature for more deterministic output
+                    max_tokens=2000,
+                )
+                return response.choices[0].message
+            except (
+                openai.OpenAIError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                TimeoutError,
+            ) as e:
+                last_error = e
+                if not self._is_retryable(e) or attempt == self.MAX_RETRIES - 1:
+                    logger.error("LLM call failed: %s", e)
+                    raise
+                backoff = min(
+                    self.INITIAL_BACKOFF_SECONDS * (2 ** attempt),
+                    self.MAX_BACKOFF_SECONDS,
+                )
+                logger.warning(
+                    "LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
+                    attempt + 1,
+                    self.MAX_RETRIES,
+                    backoff,
+                    e,
+                )
+                _time.sleep(backoff)
+
+        # Unreachable: the loop always raises on the last attempt.
+        if last_error is not None:  # pragma: no cover - defensive
+            raise last_error
+        raise RuntimeError("LLM call failed after retries")  # pragma: no cover
 
 
 class PamawasInvestigator:

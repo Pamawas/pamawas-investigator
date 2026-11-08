@@ -5,7 +5,6 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 import main
-from models import EvidenceType, Finding
 
 
 @contextmanager
@@ -267,15 +266,22 @@ def test_create_investigation_commits_idempotency_check():
 
     from unittest.mock import AsyncMock
 
+    # Use the real InvestigationPersistence class with mocked connection pool
+    from service.persistence import InvestigationPersistence
+
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.return_value = None  # No existing run
+    mock_cursor.fetchone.side_effect = [("irun_new_run",),]  # INSERT RETURNING returns the row
+    mock_cursor.rowcount = 1
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
-    mock_persistence = MagicMock()
-    mock_persistence._get_connection.return_value = mock_conn
-    # create_investigation_run owns the transaction; the endpoint delegates to it.
-    mock_persistence.create_investigation_run.return_value = ("irun_new_run", True)
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+    mock_pool.putconn = MagicMock()
+    mock_pool.closeall = MagicMock()
+
+    mock_persistence = InvestigationPersistence(database_url="test://url")
+    mock_persistence._pool = mock_pool
 
     service = MagicMock()
     service.persistence = mock_persistence
@@ -304,13 +310,21 @@ def test_create_investigation_rolls_back_on_idempotency_check_failure():
     import os
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
+    from service.persistence import InvestigationPersistence
+
+    # Use the real InvestigationPersistence class with mocked connection pool
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_cursor.fetchone.side_effect = RuntimeError("db down")
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
-    mock_persistence = MagicMock()
-    mock_persistence._get_connection.return_value = mock_conn
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+    mock_pool.putconn = MagicMock()
+    mock_pool.closeall = MagicMock()
+
+    mock_persistence = InvestigationPersistence(database_url="test://url")
+    mock_persistence._pool = mock_pool
 
     service = MagicMock()
     service.persistence = mock_persistence
@@ -332,3 +346,54 @@ def test_create_investigation_rolls_back_on_idempotency_check_failure():
 
     mock_conn.commit.assert_not_called()
     mock_conn.rollback.assert_called_once()
+
+
+def test_get_investigation_status_returns_status():
+    """GET /api/v1/investigations/{run_id} returns current status."""
+    mock_persistence = MagicMock()
+    conn = MagicMock()
+    mock_persistence._get_connection.return_value = conn
+    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (
+        "completed",
+    )
+
+    service = MagicMock()
+    service.persistence = mock_persistence
+    service.db_conn = MagicMock()
+
+    with client_with(service) as client:
+        response = client.get("/api/v1/investigations/irch_abc123")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["run_id"] == "irch_abc123"
+    assert data["status"] == "completed"
+
+
+def test_get_investigation_status_returns_404_for_missing_run():
+    """GET /api/v1/investigations/{run_id} returns 404 if run not found."""
+    mock_persistence = MagicMock()
+    conn = MagicMock()
+    mock_persistence._get_connection.return_value = conn
+    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (
+        None,
+    )
+
+    service = MagicMock()
+    service.persistence = mock_persistence
+    service.db_conn = MagicMock()
+
+    with client_with(service) as client:
+        response = client.get("/api/v1/investigations/irch_notfound")
+
+    assert response.status_code == 404
+    assert response.json()["error"] == "Investigation not found"
+
+
+def test_get_investigation_status_returns_503_when_uninitialized():
+    """GET /api/v1/investigations/{run_id} returns 503 if investigator not ready."""
+    with client_with(None) as client:
+        response = client.get("/api/v1/investigations/irch_abc")
+
+    assert response.status_code == 503
+    assert "error" in response.json()

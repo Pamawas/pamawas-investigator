@@ -129,18 +129,29 @@ class LokiFetcher(LogsFetcher):
         tmpl = self.query_template
         query = tmpl % incident_id if "%s" in tmpl else tmpl
 
-        # Default 5-minute window
+        # Normalize the caller-provided window. A missing/invalid end falls
+        # back to now; a missing/invalid start defaults to 5 minutes before
+        # end. The caller's start is always honored when provided — never
+        # silently replaced with a hardcoded window.
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-            # Calculate start time as 5 minutes before end (300 seconds)
-            start_ts = end_dt.timestamp() - 300  # 5 minutes in seconds
-            start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-        except ValueError:
+        except (ValueError, AttributeError):
             end_dt = datetime.now(tz=timezone.utc)
-            start_ts = end_dt.timestamp() - 300
-            start_dt = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-            start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-            end = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        if start:
+            try:
+                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                start_dt = datetime.fromtimestamp(
+                    end_dt.timestamp() - 300, tz=timezone.utc
+                )
+        else:
+            start_dt = datetime.fromtimestamp(
+                end_dt.timestamp() - 300, tz=timezone.utc
+            )
+
+        start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         self._validate_logql(query)
 
