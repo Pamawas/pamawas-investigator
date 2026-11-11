@@ -30,10 +30,7 @@ class TestFinding:
 
     def test_finding_creation(self):
         finding = Finding(
-            type=EvidenceType.FACT,
-            content="Test fact",
-            source="prometheus",
-            confidence=0.95
+            type=EvidenceType.FACT, content="Test fact", source="prometheus", confidence=0.95
         )
         assert finding.type == EvidenceType.FACT
         assert finding.content == "Test fact"
@@ -81,7 +78,7 @@ class TestInvestigationConfig:
 class TestInvestigatorLLM:
     """Test LLM client"""
 
-    @patch('service.investigator.OpenAI')
+    @patch("service.investigator.OpenAI")
     def test_llm_initialization(self, mock_openai):
         config = InvestigationConfig(
             database_url="postgres://test:***@localhost/test",
@@ -124,9 +121,9 @@ class TestInvestigatorTools:
 
     def test_query_prometheus(self):
         result = self.tools.query_prometheus(
-            promql='rate(http_requests_total[5m])',
-            start='2026-01-01T00:00:00Z',
-            end='2026-01-01T01:00:00Z'
+            promql="rate(http_requests_total[5m])",
+            start="2026-01-01T00:00:00Z",
+            end="2026-01-01T01:00:00Z",
         )
 
         assert result["status"] == "success"
@@ -136,9 +133,9 @@ class TestInvestigatorTools:
     def test_query_loki(self):
         result = self.tools.query_loki(
             logql='{job="api-server"} |= "error"',
-            start='2026-01-01T00:00:00Z',
-            end='2026-01-01T01:00:00Z',
-            limit=50
+            start="2026-01-01T00:00:00Z",
+            end="2026-01-01T01:00:00Z",
+            limit=50,
         )
 
         assert result["status"] == "success"
@@ -146,9 +143,7 @@ class TestInvestigatorTools:
 
     def test_get_recent_deployments(self):
         result = self.tools.get_recent_deployments(
-            service="payment-api",
-            start='2026-01-01T00:00:00Z',
-            end='2026-01-01T01:00:00Z'
+            service="payment-api", start="2026-01-01T00:00:00Z", end="2026-01-01T01:00:00Z"
         )
 
         assert result["status"] == "success"
@@ -157,8 +152,7 @@ class TestInvestigatorTools:
 
     def test_get_related_incidents(self):
         result = self.tools.get_related_incidents(
-            service="payment-api",
-            symptom_keywords=["latency", "timeout"]
+            service="payment-api", symptom_keywords=["latency", "timeout"]
         )
 
         assert result["status"] == "success"
@@ -171,14 +165,14 @@ class TestInvestigatorTools:
                 type=EvidenceType.FACT,
                 content="CPU usage spiked to 95%",
                 source="prometheus",
-                confidence=0.9
+                confidence=0.9,
             ),
             Finding(
                 type=EvidenceType.LIKELY_CAUSE,
                 content="Deployment caused resource exhaustion",
                 source="investigator",
-                confidence=0.75
-            )
+                confidence=0.75,
+            ),
         ]
 
         result = self.tools.submit_findings(findings)
@@ -221,7 +215,7 @@ class TestPamawasInvestigator:
         assert len(truncated) <= 1000
         assert "TRUNCATED" in truncated
 
-    @patch('openai.OpenAI')
+    @patch("openai.OpenAI")
     def test_investigate_without_db(self, mock_openai):
         # Mock the LLM response
         mock_client = Mock()
@@ -246,6 +240,7 @@ class TestSystemPrompt:
         # This is a documentation test - the system prompt is in the _build_system_prompt method
         # We verify the key instructions are present by checking the source
         import inspect
+
         source = inspect.getsource(PamawasInvestigator._build_system_prompt)
 
         assert "Understand the symptom and blast radius" in source

@@ -223,6 +223,7 @@ class TestInsertToolExecution:
         assert args[3] == "get_deployment"  # tool_name
         # arguments_redacted is JSON in position 4
         import json
+
         redacted = json.loads(args[4]) if isinstance(args[4], str) else args[4]
         assert redacted["api_key"] == "[REDACTED]"
         assert redacted["password"] == "[REDACTED]"
@@ -241,6 +242,7 @@ class TestConnectionPoolManagement:
 
         # Getting connection should raise
         import pytest
+
         with pytest.raises(RuntimeError, match="Database URL not configured"):
             pers._get_connection()
 

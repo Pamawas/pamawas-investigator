@@ -68,9 +68,7 @@ class PrometheusFetcher(MetricsFetcher):
             if re.search(pattern, promql, re.IGNORECASE):
                 raise ValueError(f"PromQL query contains prohibited pattern: {pattern}")
 
-    async def _query_instant(
-        self, promql: str, eval_time: str | None = None
-    ) -> dict[str, Any]:
+    async def _query_instant(self, promql: str, eval_time: str | None = None) -> dict[str, Any]:
         """Execute a Prometheus instant query."""
         client = await self._get_client()
         params = {"query": promql}
@@ -89,9 +87,7 @@ class PrometheusFetcher(MetricsFetcher):
 
         return data
 
-    async def fetch_async(
-        self, incident_id: str, start: str, end: str
-    ) -> list[dict[str, Any]]:
+    async def fetch_async(self, incident_id: str, start: str, end: str) -> list[dict[str, Any]]:
         """Fetch Prometheus metrics for an incident using instant query.
 
         Args:
@@ -147,20 +143,21 @@ class PrometheusFetcher(MetricsFetcher):
                 if isinstance(value_data, list) and len(value_data) >= 2:
                     try:
                         value = float(value_data[1])
-                    except (ValueError, TypeError):
+                    except ValueError, TypeError:
                         value = 0.0
 
-            labels = {k: v for k, v in item.get("labels", {}).items()
-                      if k != "__name__"}
+            labels = {k: v for k, v in item.get("labels", {}).items() if k != "__name__"}
 
             # For instant query, use the timestamp from the result or current time
             at = datetime.now(tz=timezone.utc)
-            metrics.append({
-                "name": metric_name,
-                "value": value,
-                "labels": labels,
-                "at": at,
-            })
+            metrics.append(
+                {
+                    "name": metric_name,
+                    "value": value,
+                    "labels": labels,
+                    "at": at,
+                }
+            )
 
         return metrics
 

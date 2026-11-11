@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class PrometheusConfig:
     """Configuration for Prometheus adapter."""
+
     base_url: str
     timeout_seconds: float = 10.0
     max_response_bytes: int = 1_000_000  # 1MB
@@ -36,21 +37,25 @@ class PrometheusConfig:
 
 class PrometheusError(Exception):
     """Base exception for Prometheus adapter errors."""
+
     pass
 
 
 class PrometheusTimeoutError(PrometheusError):
     """Prometheus query timed out."""
+
     pass
 
 
 class PrometheusResponseTooLargeError(PrometheusError):
     """Prometheus response exceeded size limits."""
+
     pass
 
 
 class PrometheusQueryValidationError(PrometheusError):
     """Prometheus query validation failed."""
+
     pass
 
 
@@ -100,7 +105,7 @@ class PrometheusAdapter:
         # Basic injection prevention - reject suspicious patterns
         dangerous_patterns = [
             r";\s*\w",  # Multiple statements
-            r"--\s",    # SQL comments
+            r"--\s",  # SQL comments
             r"/\*.*\*/",  # Block comments
             r"union\s+select",  # SQL injection (case insensitive)
         ]
@@ -118,9 +123,7 @@ class PrometheusAdapter:
             start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
         except ValueError as e:
-            raise PrometheusQueryValidationError(
-                f"Invalid timestamp format (use RFC3339): {e}"
-            )
+            raise PrometheusQueryValidationError(f"Invalid timestamp format (use RFC3339): {e}")
 
         if start_dt.tzinfo is None or end_dt.tzinfo is None:
             raise PrometheusQueryValidationError("Timestamps must include timezone (RFC3339)")
@@ -203,9 +206,7 @@ class PrometheusAdapter:
         self.validate_time_range(start, end)
 
         if step_seconds <= 0 or step_seconds > 86400:
-            raise PrometheusQueryValidationError(
-                "Step must be between 1 and 86400 seconds"
-            )
+            raise PrometheusQueryValidationError("Step must be between 1 and 86400 seconds")
 
         client = await self._get_client()
 

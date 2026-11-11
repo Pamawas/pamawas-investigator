@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class DeploymentConfig:
     """Configuration for deployment adapter."""
+
     base_url: str | None = None
     timeout_seconds: float = 10.0
     max_results: int = 50
@@ -31,11 +32,13 @@ class DeploymentConfig:
 
 class DeploymentAdapterError(Exception):
     """Base exception for deployment adapter errors."""
+
     pass
 
 
 class DeploymentAdapterNotConfiguredError(DeploymentAdapterError):
     """Deployment adapter is not configured."""
+
     pass
 
 
@@ -63,6 +66,7 @@ class DeploymentAdapter:
             return None
 
         import httpx
+
         if self._client is None or self._client.is_closed:
             headers = {}
             if self.config.api_key:
@@ -129,8 +133,7 @@ class DeploymentAdapter:
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "unavailable")
             logger.info(
-                "Deployment adapter not configured, returning unavailable for "
-                "service: %s",
+                "Deployment adapter not configured, returning unavailable for service: %s",
                 service,
             )
             return self._unavailable_response("deployment_adapter_not_configured")
@@ -226,9 +229,7 @@ class DeploymentAdapter:
             return self._unavailable_response("circuit_breaker_open")
 
         try:
-            response = await client.get(
-                f"/api/v1/deployments/{service}/{version}"
-            )
+            response = await client.get(f"/api/v1/deployments/{service}/{version}")
             response.raise_for_status()
 
             self._circuit_breaker.record_success()

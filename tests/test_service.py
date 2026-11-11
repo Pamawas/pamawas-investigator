@@ -122,6 +122,7 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
     # Mock the async adapters directly - use AsyncMock for async methods
     from unittest.mock import AsyncMock
+
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": [1]}
     )

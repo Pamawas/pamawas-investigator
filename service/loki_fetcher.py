@@ -76,9 +76,7 @@ class LokiFetcher(LogsFetcher):
         """Parse Unix timestamp to datetime."""
         return datetime.fromtimestamp(ts, tz=timezone.utc)
 
-    async def _query_range(
-        self, logql: str, start: str, end: str, limit: int
-    ) -> dict[str, Any]:
+    async def _query_range(self, logql: str, start: str, end: str, limit: int) -> dict[str, Any]:
         """Execute a Loki query_range request."""
         client = await self._get_client()
 
@@ -135,20 +133,16 @@ class LokiFetcher(LogsFetcher):
         # silently replaced with a hardcoded window.
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
+        except ValueError, AttributeError:
             end_dt = datetime.now(tz=timezone.utc)
 
         if start:
             try:
                 start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            except (ValueError, AttributeError):
-                start_dt = datetime.fromtimestamp(
-                    end_dt.timestamp() - 300, tz=timezone.utc
-                )
+            except ValueError, AttributeError:
+                start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
         else:
-            start_dt = datetime.fromtimestamp(
-                end_dt.timestamp() - 300, tz=timezone.utc
-            )
+            start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
 
         start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         end = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -181,17 +175,19 @@ class LokiFetcher(LogsFetcher):
                 try:
                     ts = float(value[0])
                     line = str(value[1])
-                except (ValueError, TypeError):
+                except ValueError, TypeError:
                     continue
 
                 # Get stream name from labels
                 stream_name = stream.get("__name__", stream.get("stream", ""))
 
-                logs.append({
-                    "timestamp": self._parse_timestamp(ts),
-                    "stream": stream_name,
-                    "line": line,
-                })
+                logs.append(
+                    {
+                        "timestamp": self._parse_timestamp(ts),
+                        "stream": stream_name,
+                        "line": line,
+                    }
+                )
 
         return logs
 

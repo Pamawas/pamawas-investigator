@@ -16,6 +16,7 @@ except ImportError:
 
 class EvidenceType(StrEnum):
     """Evidence classification types."""
+
     FACT = "fact"
     LIKELY_CAUSE = "likely_cause"
     HYPOTHESIS = "hypothesis"
@@ -25,6 +26,7 @@ class EvidenceType(StrEnum):
 @dataclass
 class Finding:
     """Represents a piece of evidence or finding from the investigation."""
+
     type: EvidenceType
     content: str
     source: str
@@ -53,6 +55,7 @@ class Finding:
 @dataclass
 class IncidentContext:
     """Incident context loaded from database."""
+
     incident_id: str
     title: str
     status: str = ""
@@ -73,6 +76,7 @@ class IncidentContext:
 @dataclass
 class ToolResult:
     """Result of a tool call."""
+
     tool_name: str
     arguments: dict[str, Any]
     result: dict[str, Any]
@@ -87,6 +91,7 @@ class ToolResult:
 @dataclass
 class InvestigationState:
     """State of an ongoing investigation."""
+
     incident_id: str
     findings: list[Finding]
     tool_calls: list[ToolResult]
@@ -100,6 +105,7 @@ class InvestigationState:
 @dataclass
 class Metric:
     """Represents a single Prometheus metric sample."""
+
     name: str
     value: float
     labels: dict[str, str]
@@ -136,6 +142,7 @@ class Metric:
 @dataclass
 class LogEntry:
     """Represents a single Loki log line."""
+
     timestamp: datetime
     stream: str
     line: str
@@ -170,6 +177,7 @@ class LogEntry:
 @dataclass
 class Evidence:
     """Evidence created during investigation."""
+
     id: str
     incident_id: str
     run_id: str

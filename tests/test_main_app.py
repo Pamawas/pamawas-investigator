@@ -99,6 +99,7 @@ def test_lifespan_initializes_and_shuts_down(config):
     service = MagicMock()
     # Mock the async close method as AsyncMock
     from unittest.mock import AsyncMock
+
     service.close = AsyncMock()  # Mock the async close method
     shutdown = MagicMock()
     with (
@@ -126,6 +127,7 @@ def test_main_runs_uvicorn_with_config(config):
 def test_create_investigation_requires_service_token():
     """Test that /api/v1/investigations requires valid service token."""
     import os
+
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
     service = MagicMock()
@@ -140,7 +142,7 @@ def test_create_investigation_requires_service_token():
                 "incident_id": "inc-1",
                 "reason": "incident_created",
                 "correlation_version": 1,
-            }
+            },
         )
         assert response.status_code == 401
         assert response.json()["detail"] == "Invalid service token"
@@ -154,7 +156,7 @@ def test_create_investigation_requires_service_token():
                 "reason": "incident_created",
                 "correlation_version": 1,
             },
-            headers={"x-service-token": "wrong-token"}
+            headers={"x-service-token": "wrong-token"},
         )
         assert response.status_code == 401
 
@@ -174,7 +176,7 @@ def test_create_investigation_token_not_configured(monkeypatch):
                 "reason": "incident_created",
                 "correlation_version": 1,
             },
-            headers={"x-service-token": "any-token"}
+            headers={"x-service-token": "any-token"},
         )
         assert response.status_code == 503
         assert response.json()["detail"] == "Service token not configured"
@@ -183,6 +185,7 @@ def test_create_investigation_token_not_configured(monkeypatch):
 def test_create_investigation_idempotent_returns_409():
     """Test that duplicate investigation returns 409 conflict."""
     import os
+
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
     # Mock persistence that reports an existing run (created_new=False).
@@ -210,7 +213,7 @@ def test_create_investigation_idempotent_returns_409():
                 "reason": "incident_created",
                 "correlation_version": 1,
             },
-            headers={"x-service-token": "test-token"}
+            headers={"x-service-token": "test-token"},
         )
         assert response.status_code == 409
         assert response.json()["error"] == "Investigation already exists"
@@ -222,6 +225,7 @@ def test_create_investigation_success():
     """Test successful investigation creation returns 202 queued per the frozen
     v1 contract; the run is persisted before the async kick-off."""
     import os
+
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
     from unittest.mock import AsyncMock
@@ -243,7 +247,7 @@ def test_create_investigation_success():
                 "reason": "incident_created",
                 "correlation_version": 1,
             },
-            headers={"x-service-token": "test-token"}
+            headers={"x-service-token": "test-token"},
         )
         assert response.status_code == 202
         data = response.json()
@@ -262,6 +266,7 @@ def test_create_investigation_commits_idempotency_check():
     idle-in-transaction until the process exits.
     """
     import os
+
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
     from unittest.mock import AsyncMock
@@ -271,7 +276,9 @@ def test_create_investigation_commits_idempotency_check():
 
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
-    mock_cursor.fetchone.side_effect = [("irun_new_run",),]  # INSERT RETURNING returns the row
+    mock_cursor.fetchone.side_effect = [
+        ("irun_new_run",),
+    ]  # INSERT RETURNING returns the row
     mock_cursor.rowcount = 1
     mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
 
@@ -297,7 +304,7 @@ def test_create_investigation_commits_idempotency_check():
                 "reason": "incident_created",
                 "correlation_version": 1,
             },
-            headers={"x-service-token": "test-token"}
+            headers={"x-service-token": "test-token"},
         )
         assert response.status_code == 202
 
@@ -308,6 +315,7 @@ def test_create_investigation_commits_idempotency_check():
 def test_create_investigation_rolls_back_on_idempotency_check_failure():
     """A failed idempotency check must roll back, not leak the connection."""
     import os
+
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
     from service.persistence import InvestigationPersistence
@@ -339,7 +347,7 @@ def test_create_investigation_rolls_back_on_idempotency_check_failure():
                 "reason": "incident_created",
                 "correlation_version": 1,
             },
-            headers={"x-service-token": "test-token"}
+            headers={"x-service-token": "test-token"},
         )
         assert response.status_code == 500
         assert response.json()["error"] == "Internal server error"
@@ -353,9 +361,7 @@ def test_get_investigation_status_returns_status():
     mock_persistence = MagicMock()
     conn = MagicMock()
     mock_persistence._get_connection.return_value = conn
-    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (
-        "completed",
-    )
+    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = ("completed",)
 
     service = MagicMock()
     service.persistence = mock_persistence
@@ -375,9 +381,7 @@ def test_get_investigation_status_returns_404_for_missing_run():
     mock_persistence = MagicMock()
     conn = MagicMock()
     mock_persistence._get_connection.return_value = conn
-    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (
-        None,
-    )
+    conn.cursor.return_value.__enter__.return_value.fetchone.return_value = (None,)
 
     service = MagicMock()
     service.persistence = mock_persistence

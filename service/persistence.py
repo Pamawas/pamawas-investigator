@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class InvestigationRun:
     """Represents an investigation run record."""
+
     id: str
     incident_id: str
     request_key_hash: str
@@ -42,6 +43,7 @@ class InvestigationRun:
 @dataclass
 class ToolExecution:
     """Represents a tool execution record."""
+
     id: str
     run_id: str
     sequence_no: int
@@ -133,10 +135,17 @@ class InvestigationPersistence:
                     RETURNING id
                     """,
                     (
-                        run_id, incident_id, request_key_hash,
-                        model_provider, model_name, prompt_version,
-                        tool_contract, max_tool_calls,
-                        now, now, now,
+                        run_id,
+                        incident_id,
+                        request_key_hash,
+                        model_provider,
+                        model_name,
+                        prompt_version,
+                        tool_contract,
+                        max_tool_calls,
+                        now,
+                        now,
+                        now,
                     ),
                 )
                 result = cursor.fetchone()
@@ -295,11 +304,16 @@ class InvestigationPersistence:
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (
-                        exec_id, run_id, sequence_no, tool_name,
+                        exec_id,
+                        run_id,
+                        sequence_no,
+                        tool_name,
                         json.dumps(arguments_redacted),
                         json.dumps(result_summary),
                         result_hash,
-                        status, duration_ms, now,
+                        status,
+                        duration_ms,
+                        now,
                     ),
                 )
                 conn.commit()
@@ -341,12 +355,12 @@ class InvestigationPersistence:
         # Prepare enriched data as JSON
         mets = metrics or []
         logs_list = logs or []
-        metrics_json = json.dumps(
-            [m.to_dict() if isinstance(m, Metric) else m for m in mets]
-        )
+        metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in mets])
         logs_json = json.dumps(
-            [log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
-             for log_entry in logs_list]
+            [
+                log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
+                for log_entry in logs_list
+            ]
         )
 
         try:
@@ -363,12 +377,21 @@ class InvestigationPersistence:
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
-                            evidence_id, incident_id, run_id,
-                            finding.type.value, finding.content,
-                            finding.source, finding.confidence,
-                            [], [],  # supports/contradicts empty for MVP
-                            ordinal, now,
-                            metrics_json, logs_json, 1, now,
+                            evidence_id,
+                            incident_id,
+                            run_id,
+                            finding.type.value,
+                            finding.content,
+                            finding.source,
+                            finding.confidence,
+                            [],
+                            [],  # supports/contradicts empty for MVP
+                            ordinal,
+                            now,
+                            metrics_json,
+                            logs_json,
+                            1,
+                            now,
                         ),
                     )
                     evidence_ids.append(evidence_id)
@@ -419,12 +442,12 @@ class InvestigationPersistence:
             # Prepare JSON values
             mets = metrics or []
             logs_list = logs or []
-            metrics_json = json.dumps(
-                [m.to_dict() if isinstance(m, Metric) else m for m in mets]
-            )
+            metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in mets])
             logs_json = json.dumps(
-                [log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
-                 for log_entry in logs_list]
+                [
+                    log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
+                    for log_entry in logs_list
+                ]
             )
 
             # Update with version check
@@ -478,5 +501,6 @@ class InvestigationPersistence:
     def _hash_result(self, result: dict[str, Any]) -> str:
         """Create a hash of the result for deduplication."""
         import hashlib
+
         result_str = json.dumps(result, sort_keys=True, default=str)
         return hashlib.sha256(result_str.encode()).hexdigest()[:32]

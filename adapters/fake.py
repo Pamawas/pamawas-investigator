@@ -19,16 +19,19 @@ from metrics import increment_tool_calls, observe_tool_call_duration
 @dataclass
 class FakePrometheusResponse:
     """Pre-canned Prometheus response for testing."""
+
     status: str = "success"
     result_type: str = "matrix"
     results: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.results is None:
-            self.results = [{
-                "metric": {"__name__": "http_requests_total", "job": "test-service"},
-                "values": [[str(int(time.time())), "100"], [str(int(time.time()) + 60), "150"]],
-            }]
+            self.results = [
+                {
+                    "metric": {"__name__": "http_requests_total", "job": "test-service"},
+                    "values": [[str(int(time.time())), "100"], [str(int(time.time()) + 60), "150"]],
+                }
+            ]
         return {
             "status": self.status,
             "data": {
@@ -41,15 +44,18 @@ class FakePrometheusResponse:
 @dataclass
 class FakeLokiResponse:
     """Pre-canned Loki response for testing."""
+
     status: str = "success"
     results: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.results is None:
-            self.results = [{
-                "stream": {"job": "test-service", "level": "error"},
-                "values": [[str(int(time.time()) * 1e9), "Error: connection refused"]],
-            }]
+            self.results = [
+                {
+                    "stream": {"job": "test-service", "level": "error"},
+                    "values": [[str(int(time.time()) * 1e9), "Error: connection refused"]],
+                }
+            ]
         return {
             "status": self.status,
             "data": {"result": self.results},
@@ -59,17 +65,20 @@ class FakeLokiResponse:
 @dataclass
 class FakeDeploymentResponse:
     """Pre-canned deployment response for testing."""
+
     status: str = "success"
     deployments: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.deployments is None:
-            self.deployments = [{
-                "service": "test-service",
-                "version": "v1.0.0",
-                "deployed_at": "2026-01-01T00:00:00Z",
-                "image": "test-service:v1.0.0",
-            }]
+            self.deployments = [
+                {
+                    "service": "test-service",
+                    "version": "v1.0.0",
+                    "deployed_at": "2026-01-01T00:00:00Z",
+                    "image": "test-service:v1.0.0",
+                }
+            ]
         return {
             "status": self.status,
             "data": self.deployments,
@@ -79,23 +88,26 @@ class FakeDeploymentResponse:
 @dataclass
 class FakeRelatedIncidentsResponse:
     """Pre-canned related incidents response for testing."""
+
     status: str = "success"
     incidents: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.incidents is None:
-            self.incidents = [{
-                "incident_id": "inc_test123",
-                "title": "High latency in test-service",
-                "status": "resolved",
-                "started_at": "2026-01-01T00:00:00Z",
-                "resolved_at": "2026-01-01T01:00:00Z",
-                "severity": "high",
-                "environment": "test",
-                "affected_services": ["test-service"],
-                "correlation_policy": "pamawas-correlation-v1",
-                "correlation_version": 1,
-            }]
+            self.incidents = [
+                {
+                    "incident_id": "inc_test123",
+                    "title": "High latency in test-service",
+                    "status": "resolved",
+                    "started_at": "2026-01-01T00:00:00Z",
+                    "resolved_at": "2026-01-01T01:00:00Z",
+                    "severity": "high",
+                    "environment": "test",
+                    "affected_services": ["test-service"],
+                    "correlation_policy": "pamawas-correlation-v1",
+                    "correlation_version": 1,
+                }
+            ]
         return {
             "status": self.status,
             "data": self.incidents,

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RelatedIncidentsConfig:
     """Configuration for related incidents adapter."""
+
     database_url: str
     max_results: int = 10
     max_symptom_keywords: int = 20
@@ -27,6 +28,7 @@ class RelatedIncidentsConfig:
 
 class RelatedIncidentsError(Exception):
     """Base exception for related incidents adapter errors."""
+
     pass
 
 
@@ -69,9 +71,7 @@ class RelatedIncidentsAdapter:
         """Return circuit breaker state for health checks."""
         return self._circuit_breaker.snapshot()
 
-    def _build_symptom_conditions(
-        self, symptom_keywords: list[str]
-    ) -> tuple[str, list[Any]]:
+    def _build_symptom_conditions(self, symptom_keywords: list[str]) -> tuple[str, list[Any]]:
         """Build parameterized WHERE conditions for symptom keyword matching.
 
         Returns (where_clause, params) where where_clause includes WHERE keyword.
@@ -81,9 +81,7 @@ class RelatedIncidentsAdapter:
 
         # Sanitize and limit keywords
         sanitized = [
-            kw.strip()
-            for kw in symptom_keywords[: self.config.max_symptom_keywords]
-            if kw.strip()
+            kw.strip() for kw in symptom_keywords[: self.config.max_symptom_keywords] if kw.strip()
         ]
 
         if not sanitized:
@@ -158,9 +156,7 @@ class RelatedIncidentsAdapter:
                     params.append(environment.strip())
 
                 # Add symptom keyword conditions
-                symptom_clause, symptom_params = self._build_symptom_conditions(
-                    symptom_keywords
-                )
+                symptom_clause, symptom_params = self._build_symptom_conditions(symptom_keywords)
                 if symptom_clause:
                     where_conditions.append(symptom_clause.lstrip("WHERE "))
                     params.extend(symptom_params)
@@ -192,22 +188,24 @@ class RelatedIncidentsAdapter:
                 # Convert to dict format
                 incidents = []
                 for row in rows:
-                    incidents.append({
-                        "incident_id": row["incident_id"],
-                        "title": row["title"],
-                        "status": row["status"],
-                        "started_at": row["started_at"].isoformat()
-                        if row["started_at"]
-                        else None,
-                        "resolved_at": row["resolved_at"].isoformat()
-                        if row["resolved_at"]
-                        else None,
-                        "severity": row["severity"],
-                        "environment": row["environment"],
-                        "affected_services": row["affected_services"],
-                        "correlation_policy": row["correlation_policy"],
-                        "correlation_version": row["correlation_version"],
-                    })
+                    incidents.append(
+                        {
+                            "incident_id": row["incident_id"],
+                            "title": row["title"],
+                            "status": row["status"],
+                            "started_at": row["started_at"].isoformat()
+                            if row["started_at"]
+                            else None,
+                            "resolved_at": row["resolved_at"].isoformat()
+                            if row["resolved_at"]
+                            else None,
+                            "severity": row["severity"],
+                            "environment": row["environment"],
+                            "affected_services": row["affected_services"],
+                            "correlation_policy": row["correlation_policy"],
+                            "correlation_version": row["correlation_version"],
+                        }
+                    )
 
                 self._circuit_breaker.record_success()
                 observe_tool_call_duration("related_incidents", time.time() - start_time)
@@ -264,17 +262,13 @@ class RelatedIncidentsAdapter:
         query_start = time.time()
 
         if not service or not service.strip():
-            observe_tool_call_duration(
-                "related_incidents", time.time() - query_start
-            )
+            observe_tool_call_duration("related_incidents", time.time() - query_start)
             increment_tool_calls("related_incidents", "unavailable")
             return self._unavailable_response("invalid_service_name")
 
         # Circuit breaker: return unavailable immediately if open
         if not self._circuit_breaker.allow_call():
-            observe_tool_call_duration(
-                "related_incidents", time.time() - query_start
-            )
+            observe_tool_call_duration("related_incidents", time.time() - query_start)
             increment_tool_calls("related_incidents", "circuit_open")
             logger.warning("Related incidents circuit breaker open, rejecting time query")
             return self._unavailable_response("circuit_breaker_open")
@@ -285,6 +279,7 @@ class RelatedIncidentsAdapter:
 
         try:
             from datetime import datetime
+
             start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
 
@@ -326,27 +321,27 @@ class RelatedIncidentsAdapter:
 
                 incidents = []
                 for row in rows:
-                    incidents.append({
-                        "incident_id": row["incident_id"],
-                        "title": row["title"],
-                        "status": row["status"],
-                        "started_at": row["started_at"].isoformat()
-                        if row["started_at"]
-                        else None,
-                        "resolved_at": row["resolved_at"].isoformat()
-                        if row["resolved_at"]
-                        else None,
-                        "severity": row["severity"],
-                        "environment": row["environment"],
-                        "affected_services": row["affected_services"],
-                        "correlation_policy": row["correlation_policy"],
-                        "correlation_version": row["correlation_version"],
-                    })
+                    incidents.append(
+                        {
+                            "incident_id": row["incident_id"],
+                            "title": row["title"],
+                            "status": row["status"],
+                            "started_at": row["started_at"].isoformat()
+                            if row["started_at"]
+                            else None,
+                            "resolved_at": row["resolved_at"].isoformat()
+                            if row["resolved_at"]
+                            else None,
+                            "severity": row["severity"],
+                            "environment": row["environment"],
+                            "affected_services": row["affected_services"],
+                            "correlation_policy": row["correlation_policy"],
+                            "correlation_version": row["correlation_version"],
+                        }
+                    )
 
                 self._circuit_breaker.record_success()
-                observe_tool_call_duration(
-                    "related_incidents", time.time() - query_start
-                )
+                observe_tool_call_duration("related_incidents", time.time() - query_start)
                 increment_tool_calls("related_incidents", "success")
 
                 return {
@@ -356,16 +351,12 @@ class RelatedIncidentsAdapter:
 
         except psycopg2.Error as e:
             self._circuit_breaker.record_failure()
-            observe_tool_call_duration(
-                "related_incidents", time.time() - query_start
-            )
+            observe_tool_call_duration("related_incidents", time.time() - query_start)
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents time-range query failed: %s", e)
             raise RelatedIncidentsError(f"Database query failed: {e}")
         except (KeyError, ValueError, TypeError) as e:
-            observe_tool_call_duration(
-                "related_incidents", time.time() - query_start
-            )
+            observe_tool_call_duration("related_incidents", time.time() - query_start)
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents time-range query failed: %s", e)
             raise RelatedIncidentsError(f"Related incidents query failed: {e}")

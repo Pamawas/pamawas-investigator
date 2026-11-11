@@ -134,42 +134,13 @@ async def healthz():
     dependencies = {}
     overall_healthy = True
 
-    # Database check
-    try:
-        with investigator.db_conn.cursor() as cursor:
-            cursor.execute("SELECT 1")
-        dependencies["database"] = {"status": "healthy"}
-    except (psycopg2.Error, RuntimeError) as e:
-        dependencies["database"] = {"status": "unhealthy", "error": str(e)}
-        overall_healthy = False
-        try:
-            investigator.db_conn.rollback()
-        except psycopg2.Error:
-            pass
+    db_healthy, db_deps = _check_database_health(investigator.db_conn)
+    dependencies.update(db_deps)
+    overall_healthy = overall_healthy and db_healthy
 
-    # External dependency circuit breaker states
-    tools = getattr(investigator, "tools", None)
-    for attr, name in (
-        ("_prometheus_adapter", "prometheus"),
-        ("_loki_adapter", "loki"),
-        ("_deployment_adapter", "deployments"),
-        ("_related_incidents_adapter", "related_incidents"),
-    ):
-        adapter = getattr(tools, attr, None) if tools is not None else None
-        if adapter is None:
-            dependencies[name] = {"status": "unknown", "error": "adapter not initialized"}
-            continue
-        cb_state = getattr(adapter, "circuit_breaker_state", None)
-        if cb_state:
-            state = cb_state()
-            dependencies[name] = {
-                "status": "unhealthy" if state.get("is_open") else "healthy",
-                "circuit_breaker": state,
-            }
-            if state.get("is_open"):
-                overall_healthy = False
-        else:
-            dependencies[name] = {"status": "unknown"}
+    adapter_healthy, adapter_deps = _check_adapter_health(getattr(investigator, "tools", None))
+    dependencies.update(adapter_deps)
+    overall_healthy = overall_healthy and adapter_healthy
 
     if overall_healthy:
         return {"status": "healthy", "timestamp": time.time(), "dependencies": dependencies}
@@ -188,6 +159,51 @@ async def healthz():
             "error": top_level_error,
         },
     )
+
+
+def _check_database_health(db_conn) -> tuple[bool, dict]:
+    """Check database connectivity; return (healthy, dependency entries)."""
+    try:
+        with db_conn.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        return True, {"database": {"status": "healthy"}}
+    except (psycopg2.Error, RuntimeError) as e:
+        deps = {"database": {"status": "unhealthy", "error": str(e)}}
+        try:
+            db_conn.rollback()
+        except psycopg2.Error:
+            pass
+        return False, deps
+
+
+def _check_adapter_health(tools) -> tuple[bool, dict]:
+    """Check external adapter circuit breaker states; return (healthy, dependency entries)."""
+    deps: dict = {}
+    healthy = True
+
+    for attr, name in (
+        ("_prometheus_adapter", "prometheus"),
+        ("_loki_adapter", "loki"),
+        ("_deployment_adapter", "deployments"),
+        ("_related_incidents_adapter", "related_incidents"),
+    ):
+        adapter = getattr(tools, attr, None) if tools is not None else None
+        if adapter is None:
+            deps[name] = {"status": "unknown", "error": "adapter not initialized"}
+            continue
+        cb_state = getattr(adapter, "circuit_breaker_state", None)
+        if cb_state:
+            state = cb_state()
+            deps[name] = {
+                "status": "unhealthy" if state.get("is_open") else "healthy",
+                "circuit_breaker": state,
+            }
+            if state.get("is_open"):
+                healthy = False
+        else:
+            deps[name] = {"status": "unknown"}
+
+    return healthy, deps
 
 
 @app.get("/ready")
@@ -238,6 +254,7 @@ async def investigate(incident_id: str):
     log.info("legacy_investigate_deprecated", incident_id=incident_id)
 
     import hashlib
+
     request_key = f"{incident_id}:incident_created:1"
     request_key_hash = hashlib.sha256(request_key.encode()).hexdigest()
 
@@ -354,7 +371,7 @@ def _get_run_status(run_id: str) -> str | None:
         if conn is not None:
             try:
                 conn.rollback()
-            except (psycopg2.Error, AttributeError):
+            except psycopg2.Error, AttributeError:
                 pass
         return None
     finally:
@@ -389,15 +406,14 @@ async def create_investigation(
 
     # Generate deterministic request key hash
     import hashlib
+
     request_key = f"{incident_id}:{reason}:{correlation_version}"
     request_key_hash = hashlib.sha256(request_key.encode()).hexdigest()
 
     # Persist (or fetch) the run first, capturing the real DB run_id. This
     # closes the race where the async kick-off and the idempotency check
     # previously both fabricated a run_id locally.
-    run_id, existing_status = await _ensure_investigation_run(
-        incident_id, request_key_hash
-    )
+    run_id, existing_status = await _ensure_investigation_run(incident_id, request_key_hash)
 
     if run_id is None:
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
@@ -426,6 +442,7 @@ async def create_investigation(
     # background; return 202 with status "queued" per the frozen contract.
     log.info("investigation_started", incident_id=incident_id, reason=reason)
     import asyncio
+
     asyncio.get_running_loop().create_task(
         _run_investigation_task(run_id, incident_id, request_key_hash)
     )
@@ -466,9 +483,7 @@ async def get_investigation_status(run_id: str):
     queued -> running -> completed | failed.
     """
     if investigator is None or not investigator.persistence:
-        return JSONResponse(
-            status_code=503, content={"error": "Investigator not initialized"}
-        )
+        return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
     current_status = _get_run_status(run_id)
     if current_status is None:

@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class LokiConfig:
     """Configuration for Loki adapter."""
+
     base_url: str
     timeout_seconds: float = 10.0
     max_response_bytes: int = 1_000_000  # 1MB
@@ -36,21 +37,25 @@ class LokiConfig:
 
 class LokiError(Exception):
     """Base exception for Loki adapter errors."""
+
     pass
 
 
 class LokiTimeoutError(LokiError):
     """Loki query timed out."""
+
     pass
 
 
 class LokiResponseTooLargeError(LokiError):
     """Loki response exceeded size limits."""
+
     pass
 
 
 class LokiQueryValidationError(LokiError):
     """Loki query validation failed."""
+
     pass
 
 
@@ -93,14 +98,12 @@ class LokiAdapter:
 
         # Length limit
         if len(logql) > 10000:
-            raise LokiQueryValidationError(
-                "LogQL query exceeds maximum length (10000 chars)"
-            )
+            raise LokiQueryValidationError("LogQL query exceeds maximum length (10000 chars)")
 
         # Basic injection prevention
         dangerous_patterns = [
             r";\s*\w",  # Multiple statements
-            r"--\s",    # SQL comments
+            r"--\s",  # SQL comments
             r"/\*.*\*/",  # Block comments
         ]
         for pattern in dangerous_patterns:
@@ -117,9 +120,7 @@ class LokiAdapter:
             start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
         except ValueError as e:
-            raise LokiQueryValidationError(
-                f"Invalid timestamp format (use RFC3339): {e}"
-            )
+            raise LokiQueryValidationError(f"Invalid timestamp format (use RFC3339): {e}")
 
         if start_dt.tzinfo is None or end_dt.tzinfo is None:
             raise LokiQueryValidationError("Timestamps must include timezone (RFC3339)")
@@ -211,9 +212,7 @@ class LokiAdapter:
             )
 
         if direction not in ("forward", "backward"):
-            raise LokiQueryValidationError(
-                "Direction must be 'forward' or 'backward'"
-            )
+            raise LokiQueryValidationError("Direction must be 'forward' or 'backward'")
 
         client = await self._get_client()
 
@@ -263,16 +262,12 @@ class LokiAdapter:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "timeout")
-            raise LokiTimeoutError(
-                f"Loki query timed out after {self.config.timeout_seconds}s"
-            )
+            raise LokiTimeoutError(f"Loki query timed out after {self.config.timeout_seconds}s")
         except httpx.HTTPStatusError as e:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
-            raise LokiError(
-                f"Loki HTTP error {e.response.status_code}: {e.response.text}"
-            )
+            raise LokiError(f"Loki HTTP error {e.response.status_code}: {e.response.text}")
         except LokiError:
             # Validation errors are client-side; don't trip the circuit breaker.
             observe_tool_call_duration("loki", time.time() - start_time)
@@ -356,16 +351,12 @@ class LokiAdapter:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "timeout")
-            raise LokiTimeoutError(
-                f"Loki query timed out after {self.config.timeout_seconds}s"
-            )
+            raise LokiTimeoutError(f"Loki query timed out after {self.config.timeout_seconds}s")
         except httpx.HTTPStatusError as e:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
-            raise LokiError(
-                f"Loki HTTP error {e.response.status_code}: {e.response.text}"
-            )
+            raise LokiError(f"Loki HTTP error {e.response.status_code}: {e.response.text}")
         except LokiError:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
@@ -414,16 +405,12 @@ class LokiAdapter:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "timeout")
-            raise LokiTimeoutError(
-                f"Loki query timed out after {self.config.timeout_seconds}s"
-            )
+            raise LokiTimeoutError(f"Loki query timed out after {self.config.timeout_seconds}s")
         except httpx.HTTPStatusError as e:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
-            raise LokiError(
-                f"Loki HTTP error {e.response.status_code}: {e.response.text}"
-            )
+            raise LokiError(f"Loki HTTP error {e.response.status_code}: {e.response.text}")
         except LokiError:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")

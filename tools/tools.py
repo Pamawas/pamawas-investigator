@@ -97,6 +97,7 @@ class InvestigatorTools:
 
         try:
             import asyncio
+
             # Run async adapter in sync context
             try:
                 loop = asyncio.get_running_loop()
@@ -123,17 +124,14 @@ class InvestigatorTools:
             logger.error("Prometheus query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def query_loki(
-        self, logql: str, start: str, end: str, limit: int = 100
-    ) -> dict[str, Any]:
+    def query_loki(self, logql: str, start: str, end: str, limit: int = 100) -> dict[str, Any]:
         """Query Loki for logs data (sync wrapper for async adapter)."""
-        logger.info(
-            "Querying Loki: %s [%s to %s] limit=%d", logql, start, end, limit
-        )
+        logger.info("Querying Loki: %s [%s to %s] limit=%d", logql, start, end, limit)
         start_time = time.time()
 
         try:
             import asyncio
+
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -159,17 +157,14 @@ class InvestigatorTools:
             logger.error("Loki query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def get_recent_deployments(
-        self, service: str, start: str, end: str
-    ) -> dict[str, Any]:
+    def get_recent_deployments(self, service: str, start: str, end: str) -> dict[str, Any]:
         """Get recent deployments for a service (sync wrapper for async adapter)."""
-        logger.info(
-            "Getting recent deployments for %s [%s to %s]", service, start, end
-        )
+        logger.info("Getting recent deployments for %s [%s to %s]", service, start, end)
         start_time = time.time()
 
         try:
             import asyncio
+
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -184,7 +179,8 @@ class InvestigatorTools:
             observe_tool_call_duration("deployments", duration)
             increment_tool_calls(
                 "deployments",
-                "success" if result.get("status") == "success"
+                "success"
+                if result.get("status") == "success"
                 else ("circuit_open" if result.get("status") == "unavailable" else "error"),
             )
             return result
@@ -196,9 +192,7 @@ class InvestigatorTools:
             logger.error("Get deployments failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def get_related_incidents(
-        self, service: str, symptom_keywords: list[str]
-    ) -> dict[str, Any]:
+    def get_related_incidents(self, service: str, symptom_keywords: list[str]) -> dict[str, Any]:
         """Find related incidents from the database (sync wrapper for async adapter)."""
         logger.info(
             "Finding related incidents for %s with keywords %s",
@@ -209,6 +203,7 @@ class InvestigatorTools:
 
         try:
             import asyncio
+
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
@@ -268,22 +263,19 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "promql": {
-                                "type": "string",
-                                "description": "PromQL query expression"
-                            },
+                            "promql": {"type": "string", "description": "PromQL query expression"},
                             "start": {
                                 "type": "string",
-                                "description": "Start timestamp (ISO 8601/RFC3339)"
+                                "description": "Start timestamp (ISO 8601/RFC3339)",
                             },
                             "end": {
                                 "type": "string",
-                                "description": "End timestamp (ISO 8601/RFC3339)"
-                            }
+                                "description": "End timestamp (ISO 8601/RFC3339)",
+                            },
                         },
-                        "required": ["promql", "start", "end"]
-                    }
-                }
+                        "required": ["promql", "start", "end"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -293,28 +285,23 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "logql": {
-                                "type": "string",
-                                "description": "LogQL query expression"
-                            },
+                            "logql": {"type": "string", "description": "LogQL query expression"},
                             "start": {
                                 "type": "string",
-                                "description": "Start timestamp (ISO 8601/RFC3339)"
+                                "description": "Start timestamp (ISO 8601/RFC3339)",
                             },
                             "end": {
                                 "type": "string",
-                                "description": "End timestamp (ISO 8601/RFC3339)"
+                                "description": "End timestamp (ISO 8601/RFC3339)",
                             },
                             "limit": {
                                 "type": "integer",
-                                "description": (
-                                    "Maximum number of log entries to return"
-                                )
-                            }
+                                "description": ("Maximum number of log entries to return"),
+                            },
                         },
-                        "required": ["logql", "start", "end"]
-                    }
-                }
+                        "required": ["logql", "start", "end"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -324,22 +311,19 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "service": {
-                                "type": "string",
-                                "description": "Service name"
-                            },
+                            "service": {"type": "string", "description": "Service name"},
                             "start": {
                                 "type": "string",
-                                "description": "Start timestamp (ISO 8601/RFC3339)"
+                                "description": "Start timestamp (ISO 8601/RFC3339)",
                             },
                             "end": {
                                 "type": "string",
-                                "description": "End timestamp (ISO 8601/RFC3339)"
-                            }
+                                "description": "End timestamp (ISO 8601/RFC3339)",
+                            },
                         },
-                        "required": ["service", "start", "end"]
-                    }
-                }
+                        "required": ["service", "start", "end"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -349,21 +333,16 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "service": {
-                                "type": "string",
-                                "description": "Service name"
-                            },
+                            "service": {"type": "string", "description": "Service name"},
                             "symptom_keywords": {
                                 "type": "array",
                                 "items": {"type": "string"},
-                                "description": (
-                                    "Keywords to match against incident symptoms"
-                                )
-                            }
+                                "description": ("Keywords to match against incident symptoms"),
+                            },
                         },
-                        "required": ["service", "symptom_keywords"]
-                    }
-                }
+                        "required": ["service", "symptom_keywords"],
+                    },
+                },
             },
             {
                 "type": "function",
@@ -384,27 +363,25 @@ class ToolRegistry:
                                                 "fact",
                                                 "likely_cause",
                                                 "hypothesis",
-                                                "unknown"
-                                            ]
+                                                "unknown",
+                                            ],
                                         },
                                         "content": {"type": "string"},
                                         "source": {"type": "string"},
                                         "confidence": {
                                             "type": "number",
                                             "minimum": 0.0,
-                                            "maximum": 1.0
-                                        }
+                                            "maximum": 1.0,
+                                        },
                                     },
-                                    "required": [
-                                        "type", "content", "source", "confidence"
-                                    ]
-                                }
+                                    "required": ["type", "content", "source", "confidence"],
+                                },
                             }
                         },
-                        "required": ["findings"]
-                    }
-                }
-            }
+                        "required": ["findings"],
+                    },
+                },
+            },
         ]
 
     @classmethod
