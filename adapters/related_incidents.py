@@ -1,12 +1,14 @@
-"""Database-backed related incidents query adapter."""
+"""Database-backed related incidents query adapter with circuit breaker."""
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import psycopg2
 import psycopg2.extras
 
+from adapters.circuit_breaker import CircuitBreaker
 from metrics import increment_tool_calls, observe_tool_call_duration
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,9 @@ class RelatedIncidentsConfig:
     database_url: str
     max_results: int = 10
     max_symptom_keywords: int = 20
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_timeout_seconds: float = 30.0
+    circuit_breaker_half_open_max_calls: int = 3
 
 
 class RelatedIncidentsError(Exception):
@@ -35,6 +40,12 @@ class RelatedIncidentsAdapter:
     def __init__(self, config: RelatedIncidentsConfig):
         self.config = config
         self._conn: psycopg2.extensions.connection | None = None
+        self._circuit_breaker = CircuitBreaker(
+            name="related_incidents",
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            timeout_seconds=config.circuit_breaker_timeout_seconds,
+            half_open_max_calls=config.circuit_breaker_half_open_max_calls,
+        )
 
     def _get_connection(self) -> psycopg2.extensions.connection:
         """Get or create database connection with timeout."""
@@ -53,6 +64,10 @@ class RelatedIncidentsAdapter:
         if self._conn and not self._conn.closed:
             self._conn.close()
             self._conn = None
+
+    def circuit_breaker_state(self) -> dict:
+        """Return circuit breaker state for health checks."""
+        return self._circuit_breaker.snapshot()
 
     def _build_symptom_conditions(
         self, symptom_keywords: list[str]
@@ -112,11 +127,19 @@ class RelatedIncidentsAdapter:
         Returns:
             Dict with status and data list of related incidents
         """
-        import time
         start_time = time.time()
 
         if not service or not service.strip():
-            raise RelatedIncidentsError("Service name is required")
+            observe_tool_call_duration("related_incidents", time.time() - start_time)
+            increment_tool_calls("related_incidents", "unavailable")
+            return self._unavailable_response("invalid_service_name")
+
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("related_incidents", time.time() - start_time)
+            increment_tool_calls("related_incidents", "circuit_open")
+            logger.warning("Related incidents circuit breaker open, rejecting query")
+            return self._unavailable_response("circuit_breaker_open")
 
         # Validate and limit results
         max_results = min(limit or self.config.max_results, self.config.max_results)
@@ -186,6 +209,7 @@ class RelatedIncidentsAdapter:
                         "correlation_version": row["correlation_version"],
                     })
 
+                self._circuit_breaker.record_success()
                 observe_tool_call_duration("related_incidents", time.time() - start_time)
                 increment_tool_calls("related_incidents", "success")
 
@@ -195,6 +219,7 @@ class RelatedIncidentsAdapter:
                 }
 
         except psycopg2.Error as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("related_incidents", time.time() - start_time)
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents query failed: %s", e)
@@ -204,6 +229,16 @@ class RelatedIncidentsAdapter:
             increment_tool_calls("related_incidents", "error")
             logger.error("Related incidents query failed: %s", e)
             raise RelatedIncidentsError(f"Related incidents query failed: {e}")
+
+    def _unavailable_response(
+        self, reason: str = "related_incidents_not_available"
+    ) -> dict[str, Any]:
+        """Return standardized unavailable response."""
+        return {
+            "status": "unavailable",
+            "reason_code": reason,
+            "data": [],
+        }
 
     async def find_by_service_and_time(
         self,
@@ -226,11 +261,23 @@ class RelatedIncidentsAdapter:
         Returns:
             Dict with status and data list of incidents
         """
-        import time
         query_start = time.time()
 
         if not service or not service.strip():
-            raise RelatedIncidentsError("Service name is required")
+            observe_tool_call_duration(
+                "related_incidents", time.time() - query_start
+            )
+            increment_tool_calls("related_incidents", "unavailable")
+            return self._unavailable_response("invalid_service_name")
+
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration(
+                "related_incidents", time.time() - query_start
+            )
+            increment_tool_calls("related_incidents", "circuit_open")
+            logger.warning("Related incidents circuit breaker open, rejecting time query")
+            return self._unavailable_response("circuit_breaker_open")
 
         max_results = min(limit or self.config.max_results, self.config.max_results)
 
@@ -296,6 +343,7 @@ class RelatedIncidentsAdapter:
                         "correlation_version": row["correlation_version"],
                     })
 
+                self._circuit_breaker.record_success()
                 observe_tool_call_duration(
                     "related_incidents", time.time() - query_start
                 )
@@ -307,6 +355,7 @@ class RelatedIncidentsAdapter:
                 }
 
         except psycopg2.Error as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration(
                 "related_incidents", time.time() - query_start
             )

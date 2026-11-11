@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from adapters.circuit_breaker import CircuitBreaker
 from metrics import increment_tool_calls, observe_tool_call_duration
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,9 @@ class PrometheusConfig:
     max_series: int = 1000
     max_samples_per_series: int = 10000
     allowed_time_range_hours: int = 72  # Max 72 hours relative to incident
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_timeout_seconds: float = 30.0
+    circuit_breaker_half_open_max_calls: int = 3
 
     def __post_init__(self):
         if not self.base_url:
@@ -56,6 +60,12 @@ class PrometheusAdapter:
     def __init__(self, config: PrometheusConfig):
         self.config = config
         self._client: httpx.AsyncClient | None = None
+        self._circuit_breaker = CircuitBreaker(
+            name="prometheus",
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            timeout_seconds=config.circuit_breaker_timeout_seconds,
+            half_open_max_calls=config.circuit_breaker_half_open_max_calls,
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -71,6 +81,10 @@ class PrometheusAdapter:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    def circuit_breaker_state(self) -> dict:
+        """Return circuit breaker state for health checks."""
+        return self._circuit_breaker.snapshot()
 
     def validate_promql(self, promql: str) -> None:
         """Validate PromQL query for safety."""
@@ -150,6 +164,14 @@ class PrometheusAdapter:
                         f"{self.config.max_samples_per_series}"
                     )
 
+    def _unavailable_response(self, reason_code: str) -> dict[str, Any]:
+        """Return standardized unavailable response (circuit open)."""
+        return {
+            "status": "unavailable",
+            "reason_code": reason_code,
+            "data": {},
+        }
+
     async def query_range(
         self,
         promql: str,
@@ -187,6 +209,13 @@ class PrometheusAdapter:
 
         client = await self._get_client()
 
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "circuit_open")
+            logger.warning("Prometheus circuit breaker open, rejecting query")
+            return self._unavailable_response("circuit_breaker_open")
+
         try:
             params = {
                 "query": promql,
@@ -206,11 +235,13 @@ class PrometheusAdapter:
             # Validate Prometheus response structure
             if data.get("status") != "success":
                 error_msg = data.get("error", "Unknown Prometheus error")
+                self._circuit_breaker.record_failure()
                 raise PrometheusError(f"Prometheus error: {error_msg}")
 
             # Validate result bounds
             self._validate_result_bounds(data.get("data", {}))
 
+            self._circuit_breaker.record_success()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "success")
 
@@ -220,23 +251,27 @@ class PrometheusAdapter:
             }
 
         except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "timeout")
             raise PrometheusTimeoutError(
                 f"Prometheus query timed out after {self.config.timeout_seconds}s"
             )
         except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             raise PrometheusError(
                 f"Prometheus HTTP error {e.response.status_code}: {e.response.text}"
             )
         except PrometheusError:
-            # Re-raise our validation errors
+            # Validation errors are client-side; don't trip the circuit breaker.
+            # Non-validation PrometheusError already recorded failure above.
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             raise
         except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus query failed: %s", e)
@@ -263,6 +298,13 @@ class PrometheusAdapter:
 
         client = await self._get_client()
 
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "circuit_open")
+            logger.warning("Prometheus circuit breaker open, rejecting instant query")
+            return self._unavailable_response("circuit_breaker_open")
+
         try:
             params = {"query": promql}
             if eval_time:
@@ -278,8 +320,10 @@ class PrometheusAdapter:
 
             if data.get("status") != "success":
                 error_msg = data.get("error", "Unknown Prometheus error")
+                self._circuit_breaker.record_failure()
                 raise PrometheusError(f"Prometheus error: {error_msg}")
 
+            self._circuit_breaker.record_success()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "success")
 
@@ -289,12 +333,14 @@ class PrometheusAdapter:
             }
 
         except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "timeout")
             raise PrometheusTimeoutError(
                 f"Prometheus query timed out after {self.config.timeout_seconds}s"
             )
         except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             raise PrometheusError(
@@ -305,6 +351,7 @@ class PrometheusAdapter:
             increment_tool_calls("prometheus", "error")
             raise
         except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("prometheus", time.time() - start_time)
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus instant query failed: %s", e)

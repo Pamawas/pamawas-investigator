@@ -38,6 +38,12 @@ class Config:
     deployment_max_results: int = 50
     related_incidents_max_results: int = 10
     related_incidents_max_symptom_keywords: int = 20
+    # Circuit breaker settings for external adapters
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_timeout_seconds: float = 30.0
+    circuit_breaker_half_open_max_calls: int = 3
+    # Overall investigation deadline (wall clock, seconds)
+    investigation_timeout_seconds: float = 120.0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -104,5 +110,18 @@ class Config:
             ),
             related_incidents_max_symptom_keywords=int(
                 os.getenv("RELATED_INCIDENTS_MAX_SYMPTOM_KEYWORDS", "20")
+            ),
+            # Circuit breaker settings
+            circuit_breaker_failure_threshold=int(
+                os.getenv("CIRCUIT_BREAKER_FAILURE_THRESHOLD", "5")
+            ),
+            circuit_breaker_timeout_seconds=float(
+                os.getenv("CIRCUIT_BREAKER_TIMEOUT_SECONDS", "30.0")
+            ),
+            circuit_breaker_half_open_max_calls=int(
+                os.getenv("CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", "3")
+            ),
+            investigation_timeout_seconds=float(
+                os.getenv("INVESTIGATION_TIMEOUT_SECONDS", "120.0")
             ),
         )

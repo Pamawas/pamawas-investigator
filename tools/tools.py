@@ -40,6 +40,9 @@ class InvestigatorTools:
                 max_series=config.prometheus_max_series,
                 max_samples_per_series=config.prometheus_max_samples_per_series,
                 allowed_time_range_hours=config.prometheus_allowed_time_range_hours,
+                circuit_breaker_failure_threshold=config.circuit_breaker_failure_threshold,
+                circuit_breaker_timeout_seconds=config.circuit_breaker_timeout_seconds,
+                circuit_breaker_half_open_max_calls=config.circuit_breaker_half_open_max_calls,
             )
         )
 
@@ -51,6 +54,9 @@ class InvestigatorTools:
                 max_log_lines=config.loki_max_log_lines,
                 max_log_line_length=config.loki_max_log_line_length,
                 allowed_time_range_hours=config.loki_allowed_time_range_hours,
+                circuit_breaker_failure_threshold=config.circuit_breaker_failure_threshold,
+                circuit_breaker_timeout_seconds=config.circuit_breaker_timeout_seconds,
+                circuit_breaker_half_open_max_calls=config.circuit_breaker_half_open_max_calls,
             )
         )
 
@@ -60,6 +66,9 @@ class InvestigatorTools:
                 timeout_seconds=config.deployment_timeout_seconds,
                 max_results=config.deployment_max_results,
                 api_key=config.deployment_api_key or None,
+                circuit_breaker_failure_threshold=config.circuit_breaker_failure_threshold,
+                circuit_breaker_timeout_seconds=config.circuit_breaker_timeout_seconds,
+                circuit_breaker_half_open_max_calls=config.circuit_breaker_half_open_max_calls,
             )
         )
 
@@ -68,6 +77,9 @@ class InvestigatorTools:
                 database_url=config.database_url,
                 max_results=config.related_incidents_max_results,
                 max_symptom_keywords=config.related_incidents_max_symptom_keywords,
+                circuit_breaker_failure_threshold=config.circuit_breaker_failure_threshold,
+                circuit_breaker_timeout_seconds=config.circuit_breaker_timeout_seconds,
+                circuit_breaker_half_open_max_calls=config.circuit_breaker_half_open_max_calls,
             )
         )
 
@@ -98,6 +110,9 @@ class InvestigatorTools:
 
             duration = time.time() - start_time
             observe_tool_call_duration("prometheus", duration)
+            if result.get("status") == "unavailable":
+                increment_tool_calls("prometheus", "circuit_open")
+                return result
             increment_tool_calls("prometheus", "success")
             return result
 
@@ -131,6 +146,9 @@ class InvestigatorTools:
 
             duration = time.time() - start_time
             observe_tool_call_duration("loki", duration)
+            if result.get("status") == "unavailable":
+                increment_tool_calls("loki", "circuit_open")
+                return result
             increment_tool_calls("loki", "success")
             return result
 
@@ -165,7 +183,9 @@ class InvestigatorTools:
             duration = time.time() - start_time
             observe_tool_call_duration("deployments", duration)
             increment_tool_calls(
-                "deployments", "success" if result.get("status") == "success" else "error"
+                "deployments",
+                "success" if result.get("status") == "success"
+                else ("circuit_open" if result.get("status") == "unavailable" else "error"),
             )
             return result
 

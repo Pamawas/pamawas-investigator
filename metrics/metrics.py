@@ -8,6 +8,11 @@ investigations_total = Counter(
     "Total number of investigations started",
 )
 
+max_tool_calls_reached = Counter(
+    "investigator_max_tool_calls_reached_total",
+    "Total number of investigations that hit max tool calls without submitting findings",
+)
+
 tool_calls_total = Counter(
     "investigator_tool_calls_total",
     "Total number of tool calls made",
@@ -54,6 +59,10 @@ investigator_uptime = Gauge(
 )
 
 
+def increment_max_tool_calls_reached():
+    max_tool_calls_reached.inc()
+
+
 def increment_investigations():
     investigations_total.inc()
 
@@ -64,6 +73,12 @@ def increment_tool_calls(tool: str, status: str):
 
 def increment_findings(finding_type: str):
     findings_total.labels(type=finding_type).inc()
+
+
+def increment_findings_by_type(findings):
+    """Increment findings counter per finding type."""
+    for f in findings:
+        increment_findings(f.type.value if hasattr(f, "type") else f["type"])
 
 
 def increment_db_errors():

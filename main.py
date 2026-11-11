@@ -130,17 +130,64 @@ async def healthz():
             status_code=503, content={"status": "unhealthy", "error": "Database not connected"}
         )
 
+    # Gather dependency health
+    dependencies = {}
+    overall_healthy = True
+
+    # Database check
     try:
         with investigator.db_conn.cursor() as cursor:
             cursor.execute("SELECT 1")
-        return {"status": "healthy", "timestamp": time.time()}
+        dependencies["database"] = {"status": "healthy"}
     except (psycopg2.Error, RuntimeError) as e:
-        log.error("health_check_failed", error=str(e))
+        dependencies["database"] = {"status": "unhealthy", "error": str(e)}
+        overall_healthy = False
         try:
             investigator.db_conn.rollback()
         except psycopg2.Error:
             pass
-        return JSONResponse(status_code=503, content={"status": "unhealthy", "error": str(e)})
+
+    # External dependency circuit breaker states
+    tools = getattr(investigator, "tools", None)
+    for attr, name in (
+        ("_prometheus_adapter", "prometheus"),
+        ("_loki_adapter", "loki"),
+        ("_deployment_adapter", "deployments"),
+        ("_related_incidents_adapter", "related_incidents"),
+    ):
+        adapter = getattr(tools, attr, None) if tools is not None else None
+        if adapter is None:
+            dependencies[name] = {"status": "unknown", "error": "adapter not initialized"}
+            continue
+        cb_state = getattr(adapter, "circuit_breaker_state", None)
+        if cb_state:
+            state = cb_state()
+            dependencies[name] = {
+                "status": "unhealthy" if state.get("is_open") else "healthy",
+                "circuit_breaker": state,
+            }
+            if state.get("is_open"):
+                overall_healthy = False
+        else:
+            dependencies[name] = {"status": "unknown"}
+
+    if overall_healthy:
+        return {"status": "healthy", "timestamp": time.time(), "dependencies": dependencies}
+
+    # Top-level error for clients that read it directly (e.g. database down).
+    top_level_error = None
+    db = dependencies.get("database", {})
+    if db.get("status") == "unhealthy":
+        top_level_error = db.get("error")
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "unhealthy",
+            "timestamp": time.time(),
+            "dependencies": dependencies,
+            "error": top_level_error,
+        },
+    )
 
 
 @app.get("/ready")

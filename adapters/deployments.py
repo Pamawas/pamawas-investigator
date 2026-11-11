@@ -1,11 +1,13 @@
-"""Deployment history adapter - returns unavailable when not configured."""
+"""Deployment history adapter with circuit breaker and safety bounds."""
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
+from adapters.circuit_breaker import CircuitBreaker
 from metrics import increment_tool_calls, observe_tool_call_duration
 
 logger = logging.getLogger(__name__)
@@ -18,6 +20,9 @@ class DeploymentConfig:
     timeout_seconds: float = 10.0
     max_results: int = 50
     api_key: str | None = None
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_timeout_seconds: float = 30.0
+    circuit_breaker_half_open_max_calls: int = 3
 
     def is_configured(self) -> bool:
         """Check if deployment adapter is configured."""
@@ -35,7 +40,7 @@ class DeploymentAdapterNotConfiguredError(DeploymentAdapterError):
 
 
 class DeploymentAdapter:
-    """Deployment history interface.
+    """Deployment history interface with circuit breaker protection.
 
     Returns real adapter data only when configured.
     Otherwise returns explicit unavailable response.
@@ -45,6 +50,12 @@ class DeploymentAdapter:
     def __init__(self, config: DeploymentConfig):
         self.config = config
         self._client: Any | None = None  # httpx.AsyncClient when configured
+        self._circuit_breaker = CircuitBreaker(
+            name="deployments",
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            timeout_seconds=config.circuit_breaker_timeout_seconds,
+            half_open_max_calls=config.circuit_breaker_half_open_max_calls,
+        )
 
     async def _get_client(self):
         """Get HTTP client if configured."""
@@ -72,6 +83,10 @@ class DeploymentAdapter:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    def circuit_breaker_state(self) -> dict:
+        """Return circuit breaker state for health checks."""
+        return self._circuit_breaker.snapshot()
 
     def _unavailable_response(
         self, reason: str = "deployment_adapter_not_configured"
@@ -102,10 +117,11 @@ class DeploymentAdapter:
         Returns:
             Deployment data or unavailable response
         """
-        import time
         start_time = time.time()
 
         if not service or not service.strip():
+            observe_tool_call_duration("deployments", time.time() - start_time)
+            increment_tool_calls("deployments", "unavailable")
             return self._unavailable_response("invalid_service_name")
 
         # If not configured, return explicit unavailable
@@ -119,7 +135,13 @@ class DeploymentAdapter:
             )
             return self._unavailable_response("deployment_adapter_not_configured")
 
-        # If configured, attempt to query the deployment service
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("deployments", time.time() - start_time)
+            increment_tool_calls("deployments", "circuit_open")
+            logger.warning("Deployment circuit breaker open, rejecting query")
+            return self._unavailable_response("circuit_breaker_open")
+
         client = await self._get_client()
         if not client:
             observe_tool_call_duration("deployments", time.time() - start_time)
@@ -146,6 +168,7 @@ class DeploymentAdapter:
                 logger.warning("Unexpected deployment response format: %s", type(data))
                 data = []
 
+            self._circuit_breaker.record_success()
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "success")
 
@@ -154,17 +177,26 @@ class DeploymentAdapter:
                 "data": data,
             }
 
-        except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
+        except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("deployments", time.time() - start_time)
+            increment_tool_calls("deployments", "timeout")
+            raise DeploymentAdapterError(
+                f"Deployment query timed out after {self.config.timeout_seconds}s"
+            )
+        except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("deployments", time.time() - start_time)
+            increment_tool_calls("deployments", "error")
+            raise DeploymentAdapterError(
+                f"Deployment HTTP error {e.response.status_code}: {e.response.text}"
+            )
+        except (httpx.HTTPError, ValueError, KeyError) as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("deployments", time.time() - start_time)
             increment_tool_calls("deployments", "error")
             logger.error("Deployment query failed: %s", e)
-            # Return error but don't fabricate data
-            return {
-                "status": "error",
-                "reason_code": "deployment_query_failed",
-                "error": str(e),
-                "data": [],
-            }
+            raise DeploymentAdapterError(f"Deployment query failed: {e}")
 
     async def get_deployment_by_version(
         self,
@@ -188,22 +220,34 @@ class DeploymentAdapter:
         if not client:
             return self._unavailable_response("deployment_adapter_not_configured")
 
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            logger.warning("Deployment circuit breaker open, rejecting version query")
+            return self._unavailable_response("circuit_breaker_open")
+
         try:
             response = await client.get(
                 f"/api/v1/deployments/{service}/{version}"
             )
             response.raise_for_status()
 
+            self._circuit_breaker.record_success()
             return {
                 "status": "success",
                 "data": response.json(),
             }
 
-        except (httpx.HTTPError, httpx.TimeoutException, ValueError, KeyError) as e:
+        except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
+            raise DeploymentAdapterError(
+                f"Deployment query timed out after {self.config.timeout_seconds}s"
+            )
+        except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
+            raise DeploymentAdapterError(
+                f"Deployment HTTP error {e.response.status_code}: {e.response.text}"
+            )
+        except (httpx.HTTPError, ValueError, KeyError) as e:
+            self._circuit_breaker.record_failure()
             logger.error("Deployment version query failed: %s", e)
-            return {
-                "status": "error",
-                "reason_code": "deployment_query_failed",
-                "error": str(e),
-                "data": {},
-            }
+            raise DeploymentAdapterError(f"Deployment version query failed: {e}")

@@ -8,6 +8,7 @@ from typing import Any
 
 import httpx
 
+from adapters.circuit_breaker import CircuitBreaker
 from metrics import increment_tool_calls, observe_tool_call_duration
 
 logger = logging.getLogger(__name__)
@@ -22,6 +23,9 @@ class LokiConfig:
     max_log_lines: int = 10000
     max_log_line_length: int = 10000
     allowed_time_range_hours: int = 72  # Max 72 hours relative to incident
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_timeout_seconds: float = 30.0
+    circuit_breaker_half_open_max_calls: int = 3
 
     def __post_init__(self):
         if not self.base_url:
@@ -56,6 +60,12 @@ class LokiAdapter:
     def __init__(self, config: LokiConfig):
         self.config = config
         self._client: httpx.AsyncClient | None = None
+        self._circuit_breaker = CircuitBreaker(
+            name="loki",
+            failure_threshold=config.circuit_breaker_failure_threshold,
+            timeout_seconds=config.circuit_breaker_timeout_seconds,
+            half_open_max_calls=config.circuit_breaker_half_open_max_calls,
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -71,6 +81,10 @@ class LokiAdapter:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+    def circuit_breaker_state(self) -> dict:
+        """Return circuit breaker state for health checks."""
+        return self._circuit_breaker.snapshot()
 
     def validate_logql(self, logql: str) -> None:
         """Validate LogQL query for safety."""
@@ -151,6 +165,14 @@ class LokiAdapter:
                 f"Too many log lines: {total_lines} > {self.config.max_log_lines}"
             )
 
+    def _unavailable_response(self, reason_code: str) -> dict[str, Any]:
+        """Return standardized unavailable response (circuit open)."""
+        return {
+            "status": "unavailable",
+            "reason_code": reason_code,
+            "data": {},
+        }
+
     async def query_range(
         self,
         logql: str,
@@ -195,6 +217,13 @@ class LokiAdapter:
 
         client = await self._get_client()
 
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "circuit_open")
+            logger.warning("Loki circuit breaker open, rejecting query")
+            return self._unavailable_response("circuit_breaker_open")
+
         try:
             params = {
                 "query": logql,
@@ -215,11 +244,13 @@ class LokiAdapter:
             # Validate Loki response structure
             if data.get("status") != "success":
                 error_msg = data.get("error", "Unknown Loki error")
+                self._circuit_breaker.record_failure()
                 raise LokiError(f"Loki error: {error_msg}")
 
             # Validate result bounds
             self._validate_result_bounds(data.get("data", {}))
 
+            self._circuit_breaker.record_success()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "success")
 
@@ -229,23 +260,26 @@ class LokiAdapter:
             }
 
         except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "timeout")
             raise LokiTimeoutError(
                 f"Loki query timed out after {self.config.timeout_seconds}s"
             )
         except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             raise LokiError(
                 f"Loki HTTP error {e.response.status_code}: {e.response.text}"
             )
         except LokiError:
-            # Re-raise our validation errors
+            # Validation errors are client-side; don't trip the circuit breaker.
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             raise
         except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error("Loki query failed: %s", e)
@@ -282,6 +316,13 @@ class LokiAdapter:
 
         client = await self._get_client()
 
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "circuit_open")
+            logger.warning("Loki circuit breaker open, rejecting instant query")
+            return self._unavailable_response("circuit_breaker_open")
+
         try:
             params = {
                 "query": logql,
@@ -299,8 +340,10 @@ class LokiAdapter:
 
             if data.get("status") != "success":
                 error_msg = data.get("error", "Unknown Loki error")
+                self._circuit_breaker.record_failure()
                 raise LokiError(f"Loki error: {error_msg}")
 
+            self._circuit_breaker.record_success()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "success")
 
@@ -310,12 +353,14 @@ class LokiAdapter:
             }
 
         except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "timeout")
             raise LokiTimeoutError(
                 f"Loki query timed out after {self.config.timeout_seconds}s"
             )
         except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             raise LokiError(
@@ -326,6 +371,7 @@ class LokiAdapter:
             increment_tool_calls("loki", "error")
             raise
         except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error("Loki instant query failed: %s", e)
@@ -337,6 +383,13 @@ class LokiAdapter:
 
         client = await self._get_client()
 
+        # Circuit breaker: return unavailable immediately if open
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "circuit_open")
+            logger.warning("Loki circuit breaker open, rejecting labels query")
+            return self._unavailable_response("circuit_breaker_open")
+
         try:
             response = await client.get("/loki/api/v1/labels")
             response.raise_for_status()
@@ -345,8 +398,10 @@ class LokiAdapter:
 
             if data.get("status") != "success":
                 error_msg = data.get("error", "Unknown Loki error")
+                self._circuit_breaker.record_failure()
                 raise LokiError(f"Loki error: {error_msg}")
 
+            self._circuit_breaker.record_success()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "success")
 
@@ -356,18 +411,25 @@ class LokiAdapter:
             }
 
         except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "timeout")
             raise LokiTimeoutError(
                 f"Loki query timed out after {self.config.timeout_seconds}s"
             )
         except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             raise LokiError(
                 f"Loki HTTP error {e.response.status_code}: {e.response.text}"
             )
+        except LokiError:
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "error")
+            raise
         except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
             logger.error("Loki labels query failed: %s", e)

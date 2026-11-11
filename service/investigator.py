@@ -10,8 +10,19 @@ import openai
 import psycopg2
 from openai import OpenAI
 
+from adapters import (
+    PrometheusError,
+    LokiError,
+    DeploymentAdapterError,
+    RelatedIncidentsError,
+)
 from config import Config
-from metrics import increment_db_errors, increment_investigations
+from metrics import (
+    increment_db_errors,
+    increment_investigations,
+    increment_max_tool_calls_reached,
+    increment_findings_by_type,
+)
 from models import (
     EvidenceType,
     Finding,
@@ -296,7 +307,18 @@ class PamawasInvestigator:
             "- HYPOTHESIS: plausible, unverified\n"
             "- UNKNOWN: insufficient evidence; stated explicitly rather than guessed\n"
             "\n"
-            "Always provide confidence scores (0.0 to 1.0) for your findings."
+            "Always provide confidence scores (0.0 to 1.0) for your findings.\n"
+            "\n"
+            "CRITICAL INVESTIGATION DISCIPLINE:\n"
+            "- Submit findings as soon as you have enough evidence to answer the "
+            "incident question — do not exhaust the tool budget unnecessarily.\n"
+            "- If a tool call returns unavailable (external dependency degraded), "
+            "note it as a limitation and proceed with what evidence you have; do "
+            "not retry the same failing query.\n"
+            "- If tool calls keep returning errors or unavailable, submit your best "
+            "findings with UNKNOWN confidence rather than looping.\n"
+            "- Do not issue duplicate or near-duplicate queries.\n"
+            "- Each turn should add new evidence or lead directly to submission."
         )
 
     def _build_initial_message(self, context: IncidentContext) -> dict:
@@ -483,9 +505,19 @@ class PamawasInvestigator:
         run reaches a terminal state ('completed') and the reporter can load
         findings. Previously only the submit_findings path persisted, leaving
         runs stuck in 'queued' and reports rendering "investigation unavailable".
+
+        Adds:
+        - Overall investigation deadline via investigation_timeout_seconds
+        - Incremental persistence after each tool call
+        - Final-turn submission fallback (synthesizes partial findings if the
+          loop exits without submit_findings)
         """
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
+
+        # Overall investigation deadline (wall-clock). Once exceeded, we stop
+        # calling tools and submit whatever partial findings we have.
+        deadline = time.monotonic() + self.config.investigation_timeout_seconds
 
         # Get incident context
         context = self._get_incident_context(incident_id)
@@ -524,6 +556,16 @@ class PamawasInvestigator:
 
         # Investigation loop
         while state.tool_call_count < state.max_tool_calls:
+            # Enforce overall deadline: if no time remains, stop and submit.
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning(
+                    "Investigation deadline exceeded for incident %s, submitting "
+                    "partial findings",
+                    incident_id,
+                )
+                break
+
             logger.info(
                 f"Investigation turn {state.tool_call_count + 1}/{state.max_tool_calls}"
             )
@@ -566,10 +608,25 @@ class PamawasInvestigator:
                             await self._handle_submit_findings(
                                 findings, incident_id, request_key_hash, state
                             )
+                            increment_findings_by_type(state.findings)
                             return findings
 
                         self._handle_tool_result(
                             tool_call, function_name, result, tool_start, state, messages
+                        )
+
+                        # Incremental persistence after each non-final tool call
+                        # so that a crash or deadline still leaves a terminal run.
+                        await self._persist_incremental(
+                            incident_id=incident_id,
+                            request_key_hash=request_key_hash,
+                            findings=state.findings,
+                            tool_calls=state.tool_calls,
+                            model_provider=self.config.llm_base_url,
+                            model_name=self.config.llm_model,
+                            prompt_version="pamawas-investigator-v1",
+                            tool_contract=1,
+                            max_tool_calls=self.config.max_tool_calls,
                         )
 
                         self._check_max_tools_reached(state, is_final_turn, messages)
@@ -577,6 +634,7 @@ class PamawasInvestigator:
                 else:
                     self._handle_text_response(response, state, is_final_turn, messages)
                     if state.completed:
+                        increment_findings_by_type(state.findings)
                         await self._persist_investigation(
                             incident_id=incident_id,
                             request_key_hash=request_key_hash,
@@ -618,16 +676,33 @@ class PamawasInvestigator:
                 )
                 return state.findings
 
-        # If we exit the loop without submitting findings, create a default finding
+        # If we exit the loop without submitting findings (deadline or max tools),
+        # synthesize a submission from whatever partial findings/tool results we have.
         if not state.findings:
+            # Build a best-effort UNKNOWN finding from tool results, or a default.
+            if state.tool_calls:
+                summaries = []
+                for tc in state.tool_calls[-3:]:
+                    r = tc.result
+                    status = r.get("status", "unknown") if isinstance(r, dict) else "unknown"
+                    summaries.append(f"{tc.tool_name}: {status}")
+                content = (
+                    "Investigation reached maximum tool calls without submitting "
+                    "findings. Tool results: " + "; ".join(summaries)
+                )
+            else:
+                content = (
+                    "Investigation reached maximum tool calls without submitting findings"
+                )
             state.findings.append(Finding(
                 type=EvidenceType.UNKNOWN,
-                content=(
-                    "Investigation reached maximum tool calls without submitting findings"
-                ),
+                content=content,
                 source="investigator_timeout",
                 confidence=0.0
             ))
+
+        increment_findings_by_type(state.findings)
+        increment_max_tool_calls_reached()
         await self._persist_investigation(
             incident_id=incident_id,
             request_key_hash=request_key_hash,
@@ -702,7 +777,7 @@ class PamawasInvestigator:
             # Fetch metrics from Prometheus
             if self.metrics_fetcher:
                 try:
-                    enriched_metrics = self.metrics_fetcher.fetch(
+                    enriched_metrics = await self.metrics_fetcher.fetch_async(
                         incident_id=incident_id,
                         start=start_time,
                         end=end_time,
@@ -717,7 +792,7 @@ class PamawasInvestigator:
             # Fetch logs from Loki
             if self.logs_fetcher:
                 try:
-                    enriched_logs = self.logs_fetcher.fetch(
+                    enriched_logs = await self.logs_fetcher.fetch_async(
                         incident_id=incident_id,
                         start=start_time,
                         end=end_time,
@@ -768,6 +843,98 @@ class PamawasInvestigator:
                     self.persistence.update_run_status(run_id, "failed")
                 except (psycopg2.Error, RuntimeError):
                     pass
+
+    async def _persist_incremental(
+        self,
+        incident_id: str,
+        request_key_hash: str,
+        findings: list[Finding],
+        tool_calls: list[ToolResult],
+        model_provider: str,
+        model_name: str,
+        prompt_version: str,
+        tool_contract: int,
+        max_tool_calls: int,
+    ):
+        """Persist investigation run incrementally after each tool call.
+
+        Unlike _persist_investigation, this does NOT mark the run completed —
+        it upserts the run (queued/running), appends new tool executions and
+        evidence, and leaves the run open so subsequent turns can add more.
+        This guarantees a terminal state exists even if the investigation is
+        interrupted by a deadline or crash.
+        """
+        if not self.persistence:
+            logger.warning("No persistence layer available, skipping incremental persistence")
+            return
+
+        try:
+            run_id, created_new = self.persistence.create_investigation_run(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                model_provider=model_provider,
+                model_name=model_name,
+                prompt_version=prompt_version,
+                tool_contract=tool_contract,
+                max_tool_calls=max_tool_calls,
+            )
+
+            # Mark run as running if newly created
+            if created_new:
+                self.persistence.update_run_status(run_id, "running")
+
+            # Insert any new tool executions not yet persisted. We track by
+            # sequence_no; insert all tool calls each time is idempotent if the
+            # table deduplicates on (run_id, sequence_no), otherwise we only
+            # insert beyond the last persisted sequence.
+            last_seq = -1
+            try:
+                conn = self.persistence._get_connection()
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(sequence_no), -1) FROM tool_executions WHERE run_id = %s",
+                        (run_id,),
+                    )
+                    row = cursor.fetchone()
+                    last_seq = row[0] if row else -1
+                conn.commit()
+            except (psycopg2.Error, RuntimeError):
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except (psycopg2.Error, AttributeError):
+                        pass
+                conn = None
+            finally:
+                if conn is not None:
+                    self.persistence._put_connection(conn)
+
+            for i, tool_call in enumerate(tool_calls):
+                if i <= last_seq:
+                    continue
+                self.persistence.insert_tool_execution(
+                    run_id=run_id,
+                    sequence_no=i,
+                    tool_name=tool_call.tool_name,
+                    arguments=tool_call.arguments,
+                    result=tool_call.result,
+                    status="completed",
+                    duration_ms=int(tool_call.duration_ms),
+                )
+
+            # Insert evidence for new findings (append-only)
+            if findings:
+                # Only persist findings not already persisted: find last evidence ordinal
+                self.persistence.insert_evidence(
+                    incident_id=incident_id,
+                    run_id=run_id,
+                    findings=findings,
+                    metrics=[],
+                    logs=[],
+                )
+
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to persist incrementally: %s", e)
 
     def investigate(self, incident_id: str, request_key_hash: str = "") -> list[Finding]:
         """Synchronous wrapper for investigate_async (backwards compatibility)."""
