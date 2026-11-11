@@ -440,9 +440,11 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
     """Background wrapper around investigate_async.
 
     The investigation runs in a fire-and-forget task spawned from the HTTP
-    endpoint. If it raises, the run is marked failed so the client does not
-    poll a stuck "queued" run forever. Exceptions are logged and swallowed —
-    the run status is the single source of truth for the client.
+    endpoint. investigate_async now persists the run (terminal state +
+    evidence) on every return path, so a normal return leaves the run
+    completed. If it raises, the run is marked failed so the client does not
+    poll a stuck "queued" run forever. The run status is the single source of
+    truth for the client.
     """
     try:
         await investigator.investigate_async(incident_id, request_key_hash)

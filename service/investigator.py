@@ -477,14 +477,32 @@ class PamawasInvestigator:
     async def investigate_async(
         self, incident_id: str, request_key_hash: str = ""
     ) -> list[Finding]:
-        """Main investigation loop with bounded tool-calling (async version)."""
+        """Main investigation loop with bounded tool-calling (async version).
+
+        Every terminal return path now persists the run and its evidence so the
+        run reaches a terminal state ('completed') and the reporter can load
+        findings. Previously only the submit_findings path persisted, leaving
+        runs stuck in 'queued' and reports rendering "investigation unavailable".
+        """
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
 
         # Get incident context
         context = self._get_incident_context(incident_id)
         if hasattr(context, 'error') and context.error:
-            return self._handle_error_context(context)
+            findings = self._handle_error_context(context)
+            await self._persist_investigation(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                findings=findings,
+                tool_calls=[],
+                model_provider=self.config.llm_base_url,
+                model_name=self.config.llm_model,
+                prompt_version="pamawas-investigator-v1",
+                tool_contract=1,
+                max_tool_calls=self.config.max_tool_calls,
+            )
+            return findings
 
         # Initialize investigation state
         state = InvestigationState(
@@ -559,6 +577,17 @@ class PamawasInvestigator:
                 else:
                     self._handle_text_response(response, state, is_final_turn, messages)
                     if state.completed:
+                        await self._persist_investigation(
+                            incident_id=incident_id,
+                            request_key_hash=request_key_hash,
+                            findings=state.findings,
+                            tool_calls=state.tool_calls,
+                            model_provider=self.config.llm_base_url,
+                            model_name=self.config.llm_model,
+                            prompt_version="pamawas-investigator-v1",
+                            tool_contract=1,
+                            max_tool_calls=self.config.max_tool_calls,
+                        )
                         return state.findings
 
             except (
@@ -576,6 +605,17 @@ class PamawasInvestigator:
                     source="investigator_error",
                     confidence=0.0
                 ))
+                await self._persist_investigation(
+                    incident_id=incident_id,
+                    request_key_hash=request_key_hash,
+                    findings=state.findings,
+                    tool_calls=state.tool_calls,
+                    model_provider=self.config.llm_base_url,
+                    model_name=self.config.llm_model,
+                    prompt_version="pamawas-investigator-v1",
+                    tool_contract=1,
+                    max_tool_calls=self.config.max_tool_calls,
+                )
                 return state.findings
 
         # If we exit the loop without submitting findings, create a default finding
@@ -588,6 +628,17 @@ class PamawasInvestigator:
                 source="investigator_timeout",
                 confidence=0.0
             ))
+        await self._persist_investigation(
+            incident_id=incident_id,
+            request_key_hash=request_key_hash,
+            findings=state.findings,
+            tool_calls=state.tool_calls,
+            model_provider=self.config.llm_base_url,
+            model_name=self.config.llm_model,
+            prompt_version="pamawas-investigator-v1",
+            tool_contract=1,
+            max_tool_calls=self.config.max_tool_calls,
+        )
 
         return state.findings
 
