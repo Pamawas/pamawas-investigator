@@ -84,6 +84,7 @@ class InvestigatorLLM:
             for url, key, _ in endpoints
         ]
         self.models = [model or config.llm_model for _, _, model in endpoints]
+        self.model = self.models[0] if self.models else config.llm_model
 
     def _is_retryable(self, error: Exception) -> bool:
         """Return True for transient errors worth retrying / failing over."""
