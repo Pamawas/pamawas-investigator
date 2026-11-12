@@ -922,10 +922,11 @@ class PamawasInvestigator:
 
         except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to persist investigation: %s", e)
-            # Try to mark run as failed
+            # Try to mark run as failed (terminal state; 'failed_terminal' is
+            # the only terminal failure value the DB check constraint permits)
             if "run_id" in locals():
                 try:
-                    self.persistence.update_run_status(run_id, "failed")
+                    self.persistence.update_run_status(run_id, "failed_terminal")
                 except (psycopg2.Error, RuntimeError):
                     pass
 

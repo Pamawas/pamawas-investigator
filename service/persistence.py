@@ -184,9 +184,14 @@ class InvestigationPersistence:
     ) -> bool:
         """Mark a run as failed.
 
-        Idempotent: a run already in a terminal state (completed, failed,
+        Idempotent: a run already in a terminal state (completed,
         failed_terminal) is left untouched so a retry of a completed run
         does not regress it to failed.
+
+        Writes `failed_terminal` because the DB check constraint
+        `investigation_runs_status_check` does not permit the bare value
+        `failed` — only `queued, running, completed, unknown,
+        failed_retryable, failed_terminal`.
 
         Returns True if the status was updated, False otherwise.
         """
@@ -198,10 +203,10 @@ class InvestigationPersistence:
                 cursor.execute(
                     """
                     UPDATE investigation_runs
-                    SET status = 'failed', updated_at = %s,
+                    SET status = 'failed_terminal', updated_at = %s,
                         completed_at = %s, safe_error_code = %s
                     WHERE id = %s
-                      AND status NOT IN ('completed', 'failed', 'failed_terminal')
+                      AND status NOT IN ('completed', 'failed_terminal')
                     """,
                     (now, now, error, run_id),
                 )
@@ -302,6 +307,7 @@ class InvestigationPersistence:
                         arguments_redacted, result_summary, result_hash,
                         status, duration_ms, created_at
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (run_id, sequence_no) DO NOTHING
                     """,
                     (
                         exec_id,

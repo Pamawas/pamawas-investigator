@@ -112,6 +112,21 @@ class LokiAdapter:
                     f"LogQL query contains prohibited pattern: {pattern}"
                 )
 
+        # Reject invalid LogQL line-filter operator sequences that Loki
+        # cannot parse. Loki supports |=, |!=, |~, |!~ as line-filter
+        # operators; `|==`, `|=~`, `|!=~`, etc. are not valid operators
+        # and produce a parse error at the offending `|=`.
+        invalid_operator_patterns = [
+            r"\|==",  # |== is not a LogQL operator
+            r"\|=~",  # |=~ is not a LogQL operator
+            r"\|!=~",  # |!=~ is not a LogQL operator
+        ]
+        for pattern in invalid_operator_patterns:
+            if re.search(pattern, logql):
+                raise LokiQueryValidationError(
+                    f"LogQL query contains invalid operator pattern: {pattern}"
+                )
+
     def validate_time_range(self, start: str, end: str) -> tuple[float, float]:
         """Parse and validate time range. Returns (start_ts, end_ts) as Unix timestamps."""
         from datetime import datetime

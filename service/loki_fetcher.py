@@ -72,6 +72,19 @@ class LokiFetcher(LogsFetcher):
             if re.search(pattern, logql, re.IGNORECASE):
                 raise ValueError(f"LogQL query contains prohibited pattern: {pattern}")
 
+        # Reject invalid LogQL line-filter operator sequences that Loki
+        # cannot parse. Loki supports |=, |!=, |~, |!~ as line-filter
+        # operators; `|==`, `|=~`, `|!=~`, etc. are not valid operators
+        # and produce a parse error at the offending `|=`.
+        invalid_operator_patterns = [
+            r"\|==",
+            r"\|=~",
+            r"\|!=~",
+        ]
+        for pattern in invalid_operator_patterns:
+            if re.search(pattern, logql):
+                raise ValueError(f"LogQL query contains invalid operator pattern: {pattern}")
+
     def _parse_timestamp(self, ts: float) -> datetime:
         """Parse Unix timestamp to datetime."""
         return datetime.fromtimestamp(ts, tz=timezone.utc)
