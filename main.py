@@ -77,8 +77,9 @@ async def lifespan(app: FastAPI):
         config = InvestigationConfig.from_env()
         log.info(
             "config_loaded",
-            llm_model=config.llm_model,
-            llm_base_url=config.llm_base_url,
+            llm_base_urls=config.llm_base_urls,
+            llm_api_keys_count=len(config.llm_api_keys or []),
+            llm_models_count=len(config.llm_models or []),
             version=APP_VERSION,
         )
 
