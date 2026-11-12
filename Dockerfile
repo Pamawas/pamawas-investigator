@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 WORKDIR /app
 COPY --from=builder /usr/local/lib/python3.14/site-packages /usr/local/lib/python3.14/site-packages
 COPY --from=builder /app /app
+COPY --from=builder /app/version.txt ./version.txt
 
 EXPOSE 8080
 
