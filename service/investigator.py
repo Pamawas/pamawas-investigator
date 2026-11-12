@@ -78,13 +78,28 @@ class InvestigatorLLM:
             endpoints.append((config.llm_base_url, config.llm_api_key, config.llm_model))
 
         self.endpoints = endpoints
-        # Each endpoint gets its own OpenAI client.
-        self.clients = [
-            OpenAI(base_url=url, api_key=key or "", timeout=self.REQUEST_TIMEOUT)
-            for url, key, _ in endpoints
-        ]
-        self.models = [model or config.llm_model for _, _, model in endpoints]
-        self.model = self.models[0] if self.models else config.llm_model
+        # Each endpoint gets its own OpenAI client. Endpoints without a
+        # configured API key are skipped with a warning so the service can
+        # still start when LLM credentials are missing (investigations will
+        # fail gracefully at call time rather than crashing on startup).
+        self.clients: list[OpenAI] = []
+        self.models: list[str] = []
+        for url, key, model in endpoints:
+            try:
+                self.clients.append(
+                    OpenAI(base_url=url, api_key=key or "", timeout=self.REQUEST_TIMEOUT)
+                )
+                self.models.append(model or config.llm_model)
+            except openai.OpenAIError as e:
+                logger.warning(
+                    "Skipping LLM endpoint %s: missing or invalid credentials (%s)", url, e
+                )
+
+        if not self.clients:
+            logger.warning(
+                "No LLM endpoints with valid credentials configured; "
+                "investigations will fail until an API key is provided"
+            )
 
     def _is_retryable(self, error: Exception) -> bool:
         """Return True for transient errors worth retrying / failing over."""

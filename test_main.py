@@ -91,7 +91,7 @@ class TestInvestigatorLLM:
 
         llm = InvestigatorLLM(config)
 
-        assert llm.model == "gpt-4o-mini"
+        assert llm.models[0] == "gpt-4o-mini"
         mock_openai.assert_called_once_with(
             base_url="https://api.openai.com/v1",
             api_key="test-key",
