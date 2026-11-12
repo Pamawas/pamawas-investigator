@@ -21,8 +21,9 @@ def fake_transports():
 def config():
     return Config(
         database_url="",
-        llm_api_key="test-key",
-        llm_model="test-model",
+        llm_base_urls=["https://api.openai.com/v1"],
+        llm_api_keys=["test-key"],
+        llm_models=["test-model"],
         max_tool_calls=3,
         truncation_limit=256,
     )

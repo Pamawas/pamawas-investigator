@@ -82,9 +82,9 @@ class TestInvestigatorLLM:
     def test_llm_initialization(self, mock_openai):
         config = InvestigationConfig(
             database_url="postgres://test:***@localhost/test",
-            llm_base_url="https://api.openai.com/v1",
-            llm_api_key="test-key",
-            llm_model="gpt-4o-mini",
+            llm_base_urls=["https://api.openai.com/v1"],
+            llm_api_keys=["test-key"],
+            llm_models=["gpt-4o-mini"],
             prometheus_url="http://prometheus:9090",
             loki_url="http://loki:3100",
         )

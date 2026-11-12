@@ -59,8 +59,7 @@ class InvestigatorLLM:
     REQUEST_TIMEOUT = 30.0
 
     def __init__(self, config: Config):
-        # Build ordered endpoint list: explicit redundants first, then the
-        # single llm_base_url fallback.
+        # Build ordered endpoint list from plural env vars only.
         endpoints: list[tuple[str, str | None, str | None]] = []
         if config.llm_base_urls:
             keys = config.llm_api_keys or []
@@ -73,9 +72,6 @@ class InvestigatorLLM:
                         models[i] if i < len(models) else None,
                     )
                 )
-        # Single-endpoint fallback (dedup against already-added URLs).
-        if config.llm_base_url not in {e[0] for e in endpoints}:
-            endpoints.append((config.llm_base_url, config.llm_api_key, config.llm_model))
 
         self.endpoints = endpoints
         # Each endpoint gets its own OpenAI client. Endpoints without a
