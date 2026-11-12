@@ -728,7 +728,7 @@ class PamawasInvestigator:
         tools = ToolRegistry.get_tools()
 
         # Call the LLM off the asyncio event loop — chat_completion is a
-        # synchronous OpenAI call (30s timeout × 3 retries) that would block
+        # synchronous OpenAI call (30s timeout x 3 retries) that would block
         # health probes and kill the background investigation task.
         response = await asyncio.to_thread(
             self.llm.chat_completion,
