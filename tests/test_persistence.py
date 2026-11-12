@@ -300,7 +300,7 @@ class TestMarkRunFailed:
         # Verify the UPDATE query
         update_call = mock_cursor.execute.call_args[0][0]
         assert "UPDATE investigation_runs" in update_call
-        assert "status = 'failed'" in update_call
+        assert "status = 'failed_terminal'" in update_call
         params = mock_cursor.execute.call_args[0][1]
         assert "irun_123" in params
 
