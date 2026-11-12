@@ -1,5 +1,6 @@
 """Main Investigator Service."""
 
+import asyncio
 import json
 import logging
 import time
@@ -41,7 +42,12 @@ except ImportError:
 
 
 class InvestigatorLLM:
-    """OpenAI-compatible LLM client for the investigator."""
+    """OpenAI-compatible LLM client for the investigator with endpoint redundancy.
+
+    LLM endpoints are tried in order (primary first, then redundants). On a
+    transient failure (timeout/connection/5xx) the next endpoint is attempted,
+    so a single unhealthy LLM provider does not stall investigations.
+    """
 
     # Bounded retry policy: transient network/5xx errors are retried with
     # exponential backoff; anything else fails fast.
@@ -53,15 +59,34 @@ class InvestigatorLLM:
     REQUEST_TIMEOUT = 30.0
 
     def __init__(self, config: Config):
-        self.client = OpenAI(
-            base_url=config.llm_base_url,
-            api_key=config.llm_api_key,
-            timeout=self.REQUEST_TIMEOUT,
-        )
-        self.model = config.llm_model
+        # Build ordered endpoint list: explicit redundants first, then the
+        # single llm_base_url fallback.
+        endpoints: list[tuple[str, str | None, str | None]] = []
+        if config.llm_base_urls:
+            keys = config.llm_api_keys or []
+            models = config.llm_models or []
+            for i, url in enumerate(config.llm_base_urls):
+                endpoints.append(
+                    (
+                        url,
+                        keys[i] if i < len(keys) else None,
+                        models[i] if i < len(models) else None,
+                    )
+                )
+        # Single-endpoint fallback (dedup against already-added URLs).
+        if config.llm_base_url not in {e[0] for e in endpoints}:
+            endpoints.append((config.llm_base_url, config.llm_api_key, config.llm_model))
+
+        self.endpoints = endpoints
+        # Each endpoint gets its own OpenAI client.
+        self.clients = [
+            OpenAI(base_url=url, api_key=key or "", timeout=self.REQUEST_TIMEOUT)
+            for url, key, _ in endpoints
+        ]
+        self.models = [model or config.llm_model for _, _, model in endpoints]
 
     def _is_retryable(self, error: Exception) -> bool:
-        """Return True for transient errors worth retrying."""
+        """Return True for transient errors worth retrying / failing over."""
         if isinstance(error, openai.APITimeoutError):
             return True
         if isinstance(error, openai.APIConnectionError):
@@ -76,55 +101,62 @@ class InvestigatorLLM:
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
     ):
-        """Call the LLM with optional tool use.
+        """Call the LLM with optional tool use, failing over across endpoints.
 
-        Retries transient errors (timeouts, connection failures, 5xx) with
-        bounded exponential backoff. Non-retryable errors (4xx, auth, bad
-        request) propagate immediately.
+        Each endpoint gets MAX_RETRIES bounded attempts; transient failures move
+        to the next endpoint. Non-retryable errors (4xx, auth, bad request)
+        propagate immediately. The last error is raised if all endpoints fail.
         """
         import time as _time
 
         last_error: Exception | None = None
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    temperature=0.1,  # Low temperature for more deterministic output
-                    max_tokens=2000,
-                )
-                return response.choices[0].message
-            except (
-                openai.OpenAIError,
-                RuntimeError,
-                ValueError,
-                KeyError,
-                TypeError,
-                TimeoutError,
-            ) as e:
-                last_error = e
-                if not self._is_retryable(e) or attempt == self.MAX_RETRIES - 1:
-                    logger.error("LLM call failed: %s", e)
-                    raise
-                backoff = min(
-                    self.INITIAL_BACKOFF_SECONDS * (2**attempt),
-                    self.MAX_BACKOFF_SECONDS,
-                )
-                logger.warning(
-                    "LLM call failed (attempt %d/%d), retrying in %.1fs: %s",
-                    attempt + 1,
-                    self.MAX_RETRIES,
-                    backoff,
-                    e,
-                )
-                _time.sleep(backoff)
+        for idx, (client, model) in enumerate(zip(self.clients, self.models)):
+            endpoint_label = f"endpoint {idx + 1}/{len(self.endpoints)}"
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    response = client.chat.completions.create(
+                        model=model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        temperature=0.1,  # Low temperature for deterministic output
+                        max_tokens=2000,
+                    )
+                    if idx > 0:
+                        logger.warning("LLM failover succeeded on %s", endpoint_label)
+                    return response.choices[0].message
+                except (
+                    openai.OpenAIError,
+                    RuntimeError,
+                    ValueError,
+                    KeyError,
+                    TypeError,
+                    TimeoutError,
+                ) as e:
+                    last_error = e
+                    if not self._is_retryable(e) or attempt == self.MAX_RETRIES - 1:
+                        # Non-retryable, or retries exhausted on this endpoint.
+                        if not self._is_retryable(e):
+                            logger.error("LLM call failed (non-retryable): %s", e)
+                        raise
+                    backoff = min(
+                        self.INITIAL_BACKOFF_SECONDS * (2**attempt),
+                        self.MAX_BACKOFF_SECONDS,
+                    )
+                    logger.warning(
+                        "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs: %s",
+                        attempt + 1,
+                        self.MAX_RETRIES,
+                        endpoint_label,
+                        backoff,
+                        e,
+                    )
+                    _time.sleep(backoff)
 
-        # Unreachable: the loop always raises on the last attempt.
+        # All endpoints exhausted.
         if last_error is not None:  # pragma: no cover - defensive
             raise last_error
-        raise RuntimeError("LLM call failed after retries")  # pragma: no cover
+        raise RuntimeError("LLM call failed after all endpoints exhausted")  # pragma: no cover
 
 
 class PamawasInvestigator:
@@ -694,8 +726,15 @@ class PamawasInvestigator:
         )
         tools = ToolRegistry.get_tools()
 
-        # Call the LLM
-        response = self.llm.chat_completion(messages=messages, tools=tools, tool_choice=tool_choice)
+        # Call the LLM off the asyncio event loop — chat_completion is a
+        # synchronous OpenAI call (30s timeout × 3 retries) that would block
+        # health probes and kill the background investigation task.
+        response = await asyncio.to_thread(
+            self.llm.chat_completion,
+            messages=messages,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
 
         # Add the assistant's response to the conversation
         messages.append({"role": "assistant", "content": response.content or ""})
@@ -875,7 +914,7 @@ class PamawasInvestigator:
             if "run_id" in locals():
                 try:
                     self.persistence.update_run_status(run_id, "failed")
-                except psycopg2.Error, RuntimeError:
+                except (psycopg2.Error, RuntimeError):
                     pass
 
     async def _persist_incremental(
@@ -954,11 +993,11 @@ class PamawasInvestigator:
                 row = cursor.fetchone()
             conn.commit()
             return row[0] if row else -1
-        except psycopg2.Error, RuntimeError:
+        except (psycopg2.Error, RuntimeError):
             if conn is not None:
                 try:
                     conn.rollback()
-                except psycopg2.Error, AttributeError:
+                except (psycopg2.Error, AttributeError):
                     pass
             return -1
         finally:

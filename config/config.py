@@ -6,15 +6,30 @@ import os
 from dataclasses import dataclass
 
 
+def _parse_env_list(value: str | None) -> list[str] | None:
+    """Parse a comma-separated env var into a list of non-empty stripped strings."""
+    if not value:
+        return None
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 @dataclass
 class Config:
     """Configuration for the investigator service."""
 
     database_url: str
     port: int = 8080
+    # Primary LLM endpoint (kept for backward compatibility). llm_base_urls takes
+    # precedence when set; this is the single-endpoint fallback.
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
     llm_model: str = "gpt-4o-mini"
+    # Redundant LLM endpoints tried in order on transient failure. Parsed from
+    # LLM_BASE_URLS / LLM_API_KEYS / LLM_MODELS as comma-separated lists. When
+    # unset, falls back to the single llm_base_url/llm_api_key/llm_model above.
+    llm_base_urls: list[str] | None = None
+    llm_api_keys: list[str] | None = None
+    llm_models: list[str] | None = None
     prometheus_url: str = "http://prometheus:9090"
     loki_url: str = "http://loki:3100"
     max_tool_calls: int = 6
@@ -65,6 +80,9 @@ class Config:
             llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
             llm_api_key=os.getenv("LLM_API_KEY", ""),
             llm_model=os.getenv("LLM_MODEL", "gpt-4o-mini"),
+            llm_base_urls=_parse_env_list(os.getenv("LLM_BASE_URLS")),
+            llm_api_keys=_parse_env_list(os.getenv("LLM_API_KEYS")),
+            llm_models=_parse_env_list(os.getenv("LLM_MODELS")),
             prometheus_url=os.getenv("PROMETHEUS_URL", "http://prometheus:9090"),
             loki_url=os.getenv("LOKI_URL", "http://loki:3100"),
             prometheus_query_template=os.getenv("PROMETHEUS_QUERY_TEMPLATE", '{incident="%s"}'),
