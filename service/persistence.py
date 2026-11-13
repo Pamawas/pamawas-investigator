@@ -112,11 +112,7 @@ class InvestigationPersistence:
         tool_contract: int,
         max_tool_calls: int,
     ) -> tuple[str, bool]:
-        """
-        Create or get existing investigation run.
-        Returns (run_id, created_new).
-        If run already exists for this incident+request_key_hash, returns existing run_id and False.
-        """
+        """Create or get existing investigation run; returns (run_id, created_new)."""
         conn = self._get_connection()
         run_id = f"irun_{uuid.uuid4().hex[:26].upper()}"
         now = datetime.now(UTC)
@@ -182,19 +178,7 @@ class InvestigationPersistence:
         run_id: str,
         error: str | None = None,
     ) -> bool:
-        """Mark a run as failed.
-
-        Idempotent: a run already in a terminal state (completed,
-        failed_terminal) is left untouched so a retry of a completed run
-        does not regress it to failed.
-
-        Writes `failed_terminal` because the DB check constraint
-        `investigation_runs_status_check` does not permit the bare value
-        `failed` — only `queued, running, completed, unknown,
-        failed_retryable, failed_terminal`.
-
-        Returns True if the status was updated, False otherwise.
-        """
+        """Mark a run as failed (idempotent); returns True if status updated."""
         conn = None
         try:
             conn = self._get_connection()
@@ -340,18 +324,7 @@ class InvestigationPersistence:
         metrics: list[dict[str, Any]] | None = None,
         logs: list[dict[str, Any]] | None = None,
     ) -> list[str]:
-        """Insert evidence records for all findings in a transaction.
-
-        Args:
-            incident_id: The incident ID
-            run_id: The investigation run ID
-            findings: List of Finding objects
-            metrics: Optional list of metric dicts for enrichment (same across all evidence)
-            logs: Optional list of log entry dicts for enrichment (same across all evidence)
-
-        Returns:
-            List of evidence IDs created
-        """
+        """Insert evidence records for all findings in a transaction; returns evidence IDs."""
         from models import LogEntry, Metric
 
         conn = self._get_connection()
@@ -418,18 +391,7 @@ class InvestigationPersistence:
         metrics: list[dict[str, Any]] | None = None,
         logs: list[dict[str, Any]] | None = None,
     ) -> bool:
-        """Update evidence with enriched metrics and logs.
-
-        Uses optimistic concurrency control via version column.
-
-        Args:
-            evidence_id: The evidence ID to update
-            metrics: Optional list of metric dicts
-            logs: Optional list of log entry dicts
-
-        Returns:
-            True if update was successful, False if version conflict
-        """
+        """Update evidence with enriched metrics/logs; returns False on version conflict."""
         from models import LogEntry, Metric
 
         conn = self._get_connection()

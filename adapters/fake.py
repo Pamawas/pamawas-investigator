@@ -1,8 +1,6 @@
 """Fake transport interfaces for deterministic tests.
 
-These implementations are for TESTING ONLY and must not be used
-on production paths. They provide deterministic responses without
-requiring real external services.
+TESTING ONLY - not for production use; deterministic responses, no real services needed.
 """
 
 import time
@@ -115,15 +113,7 @@ class FakeRelatedIncidentsResponse:
 
 
 class FakePrometheusTransport:
-    """Fake Prometheus transport for deterministic tests.
-
-    Usage:
-        transport = FakePrometheusTransport()
-        transport.set_response(FakePrometheusResponse(status="success", results=[...]))
-        result = await transport.query_range(promql, start, end, step)
-
-    DO NOT USE IN PRODUCTION CODE PATHS.
-    """
+    """Fake Prometheus transport for deterministic tests."""
 
     def __init__(self):
         self._response = FakePrometheusResponse()
@@ -198,10 +188,7 @@ class FakePrometheusTransport:
 
 
 class FakeLokiTransport:
-    """Fake Loki transport for deterministic tests.
-
-    DO NOT USE IN PRODUCTION CODE PATHS.
-    """
+    """Fake Loki transport for deterministic tests."""
 
     def __init__(self):
         self._response = FakeLokiResponse()
@@ -275,10 +262,7 @@ class FakeLokiTransport:
 
 
 class FakeDeploymentTransport:
-    """Fake Deployment transport for deterministic tests.
-
-    DO NOT USE IN PRODUCTION CODE PATHS.
-    """
+    """Fake Deployment transport for deterministic tests."""
 
     def __init__(self):
         self._response = FakeDeploymentResponse()
@@ -341,10 +325,7 @@ class FakeDeploymentTransport:
 
 
 class FakeRelatedIncidentsTransport:
-    """Fake Related Incidents transport for deterministic tests.
-
-    DO NOT USE IN PRODUCTION CODE PATHS.
-    """
+    """Fake Related Incidents transport for deterministic tests."""
 
     def __init__(self):
         self._response = FakeRelatedIncidentsResponse()
@@ -416,10 +397,7 @@ class FakeRelatedIncidentsTransport:
 
 
 def create_fake_transports() -> dict[str, Any]:
-    """Create a complete set of fake transports for testing.
-
-    Returns dict with keys: prometheus, loki, deployments, related_incidents
-    """
+    """Create a complete set of fake transports for testing; returns a dict with transport keys."""
     return {
         "prometheus": FakePrometheusTransport(),
         "loki": FakeLokiTransport(),

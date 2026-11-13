@@ -45,10 +45,7 @@ class OTelConfig:
 
 
 def init_tracer(config: OTelConfig) -> Callable | None:
-    """Initialize OpenTelemetry tracer provider with OTLP gRPC exporter.
-
-    Returns a shutdown function if tracing is enabled, None otherwise.
-    """
+    """Initialize the OTLP gRPC tracer provider; returns a shutdown function or None."""
     if not config.enabled:
         logger.info("[otel] tracing disabled for %s", config.service_name)
         return None

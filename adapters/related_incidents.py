@@ -33,11 +33,7 @@ class RelatedIncidentsError(Exception):
 
 
 class RelatedIncidentsAdapter:
-    """Parameterized database query for related incidents.
-
-    The model never supplies SQL. All queries are parameterized and
-    constructed by the adapter based on bounded input parameters.
-    """
+    """Parameterized database query for related incidents with circuit breaker protection."""
 
     def __init__(self, config: RelatedIncidentsConfig):
         self.config = config
@@ -72,10 +68,7 @@ class RelatedIncidentsAdapter:
         return self._circuit_breaker.snapshot()
 
     def _build_symptom_conditions(self, symptom_keywords: list[str]) -> tuple[str, list[Any]]:
-        """Build parameterized WHERE conditions for symptom keyword matching.
-
-        Returns (where_clause, params) where where_clause includes WHERE keyword.
-        """
+        """Build parameterized WHERE conditions for symptom keyword matching (returns clause and params)."""
         if not symptom_keywords:
             return "", []
 
@@ -113,18 +106,7 @@ class RelatedIncidentsAdapter:
         environment: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """
-        Find related incidents using parameterized query.
-
-        Args:
-            service: Service name to filter by
-            symptom_keywords: List of symptom keywords to match
-            environment: Optional environment filter
-            limit: Maximum results (defaults to config max)
-
-        Returns:
-            Dict with status and data list of related incidents
-        """
+        """Find related incidents using a parameterized query; returns status and data list."""
         start_time = time.time()
 
         if not service or not service.strip():
@@ -246,19 +228,7 @@ class RelatedIncidentsAdapter:
         environment: str | None = None,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """
-        Find incidents for a service within a time window.
-
-        Args:
-            service: Service name
-            start_time: Start timestamp (RFC3339)
-            end_time: End timestamp (RFC3339)
-            environment: Optional environment filter
-            limit: Maximum results
-
-        Returns:
-            Dict with status and data list of incidents
-        """
+        """Find incidents for a service within a time window; returns status and data list."""
         query_start = time.time()
 
         if not service or not service.strip():

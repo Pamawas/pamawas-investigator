@@ -45,9 +45,7 @@ class DeploymentAdapterNotConfiguredError(DeploymentAdapterError):
 class DeploymentAdapter:
     """Deployment history interface with circuit breaker protection.
 
-    Returns real adapter data only when configured.
-    Otherwise returns explicit unavailable response.
-    Never returns sample/fake deployments.
+    Returns real data only when configured; otherwise an explicit unavailable response (never fake data).
     """
 
     def __init__(self, config: DeploymentConfig):
@@ -109,18 +107,7 @@ class DeploymentAdapter:
         end: str,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """
-        Get recent deployments for a service.
-
-        Args:
-            service: Service name
-            start: Start timestamp (RFC3339)
-            end: End timestamp (RFC3339)
-            limit: Maximum results
-
-        Returns:
-            Deployment data or unavailable response
-        """
+        """Get recent deployments for a service; returns deployment data or an unavailable response."""
         start_time = time.time()
 
         if not service or not service.strip():
@@ -206,16 +193,7 @@ class DeploymentAdapter:
         service: str,
         version: str,
     ) -> dict[str, Any]:
-        """
-        Get specific deployment by version.
-
-        Args:
-            service: Service name
-            version: Deployment version/tag
-
-        Returns:
-            Deployment data or unavailable response
-        """
+        """Get a specific deployment by version; returns data or an unavailable response."""
         if not self.config.is_configured():
             return self._unavailable_response("deployment_adapter_not_configured")
 

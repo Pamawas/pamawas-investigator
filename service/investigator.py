@@ -42,12 +42,7 @@ except ImportError:
 
 
 class InvestigatorLLM:
-    """OpenAI-compatible LLM client for the investigator with endpoint redundancy.
-
-    LLM endpoints are tried in order (primary first, then redundants). On a
-    transient failure (timeout/connection/5xx) the next endpoint is attempted,
-    so a single unhealthy LLM provider does not stall investigations.
-    """
+    """OpenAI-compatible LLM client with endpoint redundancy for investigator."""
 
     # Bounded retry policy: transient network/5xx errors are retried with
     # exponential backoff; anything else fails fast.
@@ -113,12 +108,7 @@ class InvestigatorLLM:
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
     ):
-        """Call the LLM with optional tool use, failing over across endpoints.
-
-        Each endpoint gets MAX_RETRIES bounded attempts; transient failures move
-        to the next endpoint. Non-retryable errors (4xx, auth, bad request)
-        propagate immediately. The last error is raised if all endpoints fail.
-        """
+        """Call the LLM with optional tool use; failing over across endpoints and raising the last error."""
         import time as _time
 
         last_error: Exception | None = None
@@ -541,19 +531,7 @@ class PamawasInvestigator:
     async def investigate_async(
         self, incident_id: str, request_key_hash: str = ""
     ) -> list[Finding]:
-        """Main investigation loop with bounded tool-calling (async version).
-
-        Every terminal return path now persists the run and its evidence so the
-        run reaches a terminal state ('completed') and the reporter can load
-        findings. Previously only the submit_findings path persisted, leaving
-        runs stuck in 'queued' and reports rendering "investigation unavailable".
-
-        Adds:
-        - Overall investigation deadline via investigation_timeout_seconds
-        - Incremental persistence after each tool call
-        - Final-turn submission fallback (synthesizes partial findings if the
-          loop exits without submit_findings)
-        """
+        """Run the bounded investigation loop; every terminal path persists the run and its evidence."""
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
 
@@ -616,10 +594,7 @@ class PamawasInvestigator:
         context: IncidentContext,
         deadline: float,
     ) -> list[Finding]:
-        """Run the bounded investigation tool-calling loop.
-
-        Returns the final findings after persisting them to a terminal run.
-        """
+        """Run the bounded investigation tool-calling loop and persist final findings."""
         # Build system prompt and initial message
         system_prompt = self._build_system_prompt()
         initial_message = self._build_initial_message(context)
@@ -726,10 +701,7 @@ class PamawasInvestigator:
         state: InvestigationState,
         messages: list[dict],
     ) -> list[Finding] | None:
-        """Run a single investigation turn (one LLM call + tool handling).
-
-        Returns the final findings if the investigation is complete, else None.
-        """
+        """Run a single investigation turn (LLM call + tool handling); returns findings if complete."""
         is_final_turn = state.tool_call_count == state.max_tool_calls - 1
         tool_choice = (
             {"type": "function", "function": {"name": "submit_findings"}}
@@ -819,10 +791,7 @@ class PamawasInvestigator:
         tool_contract: int,
         max_tool_calls: int,
     ):
-        """Persist investigation run, tool executions, and evidence in a transaction.
-
-        Includes evidence enrichment with metrics and logs from Prometheus and Loki.
-        """
+        """Persist investigation run, tool executions, and evidence in a transaction (includes enrichment)."""
         if not self.persistence:
             logger.warning("No persistence layer available, skipping investigation persistence")
             return

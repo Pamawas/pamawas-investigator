@@ -1,13 +1,6 @@
-"""Circuit breaker for external adapter calls.
+"""Thread-safe circuit breaker for external adapter calls.
 
-States:
-  CLOSED   - calls pass through; failures increment the error counter
-  OPEN     - calls are rejected immediately without touching the external dependency
-  HALF_OPEN - a limited number of trial calls are allowed to test recovery
-
-When the failure threshold is reached within a window, the circuit opens.
-After the timeout elapses, it transitions to half-open. A successful call
-closes the circuit; another failure reopens it.
+CLOSED -> trips OPEN after threshold failures -> HALF_OPEN trial -> closes on success.
 """
 
 from __future__ import annotations

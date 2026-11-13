@@ -197,24 +197,7 @@ class LokiAdapter:
         limit: int = 100,
         direction: str = "forward",
     ) -> dict[str, Any]:
-        """
-        Execute a Loki range query (query_range endpoint).
-
-        Args:
-            logql: LogQL query expression
-            start: Start timestamp (RFC3339)
-            end: End timestamp (RFC3339)
-            limit: Maximum number of log entries to return (1-10000)
-            direction: "forward" or "backward"
-
-        Returns:
-            Loki response dict with status, data, result
-
-        Raises:
-            LokiTimeoutError: Query timed out
-            LokiResponseTooLargeError: Response exceeds size/line limits
-            LokiQueryValidationError: Invalid query or parameters
-        """
+        """Execute a Loki range query; returns response dict or raises on error."""
         start_time = time.time()
 
         # Validate inputs
@@ -301,17 +284,7 @@ class LokiAdapter:
         eval_time: str | None = None,
         limit: int = 100,
     ) -> dict[str, Any]:
-        """
-        Execute a Loki instant query (query endpoint).
-
-        Args:
-            logql: LogQL query expression
-            eval_time: Optional evaluation timestamp (RFC3339), defaults to now
-            limit: Maximum number of log entries to return
-
-        Returns:
-            Loki response dict
-        """
+        """Execute a Loki instant query; returns response dict or raises on error."""
         start_time = time.time()
 
         self.validate_logql(logql)

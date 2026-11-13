@@ -182,23 +182,7 @@ class PrometheusAdapter:
         end: str,
         step_seconds: int = 60,
     ) -> dict[str, Any]:
-        """
-        Execute a Prometheus range query.
-
-        Args:
-            promql: PromQL query expression
-            start: Start timestamp (RFC3339)
-            end: End timestamp (RFC3339)
-            step_seconds: Query resolution step in seconds
-
-        Returns:
-            Prometheus response dict with status, data, resultType, result
-
-        Raises:
-            PrometheusTimeoutError: Query timed out
-            PrometheusResponseTooLargeError: Response exceeds size/sample limits
-            PrometheusQueryValidationError: Invalid query or parameters
-        """
+        """Execute a Prometheus range query; returns response dict or raises on error."""
         start_time = time.time()
 
         # Validate inputs
@@ -283,16 +267,7 @@ class PrometheusAdapter:
         promql: str,
         eval_time: str | None = None,
     ) -> dict[str, Any]:
-        """
-        Execute a Prometheus instant query.
-
-        Args:
-            promql: PromQL query expression
-            eval_time: Optional evaluation timestamp (RFC3339), defaults to now
-
-        Returns:
-            Prometheus response dict
-        """
+        """Execute a Prometheus instant query; returns response dict or raises on error."""
         start_time = time.time()
 
         self.validate_promql(promql)
