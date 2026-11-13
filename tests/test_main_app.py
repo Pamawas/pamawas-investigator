@@ -63,9 +63,7 @@ def test_health_returns_database_error(cursor):
 
 
 def test_investigate_endpoint_is_deprecated_shim():
-    """The legacy /api/v1/investigate endpoint is a deprecation shim that mirrors
-    the async v1 creation contract: persist a queued run and return 202, never
-    inline findings."""
+    """The legacy /api/v1/investigate endpoint is a deprecation shim mirroring the async creation contract: persists a queued run and returns 202, never inline findings."""
     from unittest.mock import AsyncMock
 
     service = MagicMock()
@@ -222,8 +220,7 @@ def test_create_investigation_idempotent_returns_409():
 
 
 def test_create_investigation_success():
-    """Test successful investigation creation returns 202 queued per the frozen
-    v1 contract; the run is persisted before the async kick-off."""
+    """Test successful investigation creation returns 202 queued per the v1 contract."""
     import os
 
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
@@ -259,12 +256,7 @@ def test_create_investigation_success():
 
 
 def test_create_investigation_commits_idempotency_check():
-    """The idempotency check lives inside create_investigation_run, which owns
-    the connection and must commit on success (autocommit is off, so a bare
-    SELECT leaves the transaction open). Each request must return the
-    connection to a clean state or every call leaks a connection that stays
-    idle-in-transaction until the process exits.
-    """
+    """Idempotency check inside create_investigation_run; connection must commit on success."""
     import os
 
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
