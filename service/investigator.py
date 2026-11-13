@@ -911,14 +911,7 @@ class PamawasInvestigator:
         tool_contract: int,
         max_tool_calls: int,
     ):
-        """Persist investigation run incrementally after each tool call.
-
-        Unlike _persist_investigation, this does NOT mark the run completed —
-        it upserts the run (queued/running), appends new tool executions and
-        evidence, and leaves the run open so subsequent turns can add more.
-        This guarantees a terminal state exists even if the investigation is
-        interrupted by a deadline or crash.
-        """
+        """Persist investigation incrementally after each tool call; upserts run and appends tool executions/evidence."""
         if not self.persistence:
             logger.warning("No persistence layer available, skipping incremental persistence")
             return

@@ -1,7 +1,6 @@
 """Unit tests for InvestigationPersistence.
 
-These tests cover the persistence layer directly, including edge cases
-and rollback behavior that the HTTP endpoint mocks cannot exercise.
+These tests cover the persistence layer directly, including edge cases and rollback behavior.
 """
 
 from unittest.mock import MagicMock, patch
@@ -112,10 +111,7 @@ class TestCreateInvestigationRun:
         mock_conn.commit.assert_not_called()
 
     def test_returns_none_from_fetchone_yields_runtime_error(self, mock_pool):
-        """Edge case: INSERT returns no row (ON CONFLICT), but SELECT returns None.
-
-        This should not happen in production (the ON CONFLICT should find existing),
-        but the code guards against it with a RuntimeError in the else branch."""
+        """Edge case: INSERT returns no row (ON CONFLICT) but SELECT returns None; code raises RuntimeError."""
         mock_pool, mock_conn, mock_cursor = mock_pool
 
         # INSERT returns None (ON CONFLICT DO NOTHING), but SELECT returns None

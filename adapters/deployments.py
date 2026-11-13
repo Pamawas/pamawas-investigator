@@ -43,10 +43,7 @@ class DeploymentAdapterNotConfiguredError(DeploymentAdapterError):
 
 
 class DeploymentAdapter:
-    """Deployment history interface with circuit breaker protection.
-
-    Returns real data only when configured; otherwise an explicit unavailable response (never fake data).
-    """
+    """Deployment history interface with circuit breaker; returns real data when configured or unavailable response."""
 
     def __init__(self, config: DeploymentConfig):
         self.config = config
