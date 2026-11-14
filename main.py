@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Main entry point for the Pamawas Investigator service."""
 
+import asyncio
 import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-import asyncio
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -515,8 +515,6 @@ async def get_investigation_status(run_id: str):
 
 def _retry_backoff_seconds(attempts: int, base: int) -> float:
     """Exponential back-off for investigation retries: base * 2^attempts, capped at 1h."""
-    import math
-
     if attempts > 5:
         return 3600.0
     delay = base * (2 ** attempts)
@@ -538,7 +536,7 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
     """
     try:
         await investigator.investigate_async(incident_id, request_key_hash)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         log.error(
             "investigation_task_failed",
             run_id=run_id,
@@ -596,17 +594,17 @@ async def _investigation_retry_scheduler():
                 due = investigator.persistence.list_due_investigation_retries(limit=10)
                 for run_id in due:
                     if investigator.persistence.reclaim_due_investigation_retry(run_id):
-                        row = investigator.persistence.get_run_retry_state(run_id)
                         # reclaim moved it to running; re-run the investigation.
                         # We don't have incident_id here, so look it up from the run.
                         incident_id = _get_run_incident_id(run_id)
                         if incident_id:
                             loop = asyncio.get_running_loop()
-                            loop.create_task(
+                            task = loop.create_task(
                                 _run_investigation_task(
                                     run_id, incident_id, _get_run_request_key(run_id)
                                 )
                             )
+                            _ = task
         except Exception as e:  # noqa: BLE001
             log.error("investigation_retry_scheduler_error", error=str(e))
         await asyncio.sleep(15)
@@ -636,6 +634,9 @@ def _get_run_incident_id(run_id: str) -> str | None:
             investigator.persistence._put_connection(conn)
 
 
+_GET_RUN_REQUEST_KEY_SQL = "SELECT request_key_hash FROM investigation_runs WHERE id = %s"
+
+
 def _get_run_request_key(run_id: str) -> str:
     """Return a run's request_key_hash (used for idempotent re-execution)."""
     if not investigator or not investigator.persistence:
@@ -644,7 +645,7 @@ def _get_run_request_key(run_id: str) -> str:
     try:
         conn = investigator.persistence._get_connection()
         with conn.cursor() as cursor:
-            cursor.execute("SELECT request_key_hash FROM investigation_runs WHERE id = %s", (run_id,))
+            cursor.execute(_GET_RUN_REQUEST_KEY_SQL, (run_id,))
             row = cursor.fetchone()
         conn.commit()
         return row[0] if row else ""
