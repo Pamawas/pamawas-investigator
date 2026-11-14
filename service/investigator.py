@@ -11,6 +11,12 @@ import openai
 import psycopg2
 from openai import OpenAI
 
+from adapters import (
+    DeploymentAdapterError,
+    LokiError,
+    PrometheusError,
+    RelatedIncidentsError,
+)
 from config import Config
 from metrics import (
     increment_db_errors,
@@ -403,19 +409,22 @@ class PamawasInvestigator:
     async def _execute_tool(self, function_name: str, function_args: dict):
         """Execute a tool call and return the result.
 
-        Wraps adapter calls so that Loki/Prometheus parse errors return as
-        structured error dicts (status="error") instead of raising exceptions
-        that terminate the whole investigation run.
+        Runs in the asyncio event loop, so it awaits the async adapter
+        methods directly (not the sync `self.tools.*` wrappers, which call
+        ``loop.run_until_complete`` and would fail inside a running loop).
+        Loki/Prometheus parse errors are caught here and returned as
+        structured error dicts (status="error") so a single bad query
+        does not terminate the whole investigation run.
         """
         try:
             if function_name == "query_prometheus":
-                result = await self.tools.query_prometheus(
+                result = await self.tools._prometheus_adapter.query_range(
                     function_args["promql"], function_args["start"], function_args["end"]
                 )
                 return result, None, False
 
             elif function_name == "query_loki":
-                result = await self.tools.query_loki(
+                result = await self.tools._loki_adapter.query_range(
                     function_args["logql"],
                     function_args["start"],
                     function_args["end"],
@@ -424,13 +433,13 @@ class PamawasInvestigator:
                 return result, None, False
 
             elif function_name == "get_recent_deployments":
-                result = await self.tools.get_recent_deployments(
+                result = await self.tools._deployment_adapter.get_recent_deployments(
                     function_args["service"], function_args["start"], function_args["end"]
                 )
                 return result, None, False
 
             elif function_name == "get_related_incidents":
-                result = await self.tools.get_related_incidents(
+                result = await self.tools._related_incidents_adapter.find_related(
                     function_args["service"], function_args["symptom_keywords"]
                 )
                 return result, None, False
@@ -447,10 +456,19 @@ class PamawasInvestigator:
                 ]
                 result = self.tools.submit_findings(findings)
                 return result, findings, True  # result, findings, is_final
+        except (
+            LokiError,
+            PrometheusError,
+            DeploymentAdapterError,
+            RelatedIncidentsError,
+        ) as e:
+            # A query/tool failure is a structured error, not a run-ending
+            # crash. Return it as an error dict so the loop can continue.
+            logger.warning("Tool %s returned an error: %s", function_name, e)
+            return {"status": "error", "error": str(e)}, None, False
         except Exception as e:
-            # Unexpected crash in the wrapper itself — propagate so the
-            # investigation-loop handler (not this function) decides how to
-            # persist it.
+            # Unexpected crash — propagate so the investigation-loop handler
+            # (not this function) decides how to persist it.
             logger.error("Tool %s crashed unexpectedly: %s", function_name, e)
             raise
         else:
