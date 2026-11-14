@@ -127,6 +127,34 @@ class LokiAdapter:
                     f"LogQL query contains invalid operator pattern: {pattern}"
                 )
 
+        # The model sometimes emits `OR` between two stream selectors,
+        # which Loki cannot parse. Valid alternatives: use `|~` with a
+        # pipe-separated list, or combine the selectors into one.
+        if re.search(r"\}\s+OR", logql):
+            raise LokiQueryValidationError(
+                "LogQL query contains 'OR' between stream selectors; "
+                "use '|~' with a pipe-separated list instead"
+            )
+
+        # The model sometimes groups alternation after |= with parentheses,
+        # which Loki cannot parse. Valid form: |= "term1|term2|term3"
+        # (pipe-separated within the string), not |= ("term1" OR "term2").
+        if re.search(r"\|=\(| \|=", logql):
+            raise LokiQueryValidationError(
+                "LogQL query uses '|=' with parenthesised alternation; "
+                "use pipe-separated terms inside the string instead, "
+                'e.g. |= "term1|term2|term3"'
+            )
+
+        # The model sometimes emits |!= as a line-filter operator, but !=
+        # is only valid as a label matcher (e.g. {service!="x"}), not after
+        # a pipe. Loki returns 400 for |= "x" |!= "y".
+        if re.search(r"\|!=\s", logql):
+            raise LokiQueryValidationError(
+                "LogQL query uses '|!=' as a line-filter operator; '!=' is "
+                "only valid as a label matcher (e.g. {service!=\"x\"})"
+            )
+
     def validate_time_range(self, start: str, end: str) -> tuple[float, float]:
         """Parse and validate time range. Returns (start_ts, end_ts) as Unix timestamps."""
         from datetime import datetime

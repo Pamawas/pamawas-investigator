@@ -352,7 +352,21 @@ class PamawasInvestigator:
             "- If tool calls keep returning errors or unavailable, submit your best "
             "findings with UNKNOWN confidence rather than looping.\n"
             "- Do not issue duplicate or near-duplicate queries.\n"
-            "- Each turn should add new evidence or lead directly to submission."
+            "- Each turn should add new evidence or lead directly to submission.\n"
+            "\n"
+            "IMPORTANT LOGQL SYNTAX RULES:\n"
+            "- Loki supports these line-filter operators: |=, |!=, |~, |!~\n"
+            "- Never use |==, |=~, |!=~ — these cause parse errors\n"
+            "- Never use 'OR' between stream selectors like {a} OR {b} — Loki "
+            "cannot parse. Combine selectors or use pipe-separated values with |~\n"
+            "- Never use '|=' with parentheses grouping alternation like |= "
+            "(\"term\" OR \"other\") — Loki only supports pipe-separated values "
+            "inside the string: |= \"term|other\"\n"
+            "- Never use '!=' as a line-filter operator after a pipe like |= \"x\" "
+            "|!= \"y\" — != is only valid as a label matcher inside curly "
+            "braces: {service!=\"value\"}\n"
+            "- When grouping alternatives, use |~ with pipe-separated values, "
+            "e.g. |~ \"error|timeout|refused\" or combine streams: {service} |~ \"x|y\"\n"
         )
 
     def _build_initial_message(self, context: IncidentContext) -> dict:
@@ -387,42 +401,58 @@ class PamawasInvestigator:
         ]
 
     async def _execute_tool(self, function_name: str, function_args: dict):
-        """Execute a tool call and return the result."""
-        if function_name == "query_prometheus":
-            result = await self.tools._prometheus_adapter.query_range(
-                function_args["promql"], function_args["start"], function_args["end"]
-            )
-            return result, None, False
-        elif function_name == "query_loki":
-            result = await self.tools._loki_adapter.query_range(
-                function_args["logql"],
-                function_args["start"],
-                function_args["end"],
-                function_args.get("limit", 100),
-            )
-            return result, None, False
-        elif function_name == "get_recent_deployments":
-            result = await self.tools._deployment_adapter.get_recent_deployments(
-                function_args["service"], function_args["start"], function_args["end"]
-            )
-            return result, None, False
-        elif function_name == "get_related_incidents":
-            result = await self.tools._related_incidents_adapter.find_related(
-                function_args["service"], function_args["symptom_keywords"]
-            )
-            return result, None, False
-        elif function_name == "submit_findings":
-            findings = [
-                Finding(
-                    type=EvidenceType(f["type"]),
-                    content=f["content"],
-                    source=f["source"],
-                    confidence=f["confidence"],
+        """Execute a tool call and return the result.
+
+        Wraps adapter calls so that Loki/Prometheus parse errors return as
+        structured error dicts (status="error") instead of raising exceptions
+        that terminate the whole investigation run.
+        """
+        try:
+            if function_name == "query_prometheus":
+                result = await self.tools.query_prometheus(
+                    function_args["promql"], function_args["start"], function_args["end"]
                 )
-                for f in function_args["findings"]
-            ]
-            result = self.tools.submit_findings(findings)
-            return result, findings, True  # result, findings, is_final
+                return result, None, False
+
+            elif function_name == "query_loki":
+                result = await self.tools.query_loki(
+                    function_args["logql"],
+                    function_args["start"],
+                    function_args["end"],
+                    function_args.get("limit", 100),
+                )
+                return result, None, False
+
+            elif function_name == "get_recent_deployments":
+                result = await self.tools.get_recent_deployments(
+                    function_args["service"], function_args["start"], function_args["end"]
+                )
+                return result, None, False
+
+            elif function_name == "get_related_incidents":
+                result = await self.tools.get_related_incidents(
+                    function_args["service"], function_args["symptom_keywords"]
+                )
+                return result, None, False
+
+            elif function_name == "submit_findings":
+                findings = [
+                    Finding(
+                        type=EvidenceType(f["type"]),
+                        content=f["content"],
+                        source=f["source"],
+                        confidence=f["confidence"],
+                    )
+                    for f in function_args["findings"]
+                ]
+                result = self.tools.submit_findings(findings)
+                return result, findings, True  # result, findings, is_final
+        except Exception as e:
+            # Unexpected crash in the wrapper itself — propagate so the
+            # investigation-loop handler (not this function) decides how to
+            # persist it.
+            logger.error("Tool %s crashed unexpectedly: %s", function_name, e)
+            raise
         else:
             return {"error": f"Unknown tool: {function_name}"}, None, False
 
