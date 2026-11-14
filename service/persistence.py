@@ -214,6 +214,181 @@ class InvestigationPersistence:
             if conn is not None:
                 self._put_connection(conn)
 
+    def get_run_retry_state(self, run_id: str) -> dict | None:
+        """Fetch a run's status, attempts, and max_attempts, or None if absent."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT status, attempts, max_attempts "
+                    "FROM investigation_runs WHERE id = %s",
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+            conn.commit()
+            if row is None:
+                return None
+            status, attempts, max_attempts = row
+            return {"status": status, "attempts": attempts, "max_attempts": max_attempts}
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to get retry state for run %s: %s", run_id, e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return None
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def schedule_investigation_retry(
+        self,
+        run_id: str,
+        error: str | None,
+        next_retry_at: datetime | None,
+    ) -> bool:
+        """Record a failed attempt and, if the retry budget remains, schedule a retry.
+
+        This is the investigator-side bookkeeping of the auto-retry loop. On every
+        failed execution the run's `attempts` is incremented. If the incremented
+        count is still below `max_attempts`, the run is moved to
+        `failed_retryable` with a `next_retry_at` back-off timestamp, and the
+        method returns True (a retry is scheduled). Otherwise the run goes
+        `failed_terminal` and the method returns False (budget exhausted).
+
+        The UPDATE is guarded by `status = 'failed_terminal'` NOT being reached:
+        it only applies to a run currently in a running/queued/failed_retryable
+        state, so a racing completion is a no-op.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs
+                    SET attempts = attempts + 1,
+                        status = CASE
+                            WHEN attempts + 1 < max_attempts THEN 'failed_retryable'
+                            ELSE 'failed_terminal'
+                        END,
+                        next_retry_at = CASE
+                            WHEN attempts + 1 < max_attempts THEN %s
+                            ELSE NULL
+                        END,
+                        completed_at = %s,
+                        safe_error_code = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND status NOT IN ('completed', 'failed_terminal')
+                    """,
+                    (next_retry_at, now, error, now, run_id),
+                )
+                updated = cursor.rowcount > 0
+            conn.commit()
+            if updated:
+                state = self.get_run_retry_state(run_id)
+                scheduled = bool(state and state["status"] == "failed_retryable")
+                logger.info(
+                    "Investigation run %s retry scheduled=%s attempts=%s",
+                    run_id,
+                    scheduled,
+                    (state or {}).get("attempts"),
+                )
+                return scheduled
+            return False
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to schedule retry for run %s: %s", run_id, e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return False
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def reclaim_due_investigation_retry(self, run_id: str) -> bool:
+        """Atomically move a due `failed_retryable` run back to `running`.
+
+        Guards the auto-retry against double-execution: only one worker can flip
+        a run from `failed_retryable` (with `next_retry_at <= now`) to `running`,
+        so a racing second reclaim is a no-op.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs
+                    SET status = 'running',
+                        next_retry_at = NULL,
+                        started_at = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                      AND status = 'failed_retryable'
+                      AND (next_retry_at IS NULL OR next_retry_at <= now())
+                    """,
+                    (now, now, run_id),
+                )
+                reclaimed = cursor.rowcount > 0
+            conn.commit()
+            return reclaimed
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to reclaim retry for run %s: %s", run_id, e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return False
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def list_due_investigation_retries(self, limit: int = 10) -> list[str]:
+        """Return run IDs whose retry back-off has elapsed and are due a re-run.
+
+        Used by the retry scheduler to reclaim `failed_retryable` runs. Only runs
+        in the `failed_retryable` state whose `next_retry_at` has passed are
+        returned; each is then reclaimed atomically by
+        `reclaim_due_investigation_retry` before re-execution.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id FROM investigation_runs
+                    WHERE status = 'failed_retryable'
+                      AND (next_retry_at IS NULL OR next_retry_at <= now())
+                    ORDER BY next_retry_at NULLS FIRST
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                rows = cursor.fetchall()
+            conn.commit()
+            return [row[0] for row in rows]
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to list due investigation retries: %s", e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return []
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
     def update_run_status(
         self,
         run_id: str,

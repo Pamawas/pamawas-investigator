@@ -59,7 +59,13 @@ class Config:
     circuit_breaker_timeout_seconds: float = 30.0
     circuit_breaker_half_open_max_calls: int = 3
     # Overall investigation deadline (wall clock, seconds)
-    investigation_timeout_seconds: float = 120.0
+    investigation_timeout_seconds: float = 600.0
+    # Auto-retry budget for a single investigation run: how many times it may be
+    # (re)executed total before going failed_terminal (default: initial + 4).
+    max_investigation_attempts: int = 5
+    # Base back-off in seconds between investigation retries (grows exponentially,
+    # capped by the retry scheduler).
+    investigation_retry_backoff_seconds: int = 60
 
     @classmethod
     def from_env(cls) -> Config:
@@ -125,6 +131,12 @@ class Config:
                 os.getenv("CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", "3")
             ),
             investigation_timeout_seconds=float(
-                os.getenv("INVESTIGATION_TIMEOUT_SECONDS", "120.0")
+                os.getenv("INVESTIGATION_TIMEOUT_SECONDS", "600.0")
+            ),
+            max_investigation_attempts=int(
+                os.getenv("MAX_INVESTIGATION_ATTEMPTS", "5")
+            ),
+            investigation_retry_backoff_seconds=int(
+                os.getenv("INVESTIGATION_RETRY_BACKOFF_SECONDS", "60")
             ),
         )

@@ -6,6 +6,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import asyncio
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -90,9 +91,20 @@ async def lifespan(app: FastAPI):
         log.error("investigator_init_failed", error=str(e))
         raise
 
+    # Start the auto-retry scheduler (reclaims due failed_retryable runs).
+    retry_scheduler_task = None
+    if investigator is not None and investigator.persistence:
+        retry_scheduler_task = asyncio.create_task(_investigation_retry_scheduler())
+
     yield
 
     # Shutdown
+    if retry_scheduler_task is not None:
+        retry_scheduler_task.cancel()
+        try:
+            await retry_scheduler_task
+        except asyncio.CancelledError:
+            pass
     if otel_shutdown:
         otel_shutdown()
     # Close investigator
@@ -420,7 +432,9 @@ async def create_investigation(
         return JSONResponse(status_code=500, content={"error": "Internal server error"})
 
     if existing_status is not None:
-        # Run already exists - return conflict per contract
+        # Run already exists - return conflict per contract. The status is
+        # included so the correlator can decide whether to auto-retry a
+        # failed_terminal run via POST /api/v1/investigations/{run_id}/retry.
         log.info(
             "investigation_already_exists",
             incident_id=incident_id,
@@ -499,15 +513,28 @@ async def get_investigation_status(run_id: str):
     }
 
 
+def _retry_backoff_seconds(attempts: int, base: int) -> float:
+    """Exponential back-off for investigation retries: base * 2^attempts, capped at 1h."""
+    import math
+
+    if attempts > 5:
+        return 3600.0
+    delay = base * (2 ** attempts)
+    return float(min(delay, 3600))
+
+
 async def _run_investigation_task(run_id: str, incident_id: str, request_key_hash: str):
     """Background wrapper around investigate_async.
 
     The investigation runs in a fire-and-forget task spawned from the HTTP
-    endpoint. investigate_async now persists the run (terminal state +
-    evidence) on every return path, so a normal return leaves the run
-    completed. If it raises, the run is marked failed so the client does not
-    poll a stuck "queued" run forever. The run status is the single source of
-    truth for the client.
+    endpoint. investigate_async persists the run (terminal state + evidence)
+    on every return path, so a normal return leaves the run completed. If it
+    raises, the run is retried under the auto-retry budget rather than failed
+    outright: schedule_investigation_retry increments the run's `attempts` and,
+    while attempts < max_attempts, leaves it `failed_retryable` with a back-off
+    `next_retry_at` that the retry scheduler later reclaims and re-runs. Once
+    the budget is exhausted the run goes `failed_terminal`, which lets the
+    scheduler dispatch a (possibly partial) report instead of a stuck queued run.
     """
     try:
         await investigator.investigate_async(incident_id, request_key_hash)
@@ -518,9 +545,119 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
             incident_id=incident_id,
             error=str(e),
         )
-        if investigator.persistence:
-            investigator.persistence.mark_run_failed(run_id, error=str(e))
-        raise
+        # Record the failure under the auto-retry budget. If attempts remain,
+        # schedule_investigation_retry leaves the run `failed_retryable` with a
+        # back-off `next_retry_at` that the retry scheduler later reclaims and
+        # re-runs; if the budget is exhausted it goes `failed_terminal`. Swallow
+        # the exception either way: the run's status is the source of truth, and
+        # the failed_retryable case already has a re-run scheduled.
+        if not investigator.persistence:
+            log.warning(
+                "investigation_persistence_unavailable",
+                run_id=run_id,
+                incident_id=incident_id,
+            )
+        else:
+            from datetime import UTC, datetime, timedelta
+
+            state = investigator.persistence.get_run_retry_state(run_id) or {}
+            attempts = state.get("attempts", 0)
+            base = investigator.config.investigation_retry_backoff_seconds
+            backoff = _retry_backoff_seconds(attempts, base)
+            next_retry_at = datetime.now(UTC) + timedelta(seconds=backoff)
+            scheduled = investigator.persistence.schedule_investigation_retry(
+                run_id,
+                error=str(e),
+                next_retry_at=next_retry_at,
+            )
+            if not scheduled:
+                log.warning(
+                    "investigation_retry_budget_exhausted",
+                    run_id=run_id,
+                    incident_id=incident_id,
+                    attempts=attempts,
+                )
+
+
+async def _investigation_retry_scheduler():
+    """Reclaim due `failed_retryable` runs and re-execute them.
+
+    Runs as a background asyncio task for the lifetime of the process. It wakes
+    on a short cadence, atomically reclaims any run whose retry back-off has
+    elapsed, and spawns a fresh _run_investigation_task for each. This both
+    drives in-process retries and self-heals runs that were mid-retry when the
+    process crashed (a failed_retryable run is simply reclaimed again).
+    """
+    import asyncio
+
+    while True:
+        try:
+            if investigator is not None and investigator.persistence:
+                due = investigator.persistence.list_due_investigation_retries(limit=10)
+                for run_id in due:
+                    if investigator.persistence.reclaim_due_investigation_retry(run_id):
+                        row = investigator.persistence.get_run_retry_state(run_id)
+                        # reclaim moved it to running; re-run the investigation.
+                        # We don't have incident_id here, so look it up from the run.
+                        incident_id = _get_run_incident_id(run_id)
+                        if incident_id:
+                            loop = asyncio.get_running_loop()
+                            loop.create_task(
+                                _run_investigation_task(
+                                    run_id, incident_id, _get_run_request_key(run_id)
+                                )
+                            )
+        except Exception as e:  # noqa: BLE001
+            log.error("investigation_retry_scheduler_error", error=str(e))
+        await asyncio.sleep(15)
+
+
+def _get_run_incident_id(run_id: str) -> str | None:
+    """Return a run's incident_id, or None on failure."""
+    if not investigator or not investigator.persistence:
+        return None
+    conn = None
+    try:
+        conn = investigator.persistence._get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT incident_id FROM investigation_runs WHERE id = %s", (run_id,))
+            row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else None
+    except (psycopg2.Error, RuntimeError):
+        if conn is not None:
+            try:
+                conn.rollback()
+            except (psycopg2.Error, AttributeError):
+                pass
+        return None
+    finally:
+        if conn is not None:
+            investigator.persistence._put_connection(conn)
+
+
+def _get_run_request_key(run_id: str) -> str:
+    """Return a run's request_key_hash (used for idempotent re-execution)."""
+    if not investigator or not investigator.persistence:
+        return ""
+    conn = None
+    try:
+        conn = investigator.persistence._get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT request_key_hash FROM investigation_runs WHERE id = %s", (run_id,))
+            row = cursor.fetchone()
+        conn.commit()
+        return row[0] if row else ""
+    except (psycopg2.Error, RuntimeError):
+        if conn is not None:
+            try:
+                conn.rollback()
+            except (psycopg2.Error, AttributeError):
+                pass
+        return ""
+    finally:
+        if conn is not None:
+            investigator.persistence._put_connection(conn)
 
 
 def main():
