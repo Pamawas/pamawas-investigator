@@ -130,7 +130,7 @@ class LokiAdapter:
         # The model sometimes emits `OR` between two stream selectors,
         # which Loki cannot parse. Valid alternatives: use `|~` with a
         # pipe-separated list, or combine the selectors into one.
-        if re.search(r"\}\s+OR", logql):
+        if re.search(r"\}\s+OR\s*\{", logql):
             raise LokiQueryValidationError(
                 "LogQL query contains 'OR' between stream selectors; "
                 "use '|~' with a pipe-separated list instead"
@@ -139,7 +139,7 @@ class LokiAdapter:
         # The model sometimes groups alternation after |= with parentheses,
         # which Loki cannot parse. Valid form: |= "term1|term2|term3"
         # (pipe-separated within the string), not |= ("term1" OR "term2").
-        if re.search(r"\|=\(| \|=", logql):
+        if re.search(r"\|=\s*\(", logql):
             raise LokiQueryValidationError(
                 "LogQL query uses '|=' with parenthesised alternation; "
                 "use pipe-separated terms inside the string instead, "
