@@ -114,7 +114,7 @@ class LokiAdapter:
 
         # Reject invalid LogQL line-filter operator sequences that Loki
         # cannot parse. Loki supports |=, |!=, |~, |!~ as line-filter
-        # operators; `|==`, `|=~`, `|!=~`, etc. are not valid operators
+        # operators; `|==`, `|=~`, `|!=~` are malformed operator sequences
         # and produce a parse error at the offending `|=`.
         invalid_operator_patterns = [
             r"\|==",  # |== is not a LogQL operator
@@ -144,15 +144,6 @@ class LokiAdapter:
                 "LogQL query uses '|=' with parenthesised alternation; "
                 "use pipe-separated terms inside the string instead, "
                 'e.g. |= "term1|term2|term3"'
-            )
-
-        # The model sometimes emits |!= as a line-filter operator, but !=
-        # is only valid as a label matcher (e.g. {service!="x"}), not after
-        # a pipe. Loki returns 400 for |= "x" |!= "y".
-        if re.search(r"\|!=\s", logql):
-            raise LokiQueryValidationError(
-                "LogQL query uses '|!=' as a line-filter operator; '!=' is "
-                "only valid as a label matcher (e.g. {service!=\"x\"})"
             )
 
     def validate_time_range(self, start: str, end: str) -> tuple[float, float]:

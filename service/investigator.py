@@ -369,9 +369,9 @@ class PamawasInvestigator:
             "- Never use '|=' with parentheses grouping alternation like |= "
             "(\"term\" OR \"other\") — Loki only supports pipe-separated values "
             "inside the string: |= \"term|other\"\n"
-            "- Never use '!=' as a line-filter operator after a pipe like |= \"x\" "
-            "|!= \"y\" — != is only valid as a label matcher inside curly "
-            "braces: {service!=\"value\"}\n"
+            "- Use |!= for a 'does not contain' line filter, e.g. {app=\"x\"} |= "
+            "\"error\" |!= \"debug\". Note: a bare '!=' without the pipe (label "
+            "matcher) goes inside curly braces: {service!=\"value\"}\n"
             "- When grouping alternatives, use |~ with pipe-separated values, "
             "e.g. |~ \"error|timeout|refused\" or combine streams: {service} |~ \"x|y\"\n"
         )
