@@ -63,7 +63,9 @@ def test_health_returns_database_error(cursor):
 
 
 def test_investigate_endpoint_is_deprecated_shim():
-    """The legacy /api/v1/investigate endpoint is a deprecation shim mirroring the async creation contract: persists a queued run and returns 202, never inline findings."""
+    """The legacy /api/v1/investigate endpoint is a deprecation shim
+    mirroring the async creation contract: persists a queued run and
+    returns 202, never inline findings."""
     from unittest.mock import AsyncMock
 
     service = MagicMock()

@@ -114,7 +114,8 @@ class InvestigatorLLM:
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
     ):
-        """Call the LLM with optional tool use; failing over across endpoints and raising the last error."""
+        """Call the LLM with optional tool use; failing over across endpoints
+        and raising the last error."""
         import time as _time
 
         last_error: Exception | None = None
@@ -579,7 +580,8 @@ class PamawasInvestigator:
     async def investigate_async(
         self, incident_id: str, request_key_hash: str = ""
     ) -> list[Finding]:
-        """Run the bounded investigation loop; every terminal path persists the run and its evidence."""
+        """Run the bounded investigation loop; every terminal path persists
+        the run and its evidence."""
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
 
@@ -749,7 +751,8 @@ class PamawasInvestigator:
         state: InvestigationState,
         messages: list[dict],
     ) -> list[Finding] | None:
-        """Run a single investigation turn (LLM call + tool handling); returns findings if complete."""
+        """Run a single investigation turn (LLM call + tool handling);
+        returns findings if complete."""
         is_final_turn = state.tool_call_count == state.max_tool_calls - 1
         tool_choice = (
             {"type": "function", "function": {"name": "submit_findings"}}
@@ -839,7 +842,8 @@ class PamawasInvestigator:
         tool_contract: int,
         max_tool_calls: int,
     ):
-        """Persist investigation run, tool executions, and evidence in a transaction (includes enrichment)."""
+        """Persist investigation run, tool executions, and evidence in a
+        transaction (includes enrichment)."""
         if not self.persistence:
             logger.warning("No persistence layer available, skipping investigation persistence")
             return
@@ -959,7 +963,8 @@ class PamawasInvestigator:
         tool_contract: int,
         max_tool_calls: int,
     ):
-        """Persist investigation incrementally after each tool call; upserts run and appends tool executions/evidence."""
+        """Persist investigation incrementally after each tool call; upserts
+        run and appends tool executions/evidence."""
         if not self.persistence:
             logger.warning("No persistence layer available, skipping incremental persistence")
             return

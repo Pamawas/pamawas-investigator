@@ -43,7 +43,8 @@ class DeploymentAdapterNotConfiguredError(DeploymentAdapterError):
 
 
 class DeploymentAdapter:
-    """Deployment history interface with circuit breaker; returns real data when configured or unavailable response."""
+    """Deployment history interface with circuit breaker; returns real data
+    when configured or an unavailable response."""
 
     def __init__(self, config: DeploymentConfig):
         self.config = config
@@ -104,7 +105,8 @@ class DeploymentAdapter:
         end: str,
         limit: int | None = None,
     ) -> dict[str, Any]:
-        """Get recent deployments for a service; returns deployment data or an unavailable response."""
+        """Get recent deployments for a service; returns deployment data or
+        an unavailable response."""
         start_time = time.time()
 
         if not service or not service.strip():

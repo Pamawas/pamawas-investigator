@@ -111,7 +111,8 @@ class TestCreateInvestigationRun:
         mock_conn.commit.assert_not_called()
 
     def test_returns_none_from_fetchone_yields_runtime_error(self, mock_pool):
-        """Edge case: INSERT returns no row (ON CONFLICT) but SELECT returns None; code raises RuntimeError."""
+        """Edge case: INSERT returns no row (ON CONFLICT) but SELECT
+        returns None; code raises RuntimeError."""
         mock_pool, mock_conn, mock_cursor = mock_pool
 
         # INSERT returns None (ON CONFLICT DO NOTHING), but SELECT returns None

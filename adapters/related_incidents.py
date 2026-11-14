@@ -68,7 +68,8 @@ class RelatedIncidentsAdapter:
         return self._circuit_breaker.snapshot()
 
     def _build_symptom_conditions(self, symptom_keywords: list[str]) -> tuple[str, list[Any]]:
-        """Build parameterized WHERE conditions for symptom keyword matching (returns clause and params)."""
+        """Build parameterized WHERE conditions for symptom keyword matching
+        (returns clause and params)."""
         if not symptom_keywords:
             return "", []
 
