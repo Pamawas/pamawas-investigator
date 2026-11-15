@@ -2,79 +2,81 @@
 
 from prometheus_client import Counter, Gauge, Histogram
 
+# Names follow the pamawas_<subsystem>_<metric> convention (design review
+# P3): namespace `pamawas`, subsystem `investigator`.
 # Counters
 investigations_total = Counter(
-    "investigator_investigations_total",
+    "pamawas_investigator_investigations_total",
     "Total number of investigations started",
 )
 
 max_tool_calls_reached = Counter(
-    "investigator_max_tool_calls_reached_total",
+    "pamawas_investigator_max_tool_calls_reached_total",
     "Total number of investigations that hit max tool calls without submitting findings",
 )
 
 tool_calls_total = Counter(
-    "investigator_tool_calls_total",
+    "pamawas_investigator_tool_calls_total",
     "Total number of tool calls made",
     ["tool", "status"],
 )
 
 findings_total = Counter(
-    "investigator_findings_total",
+    "pamawas_investigator_findings_total",
     "Total number of findings generated",
     ["type"],
 )
 
 db_connection_errors = Counter(
-    "investigator_db_connection_errors_total",
+    "pamawas_investigator_db_connection_errors_total",
     "Total number of database connection errors",
 )
 
 investigation_retry_scheduled_total = Counter(
-    "investigator_retry_scheduled_total",
+    "pamawas_investigator_retry_scheduled_total",
     "Total number of investigation retries scheduled after a transient failure",
 )
 
 investigation_retry_reclaimed_total = Counter(
-    "investigator_retry_reclaimed_total",
+    "pamawas_investigator_retry_reclaimed_total",
     "Total number of due failed_retryable runs reclaimed by the retry scheduler",
 )
 
 investigation_retry_exhausted_total = Counter(
-    "investigator_retry_exhausted_total",
+    "pamawas_investigator_retry_exhausted_total",
     "Total number of investigations whose retry budget was exhausted",
 )
 
 investigation_retry_errors_total = Counter(
-    "investigator_retry_errors_total",
+    "pamawas_investigator_retry_errors_total",
     "Total number of retry scheduler loop errors",
 )
 
 # Histograms
 loop_duration = Histogram(
-    "investigator_loop_duration_seconds",
+    "pamawas_investigator_loop_duration_seconds",
     "Investigation loop duration in seconds",
 )
 
 tool_call_duration = Histogram(
-    "investigator_tool_call_duration_seconds",
+    "pamawas_investigator_tool_call_duration_seconds",
     "Tool call duration in seconds",
     ["tool"],
 )
 
 context_truncations = Histogram(
-    "investigator_context_truncations_total",
+    "pamawas_investigator_context_truncations_total",
     "Number of context truncations",
 )
 
 # Gauges
 investigator_running = Gauge(
-    "investigator_running",
+    "pamawas_investigator_running",
     "Whether investigator is currently running (1) or not (0)",
 )
 
 investigator_uptime = Gauge(
-    "investigator_uptime_seconds",
+    "pamawas_investigator_uptime_seconds",
     "Uptime of the investigator in seconds",
 )
 
