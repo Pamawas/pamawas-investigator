@@ -27,12 +27,15 @@ class PrometheusFetcher(MetricsFetcher):
     def __init__(
         self,
         base_url: str,
-        query_template: str = '{incident="%s"}',
+        service_label: str = "service",
         timeout_seconds: float = 10.0,
         max_response_bytes: int = 1_000_000,
     ):
         self.base_url = base_url.rstrip("/")
-        self.query_template = query_template
+        # Label carrying the service name. Prometheus has no "incident" label,
+        # so the old `{incident="<id>"}` template matched nothing and every
+        # enrichment silently produced zero metrics.
+        self.service_label = service_label
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
         self._client: httpx.AsyncClient | None = None
@@ -87,33 +90,54 @@ class PrometheusFetcher(MetricsFetcher):
 
         return data
 
-    async def fetch_async(self, incident_id: str, start: str, end: str) -> list[dict[str, Any]]:
+    def _build_selector(self, service: str) -> str:
+        """Build a label selector for a service name.
+
+        Backslashes and quotes are escaped so a service name cannot break out
+        of the string literal and inject LogQL/PromQL.
+        """
+        safe = service.replace("\\", "\\\\").replace('"', '\\"')
+        return "{" + self.service_label + '="' + safe + '"}'
+
+    def _eval_time(self, end: str) -> str:
+        """Return the instant-query evaluation time for an end timestamp."""
+        try:
+            if end.endswith("Z"):
+                return end
+            dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    async def fetch_async(
+        self,
+        incident_id: str,
+        start: str,
+        end: str,
+        service: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Fetch Prometheus metrics for an incident using instant query.
 
         Args:
-            incident_id: The incident ID to query for
+            incident_id: The incident ID (used for logging only)
             start: Start timestamp (RFC3339, used for context)
             end: End timestamp (RFC3339, used as evaluation time)
+            service: The incident's affected service. Required to build a
+                truthful selector — without it there is nothing to select on.
 
         Returns:
             List of metric dictionaries with name, value, labels, at
         """
-        # Build query using template
-        tmpl = self.query_template
-        query = tmpl % incident_id if "%s" in tmpl else tmpl
+        if not service:
+            logger.info(
+                "Skipping Prometheus enrichment for incident %s: no service to select on",
+                incident_id,
+            )
+            return []
 
-        # For instant query, we use the end time as evaluation time
-        try:
-            # Parse end time to ensure it's valid
-            if end.endswith("Z"):
-                eval_time = end
-            else:
-                # Assume UTC if no timezone
-                dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-                eval_time = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        except ValueError:
-            # Default to now if parsing fails
-            eval_time = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        query = self._build_selector(service)
+
+        eval_time = self._eval_time(end)
 
         self._validate_promql(query)
 

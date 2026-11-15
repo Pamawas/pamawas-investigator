@@ -96,10 +96,20 @@ class InvestigationState:
     findings: list[Finding]
     tool_calls: list[ToolResult]
     tool_call_count: int = 0
+    # LLM turns consumed. Bounded by max_tool_calls: a turn is one LLM call,
+    # which may issue zero or many tool calls. The loop is bounded on turns so
+    # a model that replies with prose (no tool calls) cannot spin forever —
+    # previously only tool calls advanced the counter, so text-only turns
+    # looped until the wall-clock deadline and the run ended with a
+    # synthesized UNKNOWN.
+    turn_count: int = 0
     max_tool_calls: int = 100
     completed: bool = False
     error: str | None = None
     request_key_hash: str | None = None
+    # Affected service for this incident; selects the Loki stream during
+    # enrichment. None when the incident has no service (enrichment skips).
+    service: str | None = None
 
 
 @dataclass

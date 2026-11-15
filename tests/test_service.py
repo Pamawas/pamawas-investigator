@@ -222,4 +222,24 @@ def test_investigate_handles_large_tool_result_without_invalid_json(investigator
     )
     finding = investigator.investigate("inc")[0]
     assert finding.type is EvidenceType.UNKNOWN
-    assert "maximum tool calls" in finding.content
+    assert "turn budget" in finding.content
+
+
+def test_text_only_turns_are_bounded_by_turn_budget(investigator):
+    """A model that only replies with prose must not spin until the deadline.
+
+    Regression: the loop was bounded on tool-call count, which text-only turns
+    never advanced, so the investigation ran until the wall-clock timeout and
+    ended with a synthesized UNKNOWN even though tools had succeeded.
+    """
+    investigator.config.max_tool_calls = 3
+    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator.llm.chat_completion = MagicMock(return_value=response("still thinking"))
+
+    findings = investigator.investigate("inc")
+
+    # Exactly max_tool_calls LLM turns — bounded, not an infinite loop.
+    assert investigator.llm.chat_completion.call_count == 3
+    # The final turn's prose is captured as a hypothesis rather than discarded.
+    assert findings[0].type is EvidenceType.HYPOTHESIS
+    assert findings[0].content == "still thinking"

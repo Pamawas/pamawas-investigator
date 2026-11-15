@@ -187,12 +187,12 @@ class PamawasInvestigator:
         # Initialize fetchers for evidence enrichment
         self.metrics_fetcher: MetricsFetcher = PrometheusFetcher(
             base_url=config.prometheus_url,
-            query_template=config.prometheus_query_template or '{incident="%s"}',
+            service_label=config.prometheus_service_label,
             timeout_seconds=config.prometheus_timeout_seconds,
         )
         self.logs_fetcher: LogsFetcher = LokiFetcher(
             base_url=config.loki_url,
-            query_template=config.loki_query_template or '{incident="%s"}',
+            service_label=config.loki_service_label,
             timeout_seconds=config.loki_timeout_seconds,
             max_lines=config.loki_max_log_lines,
         )
@@ -382,6 +382,16 @@ class PamawasInvestigator:
             "matcher) goes inside curly braces: {service!=\"value\"}\n"
             "- When grouping alternatives, use |~ with pipe-separated values, "
             "e.g. |~ \"error|timeout|refused\" or combine streams: {service} |~ \"x|y\"\n"
+            "\n"
+            "CRITICAL: LABEL NAMES ARE DEPLOYMENT-SPECIFIC.\n"
+            "- A selector naming a label or value that does not exist returns "
+            "status=success with ZERO streams. That is indistinguishable from "
+            "'no logs', so never conclude 'no logs exist' from an empty result "
+            "until you have verified the selector.\n"
+            "- Call get_loki_labels first to list the real label names, then "
+            "get_loki_labels with a specific label to list its values, and build "
+            "your selector from what actually exists.\n"
+            "- Do not assume a 'service' or 'app' label exists.\n"
         )
 
     def _build_initial_message(self, context: IncidentContext) -> dict:
@@ -440,6 +450,14 @@ class PamawasInvestigator:
                         "error": "query_prometheus requires promql, start, end",
                     }, None, False
                 result = await self.tools._prometheus_adapter.query_range(promql, start, end)
+                return result, None, False
+
+            elif function_name == "get_loki_labels":
+                label = function_args.get("label") or ""
+                if label:
+                    result = await self.tools._loki_adapter.query_label_values(label)
+                else:
+                    result = await self.tools._loki_adapter.query_labels()
                 return result, None, False
 
             elif function_name == "query_loki":
@@ -621,6 +639,7 @@ class PamawasInvestigator:
                 prompt_version="pamawas-investigator-v1",
                 tool_contract=1,
                 max_tool_calls=self.config.max_tool_calls,
+                service=state.service,
             )
 
     async def investigate_async(
@@ -651,6 +670,7 @@ class PamawasInvestigator:
             tool_calls=[],
             max_tool_calls=self.config.max_tool_calls,
             request_key_hash=request_key_hash,
+            service=context.affected_services[0] if context.affected_services else None,
         )
 
         return await self._run_investigation_loop(
@@ -679,6 +699,7 @@ class PamawasInvestigator:
             prompt_version="pamawas-investigator-v1",
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
+            service=context.affected_services[0] if context.affected_services else None,
         )
         return findings
 
@@ -697,18 +718,29 @@ class PamawasInvestigator:
 
         messages = [{"role": "system", "content": system_prompt}, initial_message]
 
-        # Investigation loop
-        while state.tool_call_count < state.max_tool_calls:
+        # Investigation loop. Bounded on TURNS (LLM calls), not tool calls: a
+        # turn may issue zero tool calls (a prose reply), and if only tool calls
+        # advanced the counter such a turn would loop forever until the
+        # wall-clock deadline and end with a synthesized UNKNOWN.
+        exhausted_by = ""
+        while state.turn_count < state.max_tool_calls:
             # Enforce overall deadline: if no time remains, stop and submit.
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                exhausted_by = "deadline"
                 logger.warning(
                     "Investigation deadline exceeded for incident %s, submitting partial findings",
                     incident_id,
                 )
                 break
 
-            logger.info(f"Investigation turn {state.tool_call_count + 1}/{state.max_tool_calls}")
+            state.turn_count += 1
+            logger.info(
+                "Investigation turn %d/%d (tool calls so far: %d)",
+                state.turn_count,
+                state.max_tool_calls,
+                state.tool_call_count,
+            )
 
             try:
                 result = await self._handle_investigation_turn(
@@ -746,13 +778,18 @@ class PamawasInvestigator:
                     prompt_version="pamawas-investigator-v1",
                     tool_contract=1,
                     max_tool_calls=self.config.max_tool_calls,
+                    service=state.service,
                 )
                 return state.findings
 
-        # If we exit the loop without submitting findings (deadline or max tools),
-        # synthesize a submission from whatever partial findings/tool results we have.
+        # If we exit the loop without submitting findings (deadline or turn
+        # budget), synthesize a submission from whatever partial findings and
+        # tool results we have.
         if not state.findings:
-            # Build a best-effort UNKNOWN finding from tool results, or a default.
+            if exhausted_by == "deadline":
+                reason = "Investigation deadline exceeded"
+            else:
+                reason = "Investigation exhausted its turn budget"
             if state.tool_calls:
                 summaries = []
                 for tc in state.tool_calls[-3:]:
@@ -760,11 +797,11 @@ class PamawasInvestigator:
                     status = r.get("status", "unknown") if isinstance(r, dict) else "unknown"
                     summaries.append(f"{tc.tool_name}: {status}")
                 content = (
-                    "Investigation reached maximum tool calls without submitting "
-                    "findings. Tool results: " + "; ".join(summaries)
+                    f"{reason} without submitting findings. "
+                    "Tool results: " + "; ".join(summaries)
                 )
             else:
-                content = "Investigation reached maximum tool calls without submitting findings"
+                content = f"{reason} without calling any tools"
             state.findings.append(
                 Finding(
                     type=EvidenceType.UNKNOWN,
@@ -786,6 +823,7 @@ class PamawasInvestigator:
             prompt_version="pamawas-investigator-v1",
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
+            service=state.service,
         )
 
         return state.findings
@@ -799,7 +837,7 @@ class PamawasInvestigator:
     ) -> list[Finding] | None:
         """Run a single investigation turn (LLM call + tool handling);
         returns findings if complete."""
-        is_final_turn = state.tool_call_count == state.max_tool_calls - 1
+        is_final_turn = state.turn_count >= state.max_tool_calls
         tool_choice = (
             {"type": "function", "function": {"name": "submit_findings"}}
             if is_final_turn
@@ -872,6 +910,7 @@ class PamawasInvestigator:
                 prompt_version="pamawas-investigator-v1",
                 tool_contract=1,
                 max_tool_calls=self.config.max_tool_calls,
+                service=state.service,
             )
             return state.findings
         return None
@@ -887,6 +926,7 @@ class PamawasInvestigator:
         prompt_version: str,
         tool_contract: int,
         max_tool_calls: int,
+        service: str | None = None,
     ):
         """Persist investigation run, tool executions, and evidence in a
         transaction (includes enrichment)."""
@@ -936,6 +976,7 @@ class PamawasInvestigator:
                         incident_id=incident_id,
                         start=start_time,
                         end=end_time,
+                        service=service,
                     )
                     enrichment_data["metrics"] = enriched_metrics
                     logger.info(f"Fetched {len(enriched_metrics)} metrics for enrichment")
@@ -950,6 +991,7 @@ class PamawasInvestigator:
                         start=start_time,
                         end=end_time,
                         limit=self.config.loki_max_log_lines,
+                        service=service,
                     )
                     enrichment_data["logs"] = enriched_logs
                     logger.info(f"Fetched {len(enriched_logs)} logs for enrichment")

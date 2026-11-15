@@ -17,7 +17,7 @@ class LogsFetcher:
     """Interface for fetching Loki logs."""
 
     def fetch(
-        self, incident_id: str, start: str, end: str, limit: int = 100
+        self, incident_id: str, start: str, end: str, limit: int = 100, service: str | None = None
     ) -> list[dict[str, Any]]:
         """Fetch logs for an incident. Returns list of log entry dicts."""
         raise NotImplementedError
@@ -29,13 +29,18 @@ class LokiFetcher(LogsFetcher):
     def __init__(
         self,
         base_url: str,
-        query_template: str = '{incident="%s"}',
+        service_label: str = "kubernetes_container_name",
         timeout_seconds: float = 10.0,
         max_lines: int = 10000,
         max_response_bytes: int = 1_000_000,
     ):
         self.base_url = base_url.rstrip("/")
-        self.query_template = query_template
+        # Label that carries the service/container name in this Loki instance.
+        # Enrichment selects on the incident's service, because that is the
+        # only thing we can build a truthful selector from: Loki has no
+        # "incident" label, so the old `{incident="<id>"}` template matched
+        # nothing and every enrichment silently produced zero logs.
+        self.service_label = service_label
         self.timeout_seconds = timeout_seconds
         self.max_lines = max_lines
         self.max_response_bytes = max_response_bytes
@@ -122,28 +127,22 @@ class LokiFetcher(LogsFetcher):
 
         return response.json()
 
-    async def fetch_async(
-        self, incident_id: str, start: str, end: str, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        """Fetch Loki logs for an incident.
+    def _build_selector(self, service: str) -> str:
+        """Build a label selector for a service name.
 
-        Args:
-            incident_id: The incident ID to query for
-            start: Start timestamp (RFC3339)
-            end: End timestamp (RFC3339)
-            limit: Maximum number of log lines to return
-
-        Returns:
-            List of log entry dictionaries with timestamp, stream, line
+        Backslashes and quotes are escaped so a service name cannot break out
+        of the string literal and inject LogQL/PromQL.
         """
-        # Build query using template
-        tmpl = self.query_template
-        query = tmpl % incident_id if "%s" in tmpl else tmpl
+        safe = service.replace("\\", "\\\\").replace('"', '\\"')
+        return "{" + self.service_label + '="' + safe + '"}'
 
-        # Normalize the caller-provided window. A missing/invalid end falls
-        # back to now; a missing/invalid start defaults to 5 minutes before
-        # end. The caller's start is always honored when provided — never
-        # silently replaced with a hardcoded window.
+    def _normalize_window(self, start: str, end: str) -> tuple[str, str]:
+        """Normalize a query window to RFC3339 UTC strings.
+
+        A missing/invalid end falls back to now; a missing/invalid start
+        defaults to five minutes before end. A caller-provided start is always
+        honored — never silently replaced with a hardcoded window.
+        """
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
         except ValueError, AttributeError:
@@ -157,8 +156,43 @@ class LokiFetcher(LogsFetcher):
         else:
             start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
 
-        start = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (
+            start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            end_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+
+    async def fetch_async(
+        self,
+        incident_id: str,
+        start: str,
+        end: str,
+        limit: int = 100,
+        service: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch Loki logs for an incident.
+
+        Args:
+            incident_id: The incident ID (used for logging only).
+            start: Start timestamp (RFC3339)
+            end: End timestamp (RFC3339)
+            limit: Maximum number of log lines to return
+            service: The incident's affected service. Required to build a
+                truthful selector — without it there is nothing to select on,
+                and returning an arbitrary stream would be fabricated context.
+
+        Returns:
+            List of log entry dictionaries with timestamp, stream, line
+        """
+        if not service:
+            logger.info(
+                "Skipping Loki enrichment for incident %s: no service to select on",
+                incident_id,
+            )
+            return []
+
+        query = self._build_selector(service)
+
+        start, end = self._normalize_window(start, end)
 
         self._validate_logql(query)
 

@@ -375,6 +375,67 @@ class LokiAdapter:
             logger.error("Loki instant query failed: %s", e)
             raise LokiError(f"Loki query failed: {e}")
 
+    async def query_label_values(self, label: str) -> dict[str, Any]:
+        """Get the values for one Loki label.
+
+        Querying the real label schema is what keeps the investigation honest:
+        a selector built on a label or value that does not exist returns
+        `status: success` with zero streams, which reads as "no logs" instead
+        of "wrong query". Exposing the values lets the model build selectors
+        that match the deployment it is actually running against.
+        """
+        start_time = time.time()
+
+        client = await self._get_client()
+
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "circuit_open")
+            logger.warning("Loki circuit breaker open, rejecting label values query")
+            return self._unavailable_response("circuit_breaker_open")
+
+        try:
+            response = await client.get(f"/loki/api/v1/label/{label}/values")
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("status") != "success":
+                error_msg = data.get("error", "Unknown Loki error")
+                self._circuit_breaker.record_failure()
+                raise LokiError(f"Loki error: {error_msg}")
+
+            self._circuit_breaker.record_success()
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "success")
+
+            return {
+                "status": "success",
+                "label": label,
+                "data": data.get("data", []),
+            }
+
+        except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "timeout")
+            raise LokiTimeoutError(f"Loki query timed out after {self.config.timeout_seconds}s")
+        except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "error")
+            raise LokiError(f"Loki HTTP error {e.response.status_code}: {e.response.text}")
+        except LokiError:
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "error")
+            raise
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("loki", time.time() - start_time)
+            increment_tool_calls("loki", "error")
+            logger.error("Loki label values query failed: %s", e)
+            raise LokiError(f"Loki label values query failed: {e}")
+
     async def query_labels(self) -> dict[str, Any]:
         """Get all label names from Loki."""
         start_time = time.time()

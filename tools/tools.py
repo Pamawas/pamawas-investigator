@@ -123,6 +123,49 @@ class InvestigatorTools:
             logger.error("Prometheus query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
+    def get_loki_labels(self, label: str = "") -> dict[str, Any]:
+        """List Loki label names, or the values of one label.
+
+        Without a label this returns every label name in the Loki instance.
+        With a label it returns that label's values. The investigation uses
+        this to build selectors against the real schema: a selector naming a
+        label or value that does not exist still returns `status: success`
+        with zero streams, which is indistinguishable from "no logs".
+        """
+        logger.info("Querying Loki labels (label=%r)", label)
+        start_time = time.time()
+
+        try:
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if label:
+                result = loop.run_until_complete(
+                    self._loki_adapter.query_label_values(label)
+                )
+            else:
+                result = loop.run_until_complete(self._loki_adapter.query_labels())
+
+            duration = time.time() - start_time
+            observe_tool_call_duration("loki", duration)
+            if result.get("status") == "unavailable":
+                increment_tool_calls("loki", "circuit_open")
+                return result
+            increment_tool_calls("loki", "success")
+            return result
+
+        except (LokiError, TimeoutError, RuntimeError, OSError) as e:
+            duration = time.time() - start_time
+            observe_tool_call_duration("loki", duration)
+            increment_tool_calls("loki", "error")
+            logger.error("Loki labels query failed: %s", e)
+            return {"status": "error", "error": str(e)}
+
     def query_loki(self, logql: str, start: str, end: str, limit: int = 100) -> dict[str, Any]:
         """Query Loki for logs data (sync wrapper for async adapter)."""
         logger.info("Querying Loki: %s [%s to %s] limit=%d", logql, start, end, limit)
@@ -238,6 +281,34 @@ class ToolRegistry:
                             },
                         },
                         "required": ["promql", "start", "end"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_loki_labels",
+                    "description": (
+                        "List the Loki label schema: with no argument, all label "
+                        "names; with a label name, that label's values. Call this "
+                        "before writing a LogQL selector when unsure which labels "
+                        "or values exist — a selector naming a label or value that "
+                        "does not exist returns zero streams, which looks the same "
+                        "as 'no logs'."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": (
+                                    "Optional label name whose values to list "
+                                    "(e.g. kubernetes_container_name). Omit to list "
+                                    "all label names."
+                                ),
+                            },
+                        },
+                        "required": [],
                     },
                 },
             },
