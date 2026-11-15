@@ -29,8 +29,6 @@ from models import (
     Finding,
     IncidentContext,
     InvestigationState,
-    LogEntry,
-    Metric,
     ToolResult,
 )
 from service.loki_fetcher import LogsFetcher, LokiFetcher
@@ -998,23 +996,13 @@ class PamawasInvestigator:
                 except (OSError, ValueError, RuntimeError) as e:
                     logger.warning(f"Failed to fetch Loki logs for enrichment: {e}")
 
-            # Convert Metric and LogEntry objects to dicts for persistence
-            metrics_for_persistence = [
-                m.to_dict() if isinstance(m, Metric) else m
-                for m in enrichment_data.get("metrics", [])
-            ]
-            log_entries = enrichment_data.get("logs", [])
-            logs_for_persistence = [
-                entry.to_dict() if isinstance(entry, LogEntry) else entry for entry in log_entries
-            ]
-
             # Insert evidence with enrichment
             self.persistence.insert_evidence(
                 incident_id=incident_id,
                 run_id=run_id,
                 findings=findings,
-                metrics=metrics_for_persistence,
-                logs=logs_for_persistence,
+                metrics=enrichment_data.get("metrics", []),
+                logs=enrichment_data.get("logs", []),
             )
 
             # Mark run as completed
@@ -1026,7 +1014,8 @@ class PamawasInvestigator:
 
             logger.info(
                 f"Persisted investigation run {run_id} with {len(findings)} findings, "
-                f"{len(metrics_for_persistence)} metrics, {len(logs_for_persistence)} logs"
+                f"{len(enrichment_data.get('metrics', []))} metrics, "
+                f"{len(enrichment_data.get('logs', []))} logs"
             )
 
         except (psycopg2.Error, RuntimeError) as e:

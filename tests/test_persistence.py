@@ -328,3 +328,71 @@ class TestMarkRunFailed:
 
         assert result is False
         mock_conn.rollback.assert_called_once()
+
+
+class TestReclaimDueInvestigationRetry:
+    """Tests for InvestigationPersistence.reclaim_due_investigation_retry."""
+
+    def test_clears_completed_at_from_the_failed_attempt(self, mock_pool):
+        """A reclaimed run must not keep the failed attempt's completed_at.
+
+        investigation_runs_check1 requires completed_at >= started_at. The
+        reclaim sets started_at to now, so a stale completed_at from the
+        previous attempt lands before it and Postgres rejects the update,
+        leaving the run failed_retryable forever.
+        """
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 1
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                reclaimed = pers.reclaim_due_investigation_retry("irun_123")
+
+        assert reclaimed is True
+        query = mock_cursor.execute.call_args[0][0]
+        assert "completed_at = NULL" in query
+        assert "safe_error_code = NULL" in query
+        mock_conn.commit.assert_called_once()
+
+
+class TestInsertEvidenceSerialization:
+    """Tests for InvestigationPersistence.insert_evidence JSON encoding."""
+
+    def test_datetime_bearing_samples_serialize(self, mock_pool):
+        """Metric and LogEntry samples carry datetimes; they must serialize.
+
+        The enrichment fetchers return typed samples whose `at`/`timestamp`
+        are datetime objects. Encoding them with a bare json.dumps raised
+        "Object of type datetime is not JSON serializable", which aborted
+        persistence and left the run retry-looping with no evidence.
+        """
+        from datetime import UTC, datetime
+
+        from models import EvidenceType, Finding, LogEntry, Metric
+
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        now = datetime.now(UTC)
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                pers.insert_evidence(
+                    incident_id=INCIDENT_ID,
+                    run_id=RUN_ID_NEW,
+                    findings=[
+                        Finding(
+                            type=EvidenceType.FACT,
+                            content="target down",
+                            source="prometheus",
+                            confidence=0.9,
+                        )
+                    ],
+                    metrics=[Metric(name="up", value=1.0, labels={"job": "x"}, at=now)],
+                    logs=[LogEntry(timestamp=now, stream="kube_logs", line="hello")],
+                )
+
+        # The metrics/logs JSON are the last two params of the evidence insert.
+        params = mock_cursor.execute.call_args[0][1]
+        assert any('"at":' in str(p) for p in params)
+        assert any('"timestamp":' in str(p) for p in params)

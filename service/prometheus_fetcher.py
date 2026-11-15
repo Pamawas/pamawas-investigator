@@ -10,14 +10,16 @@ from typing import Any
 
 import httpx
 
+from models.models import Metric
+
 logger = logging.getLogger(__name__)
 
 
 class MetricsFetcher:
     """Interface for fetching Prometheus metrics."""
 
-    def fetch(self, incident_id: str, start: str, end: str) -> list[dict[str, Any]]:
-        """Fetch metrics for an incident. Returns list of metric dicts."""
+    def fetch(self, incident_id: str, start: str, end: str) -> list[Metric]:
+        """Fetch metrics for an incident. Returns list of Metric samples."""
         raise NotImplementedError
 
 
@@ -115,7 +117,7 @@ class PrometheusFetcher(MetricsFetcher):
         start: str,
         end: str,
         service: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[Metric]:
         """Fetch Prometheus metrics for an incident using instant query.
 
         Args:
@@ -126,7 +128,8 @@ class PrometheusFetcher(MetricsFetcher):
                 truthful selector — without it there is nothing to select on.
 
         Returns:
-            List of metric dictionaries with name, value, labels, at
+            List of Metric samples (the typed model, so `at` is serialized
+            consistently with everything else the investigator persists).
         """
         if not service:
             logger.info(
@@ -175,17 +178,17 @@ class PrometheusFetcher(MetricsFetcher):
             # For instant query, use the timestamp from the result or current time
             at = datetime.now(tz=timezone.utc)
             metrics.append(
-                {
-                    "name": metric_name,
-                    "value": value,
-                    "labels": labels,
-                    "at": at,
-                }
+                Metric(
+                    name=metric_name,
+                    value=value,
+                    labels=labels,
+                    at=at,
+                )
             )
 
         return metrics
 
-    def fetch(self, incident_id: str, start: str, end: str) -> list[dict[str, Any]]:
+    def fetch(self, incident_id: str, start: str, end: str) -> list[Metric]:
         """Synchronous wrapper for async fetch."""
         try:
             loop = asyncio.get_running_loop()

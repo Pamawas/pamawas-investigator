@@ -11,7 +11,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
-from models import Finding
+from models import Finding, LogEntry, Metric
 
 # Python 3.9 compatibility for datetime.UTC (added in 3.11)
 try:
@@ -318,6 +318,12 @@ class InvestigationPersistence:
         Guards the auto-retry against double-execution: only one worker can flip
         a run from `failed_retryable` (with `next_retry_at <= now`) to `running`,
         so a racing second reclaim is a no-op.
+
+        `completed_at` and `safe_error_code` are cleared because they describe
+        the attempt that just failed. Leaving them set made `started_at = now()`
+        land after the previous attempt's `completed_at`, which violates
+        `investigation_runs_check1` (completed_at >= started_at) and wedged the
+        run in `failed_retryable` forever.
         """
         conn = None
         try:
@@ -329,6 +335,8 @@ class InvestigationPersistence:
                     UPDATE investigation_runs
                     SET status = 'running',
                         next_retry_at = NULL,
+                        completed_at = NULL,
+                        safe_error_code = NULL,
                         started_at = %s,
                         updated_at = %s
                     WHERE id = %s
@@ -496,26 +504,17 @@ class InvestigationPersistence:
         incident_id: str,
         run_id: str,
         findings: list[Finding],
-        metrics: list[dict[str, Any]] | None = None,
-        logs: list[dict[str, Any]] | None = None,
+        metrics: list[Metric] | None = None,
+        logs: list[LogEntry] | None = None,
     ) -> list[str]:
         """Insert evidence records for all findings in a transaction; returns evidence IDs."""
-        from models import LogEntry, Metric
-
         conn = self._get_connection()
         evidence_ids = []
         now = datetime.now(UTC)
 
         # Prepare enriched data as JSON
-        mets = metrics or []
-        logs_list = logs or []
-        metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in mets])
-        logs_json = json.dumps(
-            [
-                log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
-                for log_entry in logs_list
-            ]
-        )
+        metrics_json = json.dumps([m.to_dict() for m in (metrics or [])])
+        logs_json = json.dumps([entry.to_dict() for entry in (logs or [])])
 
         try:
             with conn.cursor() as cursor:
@@ -557,63 +556,6 @@ class InvestigationPersistence:
             conn.rollback()
             logger.error(f"Failed to insert evidence: {e}")
             raise
-        finally:
-            self._put_connection(conn)
-
-    def update_evidence_enrichment(
-        self,
-        evidence_id: str,
-        metrics: list[dict[str, Any]] | None = None,
-        logs: list[dict[str, Any]] | None = None,
-    ) -> bool:
-        """Update evidence with enriched metrics/logs; returns False on version conflict."""
-        from models import LogEntry, Metric
-
-        conn = self._get_connection()
-        now = datetime.now(UTC)
-
-        try:
-            # Get current version
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT version FROM evidence WHERE id = %s", (evidence_id,))
-                row = cursor.fetchone()
-                if not row:
-                    logger.warning(f"Evidence {evidence_id} not found for enrichment")
-                    return False
-                current_version = row[0]
-
-            # Prepare JSON values
-            mets = metrics or []
-            logs_list = logs or []
-            metrics_json = json.dumps([m.to_dict() if isinstance(m, Metric) else m for m in mets])
-            logs_json = json.dumps(
-                [
-                    log_entry.to_dict() if isinstance(log_entry, LogEntry) else log_entry
-                    for log_entry in logs_list
-                ]
-            )
-
-            # Update with version check
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    UPDATE evidence
-                    SET metrics = %s, logs = %s, version = version + 1, updated_at = %s
-                    WHERE id = %s AND version = %s
-                    """,
-                    (metrics_json, logs_json, now, evidence_id, current_version),
-                )
-                if cursor.rowcount == 0:
-                    logger.warning(f"Version conflict updating evidence {evidence_id}")
-                    return False
-
-                conn.commit()
-                logger.debug(f"Updated evidence {evidence_id} with enrichment")
-                return True
-        except (OSError, ValueError, RuntimeError, psycopg2.Error) as e:
-            conn.rollback()
-            logger.error(f"Failed to update evidence enrichment: {e}")
-            return False
         finally:
             self._put_connection(conn)
 

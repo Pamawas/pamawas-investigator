@@ -10,6 +10,8 @@ from typing import Any
 
 import httpx
 
+from models.models import LogEntry
+
 logger = logging.getLogger(__name__)
 
 
@@ -18,8 +20,8 @@ class LogsFetcher:
 
     def fetch(
         self, incident_id: str, start: str, end: str, limit: int = 100, service: str | None = None
-    ) -> list[dict[str, Any]]:
-        """Fetch logs for an incident. Returns list of log entry dicts."""
+    ) -> list[LogEntry]:
+        """Fetch logs for an incident. Returns list of LogEntry samples."""
         raise NotImplementedError
 
 
@@ -91,8 +93,14 @@ class LokiFetcher(LogsFetcher):
                 raise ValueError(f"LogQL query contains invalid operator pattern: {pattern}")
 
     def _parse_timestamp(self, ts: float) -> datetime:
-        """Parse Unix timestamp to datetime."""
-        return datetime.fromtimestamp(ts, tz=timezone.utc)
+        """Parse a Loki sample timestamp (Unix nanoseconds) to datetime.
+
+        Loki's query_range returns each value as `[<nanoseconds>, "<line>"]`.
+        Feeding those nanoseconds to `datetime.fromtimestamp` treats them as
+        seconds and raises OSError ("Value too large"), which aborted the whole
+        enrichment and left every Loki fetch empty.
+        """
+        return datetime.fromtimestamp(ts / 1_000_000_000, tz=timezone.utc)
 
     async def _query_range(self, logql: str, start: str, end: str, limit: int) -> dict[str, Any]:
         """Execute a Loki query_range request."""
@@ -168,7 +176,7 @@ class LokiFetcher(LogsFetcher):
         end: str,
         limit: int = 100,
         service: str | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[LogEntry]:
         """Fetch Loki logs for an incident.
 
         Args:
@@ -181,7 +189,8 @@ class LokiFetcher(LogsFetcher):
                 and returning an arbitrary stream would be fabricated context.
 
         Returns:
-            List of log entry dictionaries with timestamp, stream, line
+            List of LogEntry samples (the typed model, so `timestamp` is
+            serialized consistently with everything else we persist).
         """
         if not service:
             logger.info(
@@ -229,18 +238,18 @@ class LokiFetcher(LogsFetcher):
                 stream_name = stream.get("__name__", stream.get("stream", ""))
 
                 logs.append(
-                    {
-                        "timestamp": self._parse_timestamp(ts),
-                        "stream": stream_name,
-                        "line": line,
-                    }
+                    LogEntry(
+                        timestamp=self._parse_timestamp(ts),
+                        stream=stream_name,
+                        line=line,
+                    )
                 )
 
         return logs
 
     def fetch(
         self, incident_id: str, start: str, end: str, limit: int = 100
-    ) -> list[dict[str, Any]]:
+    ) -> list[LogEntry]:
         """Synchronous wrapper for async fetch."""
         try:
             loop = asyncio.get_running_loop()
