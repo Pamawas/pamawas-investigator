@@ -163,7 +163,6 @@ app.add_middleware(
     service_name="pamawas-investigator",
     limits={
         "/api/v1/investigations": (_rate_rps, _rate_burst),
-        "/api/v1/investigate": (_rate_rps, _rate_burst),
         "/api/v1/status": (_rate_rps, _rate_burst),
         # The daily summary calls the LLM, so it carries a budget like the
         # investigation endpoints rather than being unmetered.
@@ -295,78 +294,6 @@ async def ready():
         except psycopg2.Error:
             pass
         return JSONResponse(status_code=503, content={"status": "not ready", "error": str(e)})
-
-
-@app.post("/api/v1/investigate")
-async def investigate(
-    incident_id: str,
-    x_service_token: str | None = Header(None),
-):
-    """Legacy transitional endpoint (deprecated).
-
-    The v1 frozen contract for investigation creation is
-    POST /api/v1/investigations (async, idempotent, service-token protected).
-    This unversioned endpoint is transitional and MUST be removed after
-    clients migrate. See pamawas-docs/system-design/api-workflow-contracts.md
-    §12 Compatibility.
-
-    To preserve the "do not maintain two paths with different authorization
-    or idempotency semantics" rule, this shim mirrors the async v1 creation
-    contract: it persists a queued run and returns 202, never inline findings.
-
-    The token check is part of that mirroring. It was missing, so this
-    deprecated path accepted unauthenticated calls that created investigation
-    runs and spent LLM budget.
-    """
-    await _verify_service_token(x_service_token)
-
-    if investigator is None:
-        return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
-
-    log.info("legacy_investigate_deprecated", incident_id=incident_id)
-
-    import hashlib
-
-    request_key = f"{incident_id}:incident_created:1"
-    request_key_hash = hashlib.sha256(request_key.encode()).hexdigest()
-
-    run_id, existing_status = await _ensure_investigation_run(incident_id, request_key_hash)
-
-    if run_id is None:
-        return JSONResponse(
-            status_code=500,
-            content={"error": "Internal server error"},
-        )
-
-    if existing_status is not None:
-        return JSONResponse(
-            status_code=409,
-            content={
-                "error": "Investigation already exists",
-                "request_id": f"req_{request_key_hash[:26]}",
-                "data": {
-                    "run_id": run_id,
-                    "incident_id": incident_id,
-                    "status": existing_status,
-                },
-            },
-        )
-
-    return JSONResponse(
-        status_code=202,
-        content={
-            "request_id": f"req_{request_key_hash[:26]}",
-            "data": {
-                "run_id": run_id,
-                "incident_id": incident_id,
-                "status": "queued",
-            },
-        },
-        headers={
-            "Deprecation": "true",
-            "Link": '</api/v1/investigations>; rel="successor-version"',
-        },
-    )
 
 
 class InvestigationRequest(BaseModel):

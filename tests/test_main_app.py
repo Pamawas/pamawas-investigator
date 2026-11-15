@@ -63,33 +63,6 @@ def test_health_returns_database_error(cursor):
     assert response.json()["error"] == "offline"
 
 
-def test_investigate_endpoint_is_deprecated_shim():
-    """The legacy /api/v1/investigate endpoint is a deprecation shim
-    mirroring the async creation contract: persists a queued run and
-    returns 202, never inline findings."""
-    from unittest.mock import AsyncMock
-
-    service = MagicMock()
-    service.db_conn = MagicMock()
-    service.persistence.create_investigation_run.return_value = ("irun_legacy1", True)
-    service.investigate_async = AsyncMock()
-    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
-    with client_with(service) as client:
-        response = client.post(
-            "/api/v1/investigate",
-            params={"incident_id": "inc-1"},
-            headers={"X-Service-Token": "test-token"},
-        )
-    assert response.status_code == 202
-    assert response.headers["Deprecation"] == "true"
-    body = response.json()
-    assert body["data"]["incident_id"] == "inc-1"
-    assert body["data"]["status"] == "queued"
-    assert body["data"]["run_id"] == "irun_legacy1"
-    # The shim must not invoke the synchronous investigator path.
-    service.investigate.assert_not_called()
-
-
 def test_status_reports_uptime(monkeypatch):
     monkeypatch.setattr(main, "start_time", 100.0)
     monkeypatch.setattr(main.time, "time", lambda: 112.5)
@@ -403,12 +376,11 @@ def test_get_investigation_status_returns_503_when_uninitialized():
     assert "error" in response.json()
 
 
-def test_investigate_endpoints_require_the_service_token():
+def test_mutation_endpoints_require_the_service_token():
     """Every mutating endpoint must reject unauthenticated callers.
 
-    The legacy /api/v1/investigate shim mirrored the v1 creation contract in
-    every way except authorization: it accepted anonymous calls that created
-    investigation runs and spent LLM budget.
+    These create investigation runs or spend LLM budget, so an unauthenticated
+    caller inside the cluster could burn either at will.
     """
     from unittest.mock import AsyncMock
 
@@ -417,21 +389,31 @@ def test_investigate_endpoints_require_the_service_token():
     service.investigate_async = AsyncMock()
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
+    body = {"contract_version": 1, "incident_id": "inc-1",
+            "reason": "incident_created", "correlation_version": 1}
     with client_with(service) as client:
-        for path in ("/api/v1/investigate", "/api/v1/investigations"):
-            kwargs = {"params": {"incident_id": "inc-1"}} if "investigate" in path else {
-                "json": {"contract_version": 1, "incident_id": "inc-1",
-                         "reason": "incident_created", "correlation_version": 1}
-            }
-            response = client.post(path, **kwargs)
-            assert response.status_code == 401, f"{path} accepted an anonymous call"
+        response = client.post("/api/v1/investigations", json=body)
+        assert response.status_code == 401, "accepted an anonymous call"
 
-            response = client.post(path, headers={"X-Service-Token": "wrong"}, **kwargs)
-            assert response.status_code == 401, f"{path} accepted a wrong token"
+        response = client.post(
+            "/api/v1/investigations", headers={"X-Service-Token": "wrong"}, json=body
+        )
+        assert response.status_code == 401, "accepted a wrong token"
 
-    # The summary endpoint costs an LLM request and must be protected too.
-    with client_with(service) as client:
+        # Costs an LLM request, so it is protected too.
         response = client.post("/api/v1/summaries", json={
             "period_start": "a", "period_end": "b", "timezone": "UTC", "incidents": [],
         })
         assert response.status_code == 401
+
+
+def test_legacy_investigate_endpoint_is_gone():
+    """The unversioned shim was removed; only the v1 contract remains.
+
+    It duplicated POST /api/v1/investigations with a weaker payload (reason and
+    correlation_version hardcoded, no contract_version) and had no callers.
+    """
+    service = MagicMock()
+    with client_with(service) as client:
+        response = client.post("/api/v1/investigate", params={"incident_id": "inc-1"})
+    assert response.status_code == 404
