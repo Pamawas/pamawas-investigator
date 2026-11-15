@@ -43,3 +43,35 @@ def test_investigation_state_defaults():
     assert state.max_tool_calls == 100
     assert state.completed is False
     assert state.error is None
+
+
+def test_recommendation_is_a_distinct_evidence_type():
+    """Recommendations answer "what do I do", not "what happened".
+
+    They carry their own type so the report can render them as actions instead
+    of mixing them into the evidence list as more claims about the incident.
+    """
+    rec = Finding(EvidenceType.RECOMMENDATION, "Roll back the deploy", EvidenceSource.LLM, 0.8)
+    assert rec.to_dict()["type"] == "recommendation"
+    assert Finding.from_dict(rec.to_dict()) == rec
+
+
+def test_finding_records_which_system_it_came_from():
+    """A reader must be able to tell a metric from a log from an inference."""
+    finding = Finding(
+        EvidenceType.FACT,
+        "up went to 0",
+        EvidenceSource.PROMETHEUS,
+        1.0,
+        source_detail='up{instance="koba-labs"}',
+    )
+    assert finding.to_dict()["source"] == "prometheus"
+    assert finding.to_dict()["source_detail"] == 'up{instance="koba-labs"}'
+
+
+def test_finding_rejects_a_source_outside_the_closed_set():
+    """Free-text sources produced dozens of unaggregatable one-off strings."""
+    with pytest.raises(ValueError):
+        Finding.from_dict(
+            {"type": "fact", "content": "x", "source": "Prometheus up metric", "confidence": 0}
+        )
