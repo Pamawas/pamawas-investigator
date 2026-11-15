@@ -13,6 +13,23 @@ def _parse_env_list(value: str | None) -> list[str] | None:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def rate_limit_from_env() -> tuple[float, int]:
+    """Read and validate the inbound rate-limit knobs.
+
+    Split out from Config.from_env because the ASGI middleware is installed
+    at app construction (module import time), before the database-dependent
+    config exists. Validation lives here so a malformed env var fails at
+    startup, same as every other knob.
+    """
+    rps = float(os.getenv("RATE_LIMIT_RPS", "10"))
+    burst = int(os.getenv("RATE_LIMIT_BURST", "20"))
+    if rps <= 0:
+        raise ValueError(f"RATE_LIMIT_RPS must be > 0, got {rps}")
+    if burst < 1:
+        raise ValueError(f"RATE_LIMIT_BURST must be >= 1, got {burst}")
+    return rps, burst
+
+
 @dataclass
 class Config:
     """Configuration for the investigator service."""

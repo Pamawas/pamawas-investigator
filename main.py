@@ -14,6 +14,7 @@ from prometheus_client import make_asgi_app
 from pydantic import BaseModel
 
 from config import Config as InvestigationConfig
+from config import rate_limit_from_env
 from logging_middleware import LoggingMiddleware, get_logger
 from metrics import (
     investigation_retry_errors_total,
@@ -23,6 +24,7 @@ from metrics import (
     set_running,
 )
 from otel import OTelConfig, init_tracer
+from ratelimit_middleware import RateLimitMiddleware
 from service.investigator import PamawasInvestigator
 
 # Configure structured logging
@@ -147,6 +149,22 @@ app = FastAPI(
     description="Bounded tool-calling LLM investigation engine for infrastructure incidents",
     version=APP_VERSION,
     lifespan=lifespan,
+)
+
+# Per-route rate limiting (design review P5). Installed at app construction,
+# so its knobs come from rate_limit_from_env() — validated there, failing
+# startup on a malformed value. /healthz, /ready and /metrics are exempt.
+# Added before LoggingMiddleware so logging wraps it: rejected requests are
+# still logged with trace context, matching the Go services' ordering.
+_rate_rps, _rate_burst = rate_limit_from_env()
+app.add_middleware(
+    RateLimitMiddleware,
+    service_name="pamawas-investigator",
+    limits={
+        "/api/v1/investigations": (_rate_rps, _rate_burst),
+        "/api/v1/investigate": (_rate_rps, _rate_burst),
+        "/api/v1/status": (_rate_rps, _rate_burst),
+    },
 )
 
 # Add structured logging middleware

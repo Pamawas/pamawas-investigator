@@ -1,3 +1,3 @@
-from .config import Config
+from .config import Config, rate_limit_from_env
 
-__all__ = ["Config"]
+__all__ = ["Config", "rate_limit_from_env"]
