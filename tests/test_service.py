@@ -2,6 +2,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import httpx
+import openai
 import pytest
 
 from models import EvidenceType, IncidentContext
@@ -40,6 +42,33 @@ def test_llm_initialization_and_completion(config):
         temperature=0.1,
         max_tokens=2000,
     )
+
+
+def test_llm_failover_to_next_endpoint_when_first_is_unavailable(config):
+    """When the first endpoint exhausts its retries on a retryable (5xx)
+    error, the client must fail over to the next endpoint instead of raising."""
+    def make_retryable(msg):
+        response = httpx.Response(503, request=httpx.Request("POST", "https://x/v1/chat/completions"))
+        return openai.APIStatusError(
+            message=msg, response=response, body=object()
+        )
+
+    client1 = MagicMock()
+    client1.chat.completions.create.side_effect = make_retryable("endpoint 1 down")
+    client2 = MagicMock()
+    message2 = response("ok from nvidia")
+    client2.chat.completions.create.return_value.choices = [SimpleNamespace(message=message2)]
+
+    llm = InvestigatorLLM(config)
+    # Replace the real clients with the two mocks: endpoint 1 failing, endpoint 2 OK.
+    llm.clients = [client1, client2]
+    llm.models = ["test-model", "test-model"]
+
+    result = llm.chat_completion([{"role": "user", "content": "hi"}], tools=[])
+    assert result is message2
+    # Endpoint 1 exhausted its retries (called MAX_RETRIES times), then endpoint 2 succeeded.
+    assert client1.chat.completions.create.call_count == llm.MAX_RETRIES
+    assert client2.chat.completions.create.call_count == 1
 
 
 def test_connect_db_success_and_failure(config):

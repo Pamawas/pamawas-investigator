@@ -143,11 +143,20 @@ class InvestigatorLLM:
                     TimeoutError,
                 ) as e:
                     last_error = e
-                    if not self._is_retryable(e) or attempt == self.MAX_RETRIES - 1:
-                        # Non-retryable, or retries exhausted on this endpoint.
-                        if not self._is_retryable(e):
+                    retryable = self._is_retryable(e)
+                    if not retryable or attempt == self.MAX_RETRIES - 1:
+                        # Non-retryable, or retries exhausted on this endpoint:
+                        # fail over to the next endpoint rather than aborting.
+                        if not retryable:
                             logger.error("LLM call failed (non-retryable): %s", e)
-                        raise
+                        else:
+                            logger.warning(
+                                "LLM retries exhausted on %s after %d attempts: %s; failing over to next endpoint",
+                                endpoint_label,
+                                self.MAX_RETRIES,
+                                e,
+                            )
+                        break
                     backoff = min(
                         self.INITIAL_BACKOFF_SECONDS * (2**attempt),
                         self.MAX_BACKOFF_SECONDS,
@@ -163,7 +172,7 @@ class InvestigatorLLM:
                     _time.sleep(backoff)
 
         # All endpoints exhausted.
-        if last_error is not None:  # pragma: no cover - defensive
+        if last_error is not None:
             raise last_error
         raise RuntimeError("LLM call failed after all endpoints exhausted")  # pragma: no cover
 
