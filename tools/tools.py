@@ -6,7 +6,6 @@ from typing import Any
 
 from adapters import (
     DeploymentAdapter,
-    DeploymentAdapterError,
     DeploymentConfig,
     LokiAdapter,
     LokiConfig,
@@ -157,41 +156,6 @@ class InvestigatorTools:
             logger.error("Loki query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
-    def get_recent_deployments(self, service: str, start: str, end: str) -> dict[str, Any]:
-        """Get recent deployments for a service (sync wrapper for async adapter)."""
-        logger.info("Getting recent deployments for %s [%s to %s]", service, start, end)
-        start_time = time.time()
-
-        try:
-            import asyncio
-
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            result = loop.run_until_complete(
-                self._deployment_adapter.get_recent_deployments(service, start, end)
-            )
-
-            duration = time.time() - start_time
-            observe_tool_call_duration("deployments", duration)
-            increment_tool_calls(
-                "deployments",
-                "success"
-                if result.get("status") == "success"
-                else ("circuit_open" if result.get("status") == "unavailable" else "error"),
-            )
-            return result
-
-        except (DeploymentAdapterError, TimeoutError, RuntimeError, OSError) as e:
-            duration = time.time() - start_time
-            observe_tool_call_duration("deployments", duration)
-            increment_tool_calls("deployments", "error")
-            logger.error("Get deployments failed: %s", e)
-            return {"status": "error", "error": str(e)}
-
     def get_related_incidents(self, service: str, symptom_keywords: list[str]) -> dict[str, Any]:
         """Find related incidents from the database (sync wrapper for async adapter)."""
         logger.info(
@@ -300,28 +264,6 @@ class ToolRegistry:
                             },
                         },
                         "required": ["logql", "start", "end"],
-                    },
-                },
-            },
-            {
-                "type": "function",
-                "function": {
-                    "name": "get_recent_deployments",
-                    "description": "Get recent deployments for a service",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "service": {"type": "string", "description": "Service name"},
-                            "start": {
-                                "type": "string",
-                                "description": "Start timestamp (ISO 8601/RFC3339)",
-                            },
-                            "end": {
-                                "type": "string",
-                                "description": "End timestamp (ISO 8601/RFC3339)",
-                            },
-                        },
-                        "required": ["service", "start", "end"],
                     },
                 },
             },

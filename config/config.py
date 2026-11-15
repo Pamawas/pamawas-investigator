@@ -32,7 +32,7 @@ class Config:
     llm_models: list[str] | None = None
     prometheus_url: str = "http://prometheus:9090"
     loki_url: str = "http://loki:3100"
-    max_tool_calls: int = 6
+    max_tool_calls: int = 100
     truncation_limit: int = 8192
     # Query templates for evidence enrichment
     prometheus_query_template: str = '{incident="%s"}'
@@ -93,7 +93,7 @@ class Config:
             loki_url=os.getenv("LOKI_URL", "http://loki:3100"),
             prometheus_query_template=os.getenv("PROMETHEUS_QUERY_TEMPLATE", '{incident="%s"}'),
             loki_query_template=os.getenv("LOKI_QUERY_TEMPLATE", '{incident="%s"}'),
-            max_tool_calls=int(os.getenv("MAX_TOOL_CALLS", "6")),
+            max_tool_calls=int(os.getenv("MAX_TOOL_CALLS", "100")),
             truncation_limit=int(os.getenv("TRUNCATION_LIMIT", "8192")),
             # Adapter settings from env
             prometheus_timeout_seconds=float(os.getenv("PROMETHEUS_TIMEOUT_SECONDS", "10.0")),

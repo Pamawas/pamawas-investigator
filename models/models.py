@@ -96,7 +96,7 @@ class InvestigationState:
     findings: list[Finding]
     tool_calls: list[ToolResult]
     tool_call_count: int = 0
-    max_tool_calls: int = 6
+    max_tool_calls: int = 100
     completed: bool = False
     error: str | None = None
     request_key_hash: str | None = None
