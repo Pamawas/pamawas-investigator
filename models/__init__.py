@@ -1,5 +1,6 @@
 from .models import (
     Evidence,
+    EvidenceSource,
     EvidenceType,
     Finding,
     IncidentContext,
@@ -11,6 +12,7 @@ from .models import (
 
 __all__ = [
     "Evidence",
+    "EvidenceSource",
     "EvidenceType",
     "Finding",
     "IncidentContext",

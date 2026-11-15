@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from adapters.fake import create_fake_transports
 from config import Config as InvestigationConfig
-from models import EvidenceType, Finding
+from models import EvidenceSource, EvidenceType, Finding
 from service import PamawasInvestigator
 from service.investigator import InvestigatorLLM
 from tools import InvestigatorTools
@@ -30,17 +30,30 @@ class TestFinding:
 
     def test_finding_creation(self):
         finding = Finding(
-            type=EvidenceType.FACT, content="Test fact", source="prometheus", confidence=0.95
+            type=EvidenceType.FACT,
+            content="Test fact",
+            source=EvidenceSource.PROMETHEUS,
+            confidence=0.95,
         )
         assert finding.type == EvidenceType.FACT
         assert finding.content == "Test fact"
-        assert finding.source == "prometheus"
+        assert finding.source == EvidenceSource.PROMETHEUS
         assert finding.confidence == 0.95
 
     def test_finding_confidence_bounds(self):
         # Test valid bounds
-        Finding(type=EvidenceType.FACT, content="Test", source="test", confidence=0.0)
-        Finding(type=EvidenceType.FACT, content="Test", source="test", confidence=1.0)
+        Finding(
+            type=EvidenceType.FACT,
+            content="Test",
+            source=EvidenceSource.LLM,
+            confidence=0.0,
+        )
+        Finding(
+            type=EvidenceType.FACT,
+            content="Test",
+            source=EvidenceSource.LLM,
+            confidence=1.0,
+        )
 
 
 class TestInvestigationConfig:
@@ -154,13 +167,13 @@ class TestInvestigatorTools:
             Finding(
                 type=EvidenceType.FACT,
                 content="CPU usage spiked to 95%",
-                source="prometheus",
+                source=EvidenceSource.PROMETHEUS,
                 confidence=0.9,
             ),
             Finding(
                 type=EvidenceType.LIKELY_CAUSE,
                 content="Deployment caused resource exhaustion",
-                source="investigator",
+                source=EvidenceSource.SYSTEM,
                 confidence=0.75,
             ),
         ]

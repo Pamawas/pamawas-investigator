@@ -2,11 +2,18 @@ from datetime import UTC, datetime
 
 import pytest
 
-from models import EvidenceType, Finding, IncidentContext, InvestigationState, ToolResult
+from models import (
+    EvidenceSource,
+    EvidenceType,
+    Finding,
+    IncidentContext,
+    InvestigationState,
+    ToolResult,
+)
 
 
 def test_finding_round_trip():
-    finding = Finding(EvidenceType.LIKELY_CAUSE, "deployment", "events", 0.8)
+    finding = Finding(EvidenceType.LIKELY_CAUSE, "deployment", EvidenceSource.INCIDENTS, 0.8)
     assert Finding.from_dict(finding.to_dict()) == finding
 
 

@@ -5,7 +5,7 @@ from adapters.fake import (
     FakePrometheusTransport,
     FakeRelatedIncidentsTransport,
 )
-from models import EvidenceType, Finding
+from models import EvidenceSource, EvidenceType, Finding
 from tools import InvestigatorTools, ToolRegistry
 
 
@@ -54,7 +54,7 @@ def test_tools_return_success_and_record_metrics(config, tools):
 
 
 def test_submit_findings_serializes_findings_and_records_metrics(config, tools):
-    finding = Finding(EvidenceType.FACT, "latency rose", "prometheus", 1.0)
+    finding = Finding(EvidenceType.FACT, "latency rose", EvidenceSource.PROMETHEUS, 1.0)
     result = tools.submit_findings([finding])
     assert result["findings"] == [finding.to_dict()]
 

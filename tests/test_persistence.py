@@ -369,7 +369,7 @@ class TestInsertEvidenceSerialization:
         """
         from datetime import UTC, datetime
 
-        from models import EvidenceType, Finding, LogEntry, Metric
+        from models import EvidenceSource, EvidenceType, Finding, LogEntry, Metric
 
         mock_pool, mock_conn, mock_cursor = mock_pool
         now = datetime.now(UTC)
@@ -384,7 +384,7 @@ class TestInsertEvidenceSerialization:
                         Finding(
                             type=EvidenceType.FACT,
                             content="target down",
-                            source="prometheus",
+                            source=EvidenceSource.PROMETHEUS,
                             confidence=0.9,
                         )
                     ],

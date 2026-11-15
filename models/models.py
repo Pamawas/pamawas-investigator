@@ -15,12 +15,38 @@ except ImportError:
 
 
 class EvidenceType(StrEnum):
-    """Evidence classification types."""
+    """Evidence classification types.
+
+    FACT/LIKELY_CAUSE/HYPOTHESIS/UNKNOWN describe what the investigation found.
+    RECOMMENDATION is a different kind of output: the concrete action an
+    operator should take, derived from the finding. It is kept separate so the
+    report can present actions as actions rather than mixing them into the
+    evidence list, where they read as more claims about the incident.
+    """
 
     FACT = "fact"
     LIKELY_CAUSE = "likely_cause"
     HYPOTHESIS = "hypothesis"
     UNKNOWN = "unknown"
+    RECOMMENDATION = "recommendation"
+
+class EvidenceSource(StrEnum):
+    """Which system a finding's evidence came from.
+
+    This is a closed set so the report can say, per finding, whether it rests on
+    metrics, logs, history, or the model's own reasoning — and so the sources
+    can be counted. It used to be free text, which produced dozens of one-off
+    strings ('Prometheus up metric', 'Loki logs query', ...) that answered
+    nothing and could not be aggregated.
+    """
+
+    PROMETHEUS = "prometheus"
+    LOKI = "loki"
+    INCIDENTS = "incidents"
+    # The model's own synthesis across the above (correlations, inferences).
+    LLM = "llm"
+    # The investigator harness itself (timeout, internal error).
+    SYSTEM = "system"
 
 
 @dataclass
@@ -29,15 +55,20 @@ class Finding:
 
     type: EvidenceType
     content: str
-    source: str
+    source: EvidenceSource
     confidence: float  # 0.0 to 1.0
+    # Which query, stream, or metric the finding rests on (e.g.
+    # 'up{job="system_node", instance="koba-labs"}'). The source alone says
+    # which system answered; this says what was asked.
+    source_detail: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
         return {
             "type": self.type.value,
             "content": self.content,
-            "source": self.source,
+            "source": self.source.value,
+            "source_detail": self.source_detail,
             "confidence": self.confidence,
         }
 
@@ -47,8 +78,9 @@ class Finding:
         return cls(
             type=EvidenceType(data["type"]),
             content=data["content"],
-            source=data["source"],
+            source=EvidenceSource(data["source"]),
             confidence=data["confidence"],
+            source_detail=data.get("source_detail", ""),
         )
 
 

@@ -524,10 +524,10 @@ class InvestigationPersistence:
                         """
                         INSERT INTO evidence (
                             id, incident_id, run_id, type, content,
-                            source, confidence, supports_evidence,
-                            contradicts_evidence, ordinal, created_at,
-                            metrics, logs, version, updated_at
-                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            source, source_detail, confidence,
+                            supports_evidence, contradicts_evidence, ordinal,
+                            created_at, metrics, logs, version, updated_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                         """,
                         (
                             evidence_id,
@@ -535,7 +535,8 @@ class InvestigationPersistence:
                             run_id,
                             finding.type.value,
                             finding.content,
-                            finding.source,
+                            finding.source.value,
+                            finding.source_detail,
                             finding.confidence,
                             [],
                             [],  # supports/contradicts empty for MVP

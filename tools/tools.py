@@ -377,10 +377,35 @@ class ToolRegistry:
                                                 "likely_cause",
                                                 "hypothesis",
                                                 "unknown",
+                                                "recommendation",
                                             ],
                                         },
                                         "content": {"type": "string"},
-                                        "source": {"type": "string"},
+                                        "source": {
+                                            "type": "string",
+                                            "enum": [
+                                                "prometheus",
+                                                "loki",
+                                                "incidents",
+                                                "llm",
+                                                "system",
+                                            ],
+                                            "description": (
+                                                "Where this came from: prometheus (metrics), "
+                                                "loki (logs), incidents (incident history), "
+                                                "llm (your own synthesis across sources), "
+                                                "system (a harness limit such as a timeout)"
+                                            ),
+                                        },
+                                        "source_detail": {
+                                            "type": "string",
+                                            "description": (
+                                                "The specific query/stream/metric it rests "
+                                                "on, e.g. 'up{job=\"system_node\", "
+                                                "instance=\"koba-labs\"}' or "
+                                                "'kubernetes_container_name=netbird-agent'"
+                                            ),
+                                        },
                                         "confidence": {
                                             "type": "number",
                                             "minimum": 0.0,

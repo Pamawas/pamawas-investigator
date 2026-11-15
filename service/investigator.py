@@ -25,6 +25,7 @@ from metrics import (
     increment_max_tool_calls_reached,
 )
 from models import (
+    EvidenceSource,
     EvidenceType,
     Finding,
     IncidentContext,
@@ -353,6 +354,22 @@ class PamawasInvestigator:
             "- LIKELY_CAUSE: strongly supported by evidence, not certain\n"
             "- HYPOTHESIS: plausible, unverified\n"
             "- UNKNOWN: insufficient evidence; stated explicitly rather than guessed\n"
+            "- RECOMMENDATION: a concrete action the operator should take, derived "
+            "from the findings. Put these in their own findings — never bury an "
+            "action inside a FACT.\n"
+            "\n"
+            "Every finding must name its source, because the report shows it and a "
+            "reader must be able to tell a metric from a log from your inference:\n"
+            "- prometheus: a metric you queried\n"
+            "- loki: a log line you read\n"
+            "- incidents: incident history\n"
+            "- llm: your own synthesis across sources (correlation, inference)\n"
+            "- system: a harness limit such as a timeout\n"
+            "Also set source_detail to the specific query, stream, or metric the "
+            "finding rests on, e.g. 'up{job=\"system_node\", instance=\"koba-labs\"}'. "
+            "If a finding combines metrics AND logs, say so in source_detail "
+            "(e.g. 'prometheus up + loki docker_logs') and use source llm, since "
+            "the combination is your synthesis, not a single observation.\n"
             "\n"
             "Always provide confidence scores (0.0 to 1.0) for your findings.\n"
             "\n"
@@ -418,7 +435,7 @@ class PamawasInvestigator:
             Finding(
                 type=EvidenceType.UNKNOWN,
                 content=f"Failed to load incident context: {context.error}",
-                source="investigator",
+                source=EvidenceSource.SYSTEM,
                 confidence=0.0,
             )
         ]
@@ -509,12 +526,27 @@ class PamawasInvestigator:
                             "status": "error",
                             "error": "submit_findings: finding missing required fields",
                         }, None, False
+                    # A finding's source decides how the report labels it and
+                    # whether the claim is checkable, so an unrecognized value
+                    # is a tool-call error the model must correct rather than
+                    # something to coerce into a default.
+                    try:
+                        evidence_source = EvidenceSource(source)
+                    except ValueError:
+                        return {
+                            "status": "error",
+                            "error": (
+                                "submit_findings: source must be one of "
+                                "prometheus, loki, incidents, llm, system"
+                            ),
+                        }, None, False
                     findings.append(
                         Finding(
                             type=EvidenceType(ftype),
                             content=content,
-                            source=source,
+                            source=evidence_source,
                             confidence=confidence,
+                            source_detail=f.get("source_detail") or "",
                         )
                     )
                 result = self.tools.submit_findings(findings)
@@ -608,7 +640,7 @@ class PamawasInvestigator:
                 Finding(
                     type=EvidenceType.HYPOTHESIS,
                     content=response.content or "Investigation completed via text response",
-                    source="llm_direct_response",
+                    source=EvidenceSource.LLM,
                     confidence=0.3,
                 )
             )
@@ -762,7 +794,7 @@ class PamawasInvestigator:
                     Finding(
                         type=EvidenceType.UNKNOWN,
                         content=f"Investigation error: {e!s}",
-                        source="investigator_error",
+                        source=EvidenceSource.SYSTEM,
                         confidence=0.0,
                     )
                 )
@@ -804,7 +836,7 @@ class PamawasInvestigator:
                 Finding(
                     type=EvidenceType.UNKNOWN,
                     content=content,
-                    source="investigator_timeout",
+                    source=EvidenceSource.SYSTEM,
                     confidence=0.0,
                 )
             )
