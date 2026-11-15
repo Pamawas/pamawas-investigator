@@ -298,7 +298,10 @@ async def ready():
 
 
 @app.post("/api/v1/investigate")
-async def investigate(incident_id: str):
+async def investigate(
+    incident_id: str,
+    x_service_token: str | None = Header(None),
+):
     """Legacy transitional endpoint (deprecated).
 
     The v1 frozen contract for investigation creation is
@@ -310,7 +313,13 @@ async def investigate(incident_id: str):
     To preserve the "do not maintain two paths with different authorization
     or idempotency semantics" rule, this shim mirrors the async v1 creation
     contract: it persists a queued run and returns 202, never inline findings.
+
+    The token check is part of that mirroring. It was missing, so this
+    deprecated path accepted unauthenticated calls that created investigation
+    runs and spent LLM budget.
     """
+    await _verify_service_token(x_service_token)
+
     if investigator is None:
         return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 

@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -72,8 +73,13 @@ def test_investigate_endpoint_is_deprecated_shim():
     service.db_conn = MagicMock()
     service.persistence.create_investigation_run.return_value = ("irun_legacy1", True)
     service.investigate_async = AsyncMock()
+    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
     with client_with(service) as client:
-        response = client.post("/api/v1/investigate", params={"incident_id": "inc-1"})
+        response = client.post(
+            "/api/v1/investigate",
+            params={"incident_id": "inc-1"},
+            headers={"X-Service-Token": "test-token"},
+        )
     assert response.status_code == 202
     assert response.headers["Deprecation"] == "true"
     body = response.json()
@@ -395,3 +401,37 @@ def test_get_investigation_status_returns_503_when_uninitialized():
 
     assert response.status_code == 503
     assert "error" in response.json()
+
+
+def test_investigate_endpoints_require_the_service_token():
+    """Every mutating endpoint must reject unauthenticated callers.
+
+    The legacy /api/v1/investigate shim mirrored the v1 creation contract in
+    every way except authorization: it accepted anonymous calls that created
+    investigation runs and spent LLM budget.
+    """
+    from unittest.mock import AsyncMock
+
+    service = MagicMock()
+    service.persistence.create_investigation_run.return_value = ("irun_x", True)
+    service.investigate_async = AsyncMock()
+    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
+
+    with client_with(service) as client:
+        for path in ("/api/v1/investigate", "/api/v1/investigations"):
+            kwargs = {"params": {"incident_id": "inc-1"}} if "investigate" in path else {
+                "json": {"contract_version": 1, "incident_id": "inc-1",
+                         "reason": "incident_created", "correlation_version": 1}
+            }
+            response = client.post(path, **kwargs)
+            assert response.status_code == 401, f"{path} accepted an anonymous call"
+
+            response = client.post(path, headers={"X-Service-Token": "wrong"}, **kwargs)
+            assert response.status_code == 401, f"{path} accepted a wrong token"
+
+    # The summary endpoint costs an LLM request and must be protected too.
+    with client_with(service) as client:
+        response = client.post("/api/v1/summaries", json={
+            "period_start": "a", "period_end": "b", "timezone": "UTC", "incidents": [],
+        })
+        assert response.status_code == 401
