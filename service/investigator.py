@@ -178,6 +178,12 @@ class InvestigatorLLM:
 class PamawasInvestigator:
     """Main investigator orchestrator."""
 
+    # How many turns in a row may produce prose without a tool call before the
+    # loop stops asking the model to continue. A model that replies with text
+    # three times running has stopped investigating; asking it a fourth time
+    # only burns wall-clock budget that a paged engineer is waiting on.
+    MAX_CONSECUTIVE_TEXT_TURNS = 3
+
     def __init__(self, config: Config):
         self.config = config
         self.llm = InvestigatorLLM(config)
@@ -630,18 +636,17 @@ class PamawasInvestigator:
     ):
         """Handle text response (no tool calls)."""
         logger.info(f"LLM response (no tool calls): {response.content[:100]}...")
-        if not is_final_turn:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Continue your investigation. Use your tools to gather more "
-                        "evidence, or submit your findings when ready."
-                    ),
-                }
+        state.consecutive_text_turns += 1
+
+        if is_final_turn or state.consecutive_text_turns >= self.MAX_CONSECUTIVE_TEXT_TURNS:
+            # Either the turn budget or the patience budget is gone. Take what
+            # the model has said as a hypothesis rather than discarding it: a
+            # partial answer beats the null "deadline exceeded" result this
+            # path used to produce after burning the full wall-clock budget.
+            logger.warning(
+                "Text response without tool use (%d consecutive) - recording it as a hypothesis",
+                state.consecutive_text_turns,
             )
-        else:
-            logger.warning("Final turn reached without tool use - extracting findings from text")
             state.findings.append(
                 Finding(
                     type=EvidenceType.HYPOTHESIS,
@@ -651,6 +656,16 @@ class PamawasInvestigator:
                 )
             )
             state.completed = True
+        else:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue your investigation. Use your tools to gather more "
+                        "evidence, or submit your findings when ready."
+                    ),
+                }
+            )
 
     async def _handle_submit_findings(
         self,
@@ -896,6 +911,9 @@ class PamawasInvestigator:
 
         # Handle tool calls
         if hasattr(response, "tool_calls") and response.tool_calls:
+            # Real progress: the model is still investigating, so the
+            # no-tool patience budget starts over.
+            state.consecutive_text_turns = 0
             for tool_call in response.tool_calls:
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)

@@ -414,7 +414,13 @@ class InvestigationPersistence:
                 params = [status, now]
 
                 if status == "running" and started_at is None:
-                    updates.append("started_at = %s")
+                    # COALESCE, not assignment: _persist_investigation re-marks
+                    # the run "running" at the END (before completing it), and
+                    # a plain assignment reset started_at to that moment. The
+                    # run then looked like it took 4 seconds when it had really
+                    # spent the full 10-minute deadline, which made every
+                    # "why was this slow" investigation start from a lie.
+                    updates.append("started_at = COALESCE(started_at, %s)")
                     params.append(now)
                 elif started_at is not None:
                     updates.append("started_at = %s")

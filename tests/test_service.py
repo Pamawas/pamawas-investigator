@@ -243,3 +243,39 @@ def test_text_only_turns_are_bounded_by_turn_budget(investigator):
     # The final turn's prose is captured as a hypothesis rather than discarded.
     assert findings[0].type is EvidenceType.HYPOTHESIS
     assert findings[0].content == "still thinking"
+
+
+def test_repeated_text_only_turns_stop_early(investigator):
+    """Three prose-only turns end the investigation instead of burning the budget.
+
+    The model stops calling tools when it has gathered what it needs but forgets
+    to submit. Previously the loop kept asking it to "continue" until either the
+    turn budget (100 LLM calls) or the wall-clock deadline ran out, then recorded
+    a null UNKNOWN. A partial answer beats a null one.
+    """
+    investigator.config.max_tool_calls = 100
+    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator.llm.chat_completion = MagicMock(return_value=response("I think the node rebooted"))
+
+    findings = investigator.investigate("inc")
+
+    assert investigator.llm.chat_completion.call_count == (
+        investigator.MAX_CONSECUTIVE_TEXT_TURNS
+    )
+    assert findings[0].type is EvidenceType.HYPOTHESIS
+    assert findings[0].content == "I think the node rebooted"
+
+
+def test_tool_call_resets_the_text_patience_budget(investigator):
+    """A real tool call proves the model is still working, so the count resets."""
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    state.consecutive_text_turns = 2
+
+    investigator._handle_text_response(
+        response("still here"), state, is_final_turn=False, messages=[]
+    )
+    assert state.consecutive_text_turns == 3
+    # Three in a row is the limit: this one completes rather than asking again.
+    assert state.completed is True

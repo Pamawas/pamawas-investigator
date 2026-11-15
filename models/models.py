@@ -136,6 +136,11 @@ class InvestigationState:
     # synthesized UNKNOWN.
     turn_count: int = 0
     max_tool_calls: int = 100
+    # Consecutive turns that produced no tool call. A model that stops calling
+    # tools is done investigating but forgets to submit; without this the loop
+    # burns its whole turn budget (up to 100 LLM calls) and then the wall-clock
+    # deadline, ending with a null result a human could have had in one turn.
+    consecutive_text_turns: int = 0
     completed: bool = False
     error: str | None = None
     request_key_hash: str | None = None

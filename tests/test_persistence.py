@@ -396,3 +396,26 @@ class TestInsertEvidenceSerialization:
         params = mock_cursor.execute.call_args[0][1]
         assert any('"at":' in str(p) for p in params)
         assert any('"timestamp":' in str(p) for p in params)
+
+
+class TestUpdateRunStatusStartedAt:
+    """started_at must record when the run actually began."""
+
+    def test_running_status_preserves_an_existing_started_at(self, mock_pool):
+        """Marking a run running twice must not reset its start time.
+
+        _persist_investigation re-marks the run "running" at the END, just
+        before completing it. A plain assignment reset started_at to that
+        moment, so a run that spent the full 10-minute deadline looked like it
+        took 4 seconds — every "why was this slow" investigation then started
+        from a false premise.
+        """
+        mock_pool, mock_conn, mock_cursor = mock_pool
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                pers.update_run_status("irun_123", "running")
+
+        query = mock_cursor.execute.call_args[0][0]
+        assert "started_at = COALESCE(started_at, %s)" in query
