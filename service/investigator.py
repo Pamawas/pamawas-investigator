@@ -151,10 +151,9 @@ class InvestigatorLLM:
                             logger.error("LLM call failed (non-retryable): %s", e)
                         else:
                             logger.warning(
-                                "LLM retries exhausted on %s after %d attempts: %s; failing over to next endpoint",
+                                "LLM retries exhausted on %s (%d); failing over",
                                 endpoint_label,
                                 self.MAX_RETRIES,
-                                e,
                             )
                         break
                     backoff = min(
