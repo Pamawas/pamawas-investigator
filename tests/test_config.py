@@ -42,7 +42,7 @@ def test_from_env_uses_defaults(monkeypatch):
 
     assert config.port == 8080
     assert config.llm_model == "gpt-4o-mini"
-    assert config.max_tool_calls == 6
+    assert config.max_tool_calls == 100
     assert config.truncation_limit == 8192
 
 

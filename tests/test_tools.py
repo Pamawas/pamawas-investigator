@@ -1,7 +1,6 @@
 import pytest
 
 from adapters.fake import (
-    FakeDeploymentTransport,
     FakeLokiTransport,
     FakePrometheusTransport,
     FakeRelatedIncidentsTransport,
@@ -21,22 +20,16 @@ def fake_loki():
 
 
 @pytest.fixture
-def fake_deployments():
-    return FakeDeploymentTransport()
-
-
-@pytest.fixture
 def fake_related_incidents():
     return FakeRelatedIncidentsTransport()
 
 
 @pytest.fixture
-def tools(config, fake_prometheus, fake_loki, fake_deployments, fake_related_incidents):
+def tools(config, fake_prometheus, fake_loki, fake_related_incidents):
     """Create InvestigatorTools with fake transports."""
     tools = InvestigatorTools(config)
     tools._prometheus_adapter = fake_prometheus
     tools._loki_adapter = fake_loki
-    tools._deployment_adapter = fake_deployments
     tools._related_incidents_adapter = fake_related_incidents
     return tools
 
@@ -52,12 +45,6 @@ def test_tools_return_success_and_record_metrics(config, tools):
     result = tools.query_loki("{job='api'}", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z")
     assert result["status"] == "success"
     assert "data" in result
-
-    # Test deployments
-    result = tools.get_recent_deployments("api", "2026-01-01T00:00:00Z", "2026-01-01T01:00:00Z")
-    assert result["status"] == "success"
-    assert "data" in result
-    assert len(result["data"]) > 0
 
     # Test related incidents
     result = tools.get_related_incidents("api", ["timeout"])
@@ -79,7 +66,6 @@ def test_tool_registry_names_match_definitions():
     assert names == [
         "query_prometheus",
         "query_loki",
-        "get_recent_deployments",
         "get_related_incidents",
         "submit_findings",
     ]
@@ -98,11 +84,6 @@ def test_fake_transports_track_calls(config, tools):
     tools.query_loki("{job='api'}", "s", "e")
     assert tools._loki_adapter.call_count == 1
     assert tools._loki_adapter.last_call["logql"] == "{job='api'}"
-
-    # Deployments
-    tools.get_recent_deployments("api", "s", "e")
-    assert tools._deployment_adapter.call_count == 1
-    assert tools._deployment_adapter.last_call["service"] == "api"
 
     # Related incidents
     tools.get_related_incidents("api", ["timeout"])

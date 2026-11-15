@@ -33,6 +33,6 @@ def test_tool_result_sets_timezone_aware_timestamp():
 def test_investigation_state_defaults():
     state = InvestigationState("inc", [], [])
     assert state.tool_call_count == 0
-    assert state.max_tool_calls == 6
+    assert state.max_tool_calls == 100
     assert state.completed is False
     assert state.error is None
