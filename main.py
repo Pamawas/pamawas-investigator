@@ -6,6 +6,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 import psycopg2
 from fastapi import FastAPI, Header, HTTPException
@@ -164,6 +165,9 @@ app.add_middleware(
         "/api/v1/investigations": (_rate_rps, _rate_burst),
         "/api/v1/investigate": (_rate_rps, _rate_burst),
         "/api/v1/status": (_rate_rps, _rate_burst),
+        # The daily summary calls the LLM, so it carries a budget like the
+        # investigation endpoints rather than being unmetered.
+        "/api/v1/summaries": (_rate_rps, _rate_burst),
     },
 )
 
@@ -365,6 +369,18 @@ class InvestigationRequest(BaseModel):
     correlation_version: int
 
 
+class DailySummaryRequest(BaseModel):
+    """Facts for the daily report's prose summary (POST /api/v1/summaries).
+
+    Structured facts only, no transcripts: the summary is only as good as what
+    it is given, and sending whole investigations invites invention.
+    """
+
+    period_start: str
+    period_end: str
+    timezone: str
+    incidents: list[dict[str, Any]]
+
 async def _verify_service_token(x_service_token: str | None = Header(None)) -> str:
     """Verify the service token for internal mutation endpoints."""
     expected_token = os.getenv("PAMAWAS_SERVICE_TOKEN", "")
@@ -529,6 +545,23 @@ async def status():
         "version": APP_VERSION,
     }
 
+
+@app.post("/api/v1/summaries")
+async def summarize_day(body: DailySummaryRequest):
+    """Write a short prose summary of a day's incidents.
+
+    The reporter calls this while rendering the daily digest, so the summary is
+    part of the message that goes out rather than a follow-up. All LLM access
+    lives here: the reporter never holds model credentials or prompts.
+
+    Degrades instead of failing: any model problem returns an empty summary and
+    a 200, and the reporter renders its deterministic incident lists alone.
+    """
+    if investigator is None:
+        return {"summary": "", "reason": "investigator_not_initialized"}
+    if not body.incidents:
+        return {"summary": "", "reason": "no_incidents"}
+    return {"summary": investigator.write_day_summary(body.model_dump())}
 
 @app.get("/api/v1/investigations/{run_id}")
 async def get_investigation_status(run_id: str):

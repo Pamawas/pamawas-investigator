@@ -32,6 +32,7 @@ from models import (
     InvestigationState,
     ToolResult,
 )
+from service.daily_summary import write_day_summary as _write_day_summary
 from service.loki_fetcher import LogsFetcher, LokiFetcher
 from service.persistence import InvestigationPersistence
 from service.prometheus_fetcher import MetricsFetcher, PrometheusFetcher
@@ -112,10 +113,19 @@ class InvestigatorLLM:
         messages: list[dict],
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
+        max_tokens: int = 2000,
     ):
         """Call the LLM with optional tool use; failing over across endpoints
         and raising the last error."""
         import time as _time
+
+        # Tool kwargs are only sent when there are tools. Passing
+        # tool_choice="none" alongside tools=None is rejected by some
+        # OpenAI-compatible endpoints, and tool-free callers (the daily
+        # summary) must not depend on that being tolerated.
+        optional = {}
+        if tools is not None:
+            optional = {"tools": tools, "tool_choice": tool_choice}
 
         last_error: Exception | None = None
         for idx, (client, model) in enumerate(zip(self.clients, self.models)):
@@ -125,10 +135,9 @@ class InvestigatorLLM:
                     response = client.chat.completions.create(
                         model=model,
                         messages=messages,
-                        tools=tools,
-                        tool_choice=tool_choice,
                         temperature=0.1,  # Low temperature for deterministic output
-                        max_tokens=2000,
+                        max_tokens=max_tokens,
+                        **optional,
                     )
                     if idx > 0:
                         logger.warning("LLM failover succeeded on %s", endpoint_label)
@@ -439,6 +448,14 @@ class PamawasInvestigator:
                 "tools to gather evidence and form hypotheses."
             ),
         }
+
+    def write_day_summary(self, facts: dict) -> str:
+        """Write the daily report's prose summary from the given facts.
+
+        LLM usage stays in this service; the reporter only calls the endpoint.
+        Returns "" on any failure so the digest still delivers.
+        """
+        return _write_day_summary(self.llm, facts)
 
     def _handle_error_context(self, context: IncidentContext) -> list[Finding]:
         """Handle error context and return error finding."""
