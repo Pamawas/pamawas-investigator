@@ -5,17 +5,15 @@ from .metrics import (
     increment_investigations,
     increment_max_tool_calls_reached,
     increment_tool_calls,
+    investigation_retry_errors_total,
+    investigation_retry_exhausted_total,
+    investigation_retry_reclaimed_total,
+    investigation_retry_scheduled_total,
     observe_loop_duration,
     observe_tool_call_duration,
     observe_truncations,
     set_running,
     set_uptime,
-)
-from .metrics import (
-    investigation_retry_exhausted_total,
-    investigation_retry_reclaimed_total,
-    investigation_retry_scheduled_total,
-    investigation_retry_errors_total,
 )
 
 __all__ = [
@@ -25,13 +23,13 @@ __all__ = [
     "increment_investigations",
     "increment_max_tool_calls_reached",
     "increment_tool_calls",
+    "investigation_retry_errors_total",
+    "investigation_retry_exhausted_total",
+    "investigation_retry_reclaimed_total",
+    "investigation_retry_scheduled_total",
     "observe_loop_duration",
     "observe_tool_call_duration",
     "observe_truncations",
     "set_running",
     "set_uptime",
-    "investigation_retry_exhausted_total",
-    "investigation_retry_reclaimed_total",
-    "investigation_retry_scheduled_total",
-    "investigation_retry_errors_total",
 ]

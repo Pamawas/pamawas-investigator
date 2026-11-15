@@ -154,27 +154,36 @@ class Config:
         Called by from_env after parsing so a bad env var kills startup with a
         clear message instead of degrading behaviour at runtime.
         """
-        if self.port < 1 or self.port > 65535:
-            raise ValueError(f"PORT must be 1..65535, got {self.port}")
-        if self.max_tool_calls < 1:
-            raise ValueError("MAX_TOOL_CALLS must be >= 1")
-        if self.truncation_limit < 1:
-            raise ValueError("TRUNCATION_LIMIT must be >= 1")
-        if self.investigation_timeout_seconds <= 0:
-            raise ValueError("INVESTIGATION_TIMEOUT_SECONDS must be > 0")
-        if self.max_investigation_attempts < 1:
-            raise ValueError("MAX_INVESTIGATION_ATTEMPTS must be >= 1")
-        if self.investigation_retry_backoff_seconds < 1:
-            raise ValueError("INVESTIGATION_RETRY_BACKOFF_SECONDS must be >= 1")
-        if self.retry_scheduler_tick_seconds < 1:
-            raise ValueError("RETRY_SCHEDULER_TICK_SECONDS must be >= 1")
-        if self.circuit_breaker_failure_threshold < 1:
-            raise ValueError("CIRCUIT_BREAKER_FAILURE_THRESHOLD must be >= 1")
-        if self.circuit_breaker_timeout_seconds <= 0:
-            raise ValueError("CIRCUIT_BREAKER_TIMEOUT_SECONDS must be > 0")
-        if self.prometheus_timeout_seconds <= 0 or self.loki_timeout_seconds <= 0:
-            raise ValueError("adapter timeout seconds must be > 0")
-        if self.prometheus_allowed_time_range_hours < 1:
-            raise ValueError("PROMETHEUS_ALLOWED_TIME_RANGE_HOURS must be >= 1")
-        if self.loki_allowed_time_range_hours < 1:
-            raise ValueError("LOKI_ALLOWED_TIME_RANGE_HOURS must be >= 1")
+        # (field, env var, minimum, inclusive) — positive-duration fields use
+        # a minimum just above zero.
+        bounds = [
+            ("port", "PORT", 1),
+            ("max_tool_calls", "MAX_TOOL_CALLS", 1),
+            ("truncation_limit", "TRUNCATION_LIMIT", 1),
+            ("max_investigation_attempts", "MAX_INVESTIGATION_ATTEMPTS", 1),
+            ("investigation_retry_backoff_seconds", "INVESTIGATION_RETRY_BACKOFF_SECONDS", 1),
+            ("retry_scheduler_tick_seconds", "RETRY_SCHEDULER_TICK_SECONDS", 1),
+            ("circuit_breaker_failure_threshold", "CIRCUIT_BREAKER_FAILURE_THRESHOLD", 1),
+            ("circuit_breaker_half_open_max_calls", "CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", 1),
+            ("prometheus_allowed_time_range_hours", "PROMETHEUS_ALLOWED_TIME_RANGE_HOURS", 1),
+            ("loki_allowed_time_range_hours", "LOKI_ALLOWED_TIME_RANGE_HOURS", 1),
+            ("deployment_max_results", "DEPLOYMENT_MAX_RESULTS", 1),
+            ("related_incidents_max_results", "RELATED_INCIDENTS_MAX_RESULTS", 1),
+        ]
+        for field, env_var, minimum in bounds:
+            value = getattr(self, field)
+            if value < minimum:
+                raise ValueError(f"{env_var} must be >= {minimum}, got {value}")
+
+        for field, env_var in [
+            ("investigation_timeout_seconds", "INVESTIGATION_TIMEOUT_SECONDS"),
+            ("circuit_breaker_timeout_seconds", "CIRCUIT_BREAKER_TIMEOUT_SECONDS"),
+            ("prometheus_timeout_seconds", "PROMETHEUS_TIMEOUT_SECONDS"),
+            ("loki_timeout_seconds", "LOKI_TIMEOUT_SECONDS"),
+            ("deployment_timeout_seconds", "DEPLOYMENT_TIMEOUT_SECONDS"),
+        ]:
+            if getattr(self, field) <= 0:
+                raise ValueError(f"{env_var} must be > 0, got {getattr(self, field)}")
+
+        if self.port > 65535:
+            raise ValueError(f"PORT must be <= 65535, got {self.port}")

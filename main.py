@@ -61,6 +61,18 @@ def print_startup_banner(version: str, port: int) -> None:
 investigator: PamawasInvestigator = None
 start_time = time.time()
 
+# Strong references to fire-and-forget asyncio tasks. Without this, a task can
+# be garbage-collected mid-execution (asyncio only keeps weak references).
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background_task(coro) -> asyncio.Task:
+    """Create a tracked background task that removes itself when done."""
+    task = asyncio.get_running_loop().create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -472,11 +484,7 @@ async def create_investigation(
     # New run persisted. Kick off the investigation asynchronously in the
     # background; return 202 with status "queued" per the frozen contract.
     log.info("investigation_started", incident_id=incident_id, reason=reason)
-    import asyncio
-
-    asyncio.get_running_loop().create_task(
-        _run_investigation_task(run_id, incident_id, request_key_hash)
-    )
+    _spawn_background_task(_run_investigation_task(run_id, incident_id, request_key_hash))
 
     return JSONResponse(
         status_code=202,
@@ -617,8 +625,7 @@ async def _investigation_retry_scheduler(tick_seconds: float):
                         # We don't have incident_id here, so look it up from the run.
                         incident_id = _get_run_incident_id(run_id)
                         if incident_id:
-                            loop = asyncio.get_running_loop()
-                            loop.create_task(
+                            _spawn_background_task(
                                 _run_investigation_task(
                                     run_id, incident_id, _get_run_request_key(run_id)
                                 )
