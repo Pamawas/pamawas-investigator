@@ -407,7 +407,7 @@ class PamawasInvestigator:
             )
         ]
 
-    async def _execute_tool(self, function_name: str, function_args: dict):
+    async def _execute_tool(self, function_name: str, function_args: dict):  # noqa: C901
         """Execute a tool call and return the result.
 
         Runs in the asyncio event loop, so it awaits the async adapter
@@ -419,42 +419,80 @@ class PamawasInvestigator:
         """
         try:
             if function_name == "query_prometheus":
-                result = await self.tools._prometheus_adapter.query_range(
-                    function_args["promql"], function_args["start"], function_args["end"]
-                )
+                # Guard against a missing start/end/promql argument. A tool call
+                # from the LLM may omit required keys; a direct [] lookup would
+                # raise KeyError and abort the whole investigation with a useless
+                # "Investigation error: 'start'" finding.
+                promql = function_args.get("promql")
+                start = function_args.get("start")
+                end = function_args.get("end")
+                if promql is None or start is None or end is None:
+                    return {
+                        "status": "error",
+                        "error": "query_prometheus requires promql, start, end",
+                    }, None, False
+                result = await self.tools._prometheus_adapter.query_range(promql, start, end)
                 return result, None, False
 
             elif function_name == "query_loki":
+                logql = function_args.get("logql")
+                start = function_args.get("start")
+                end = function_args.get("end")
+                if logql is None or start is None or end is None:
+                    return {
+                        "status": "error",
+                        "error": "query_loki requires logql, start, end",
+                    }, None, False
                 result = await self.tools._loki_adapter.query_range(
-                    function_args["logql"],
-                    function_args["start"],
-                    function_args["end"],
+                    logql,
+                    start,
+                    end,
                     function_args.get("limit", 100),
                 )
                 return result, None, False
 
-            elif function_name == "get_recent_deployments":
-                result = await self.tools._deployment_adapter.get_recent_deployments(
-                    function_args["service"], function_args["start"], function_args["end"]
-                )
-                return result, None, False
-
             elif function_name == "get_related_incidents":
-                result = await self.tools._related_incidents_adapter.find_related(
-                    function_args["service"], function_args["symptom_keywords"]
-                )
+                service = function_args.get("service")
+                keywords = function_args.get("symptom_keywords") or []
+                if service is None:
+                    return {
+                        "status": "error",
+                        "error": "get_related_incidents requires service",
+                    }, None, False
+                result = await self.tools._related_incidents_adapter.find_related(service, keywords)
                 return result, None, False
 
             elif function_name == "submit_findings":
-                findings = [
-                    Finding(
-                        type=EvidenceType(f["type"]),
-                        content=f["content"],
-                        source=f["source"],
-                        confidence=f["confidence"],
+                raw = function_args.get("findings")
+                if not isinstance(raw, list) or not raw:
+                    return {
+                        "status": "error",
+                        "error": "submit_findings requires a non-empty findings list",
+                    }, None, False
+                findings = []
+                for f in raw:
+                    if not isinstance(f, dict):
+                        return {
+                            "status": "error",
+                            "error": "submit_findings: each finding must be an object",
+                        }, None, False
+                    ftype = f.get("type")
+                    content = f.get("content")
+                    source = f.get("source")
+                    confidence = f.get("confidence")
+                    if not ftype or content is None or not source or confidence is None:
+                        return {
+                            "status": "error",
+                            "error": "submit_findings: finding missing required fields",
+                        }, None, False
+                    findings.append(
+                        Finding(
+                            type=EvidenceType(ftype),
+                            content=content,
+                            source=source,
+                            confidence=confidence,
+                        )
                     )
-                    for f in function_args["findings"]
-                ]
                 result = self.tools.submit_findings(findings)
                 return result, findings, True  # result, findings, is_final
         except (

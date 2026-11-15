@@ -15,7 +15,13 @@ from pydantic import BaseModel
 
 from config import Config as InvestigationConfig
 from logging_middleware import LoggingMiddleware, get_logger
-from metrics import set_running
+from metrics import (
+    investigation_retry_errors_total,
+    investigation_retry_exhausted_total,
+    investigation_retry_reclaimed_total,
+    investigation_retry_scheduled_total,
+    set_running,
+)
 from otel import OTelConfig, init_tracer
 from service.investigator import PamawasInvestigator
 
@@ -65,11 +71,12 @@ async def lifespan(app: FastAPI):
     log.info("starting_pamawas_investigator")
 
     # Initialize OpenTelemetry tracing
+    otel_sample_ratio = float(os.getenv("OTEL_SAMPLE_RATIO", "0.1"))
     otel_config = OTelConfig(
         service_name="pamawas-investigator",
         otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
         insecure=True,
-        sample_ratio=1.0,
+        sample_ratio=otel_sample_ratio,
         enabled=bool(os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT")),
     )
     otel_shutdown = init_tracer(otel_config)
@@ -85,6 +92,13 @@ async def lifespan(app: FastAPI):
         )
 
         investigator = PamawasInvestigator(config)
+
+        # Only advertise the service as running once the database dependency
+        # actually answers; a process that came up with a dead DB reports
+        # investigator_running=0 so alerting reflects reality.
+        db_healthy, _ = _check_database_health(investigator.db_conn)
+        if not db_healthy:
+            raise RuntimeError("database health check failed at startup")
         set_running(True)
         log.info("investigator_ready")
     except (psycopg2.Error, RuntimeError, ValueError, OSError) as e:
@@ -94,7 +108,9 @@ async def lifespan(app: FastAPI):
     # Start the auto-retry scheduler (reclaims due failed_retryable runs).
     retry_scheduler_task = None
     if investigator is not None and investigator.persistence:
-        retry_scheduler_task = asyncio.create_task(_investigation_retry_scheduler())
+        retry_scheduler_task = asyncio.create_task(
+            _investigation_retry_scheduler(config.retry_scheduler_tick_seconds)
+        )
 
     yield
 
@@ -568,7 +584,10 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
                 error=str(e),
                 next_retry_at=next_retry_at,
             )
-            if not scheduled:
+            if scheduled:
+                investigation_retry_scheduled_total.inc()
+            else:
+                investigation_retry_exhausted_total.inc()
                 log.warning(
                     "investigation_retry_budget_exhausted",
                     run_id=run_id,
@@ -577,37 +596,37 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
                 )
 
 
-async def _investigation_retry_scheduler():
+async def _investigation_retry_scheduler(tick_seconds: float):
     """Reclaim due `failed_retryable` runs and re-execute them.
 
     Runs as a background asyncio task for the lifetime of the process. It wakes
-    on a short cadence, atomically reclaims any run whose retry back-off has
-    elapsed, and spawns a fresh _run_investigation_task for each. This both
-    drives in-process retries and self-heals runs that were mid-retry when the
-    process crashed (a failed_retryable run is simply reclaimed again).
+    every `tick_seconds` (from config, RETRY_SCHEDULER_TICK_SECONDS, default
+    15), atomically reclaims any run whose retry back-off has elapsed, and
+    spawns a fresh _run_investigation_task for each. This both drives
+    in-process retries and self-heals runs that were mid-retry when the process
+    crashed (a failed_retryable run is simply reclaimed again).
     """
-    import asyncio
-
     while True:
         try:
             if investigator is not None and investigator.persistence:
                 due = investigator.persistence.list_due_investigation_retries(limit=10)
                 for run_id in due:
                     if investigator.persistence.reclaim_due_investigation_retry(run_id):
+                        investigation_retry_reclaimed_total.inc()
                         # reclaim moved it to running; re-run the investigation.
                         # We don't have incident_id here, so look it up from the run.
                         incident_id = _get_run_incident_id(run_id)
                         if incident_id:
                             loop = asyncio.get_running_loop()
-                            task = loop.create_task(
+                            loop.create_task(
                                 _run_investigation_task(
                                     run_id, incident_id, _get_run_request_key(run_id)
                                 )
                             )
-                            _ = task
         except Exception as e:  # noqa: BLE001
+            investigation_retry_errors_total.inc()
             log.error("investigation_retry_scheduler_error", error=str(e))
-        await asyncio.sleep(15)
+        await asyncio.sleep(tick_seconds)
 
 
 def _get_run_incident_id(run_id: str) -> str | None:

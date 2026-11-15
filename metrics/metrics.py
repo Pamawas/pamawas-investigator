@@ -30,6 +30,26 @@ db_connection_errors = Counter(
     "Total number of database connection errors",
 )
 
+investigation_retry_scheduled_total = Counter(
+    "investigator_retry_scheduled_total",
+    "Total number of investigation retries scheduled after a transient failure",
+)
+
+investigation_retry_reclaimed_total = Counter(
+    "investigator_retry_reclaimed_total",
+    "Total number of due failed_retryable runs reclaimed by the retry scheduler",
+)
+
+investigation_retry_exhausted_total = Counter(
+    "investigator_retry_exhausted_total",
+    "Total number of investigations whose retry budget was exhausted",
+)
+
+investigation_retry_errors_total = Counter(
+    "investigator_retry_errors_total",
+    "Total number of retry scheduler loop errors",
+)
+
 # Histograms
 loop_duration = Histogram(
     "investigator_loop_duration_seconds",

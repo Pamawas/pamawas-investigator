@@ -66,6 +66,8 @@ class Config:
     # Base back-off in seconds between investigation retries (grows exponentially,
     # capped by the retry scheduler).
     investigation_retry_backoff_seconds: int = 60
+    # Wake cadence of the background retry scheduler (seconds).
+    retry_scheduler_tick_seconds: float = 15.0
 
     @classmethod
     def from_env(cls) -> Config:
@@ -139,4 +141,40 @@ class Config:
             investigation_retry_backoff_seconds=int(
                 os.getenv("INVESTIGATION_RETRY_BACKOFF_SECONDS", "60")
             ),
+            retry_scheduler_tick_seconds=float(
+                os.getenv("RETRY_SCHEDULER_TICK_SECONDS", "15")
+            ),
         )
+        cfg.validate()
+        return cfg
+
+    def validate(self) -> None:
+        """Fail fast on out-of-range configuration values.
+
+        Called by from_env after parsing so a bad env var kills startup with a
+        clear message instead of degrading behaviour at runtime.
+        """
+        if self.port < 1 or self.port > 65535:
+            raise ValueError(f"PORT must be 1..65535, got {self.port}")
+        if self.max_tool_calls < 1:
+            raise ValueError("MAX_TOOL_CALLS must be >= 1")
+        if self.truncation_limit < 1:
+            raise ValueError("TRUNCATION_LIMIT must be >= 1")
+        if self.investigation_timeout_seconds <= 0:
+            raise ValueError("INVESTIGATION_TIMEOUT_SECONDS must be > 0")
+        if self.max_investigation_attempts < 1:
+            raise ValueError("MAX_INVESTIGATION_ATTEMPTS must be >= 1")
+        if self.investigation_retry_backoff_seconds < 1:
+            raise ValueError("INVESTIGATION_RETRY_BACKOFF_SECONDS must be >= 1")
+        if self.retry_scheduler_tick_seconds < 1:
+            raise ValueError("RETRY_SCHEDULER_TICK_SECONDS must be >= 1")
+        if self.circuit_breaker_failure_threshold < 1:
+            raise ValueError("CIRCUIT_BREAKER_FAILURE_THRESHOLD must be >= 1")
+        if self.circuit_breaker_timeout_seconds <= 0:
+            raise ValueError("CIRCUIT_BREAKER_TIMEOUT_SECONDS must be > 0")
+        if self.prometheus_timeout_seconds <= 0 or self.loki_timeout_seconds <= 0:
+            raise ValueError("adapter timeout seconds must be > 0")
+        if self.prometheus_allowed_time_range_hours < 1:
+            raise ValueError("PROMETHEUS_ALLOWED_TIME_RANGE_HOURS must be >= 1")
+        if self.loki_allowed_time_range_hours < 1:
+            raise ValueError("LOKI_ALLOWED_TIME_RANGE_HOURS must be >= 1")

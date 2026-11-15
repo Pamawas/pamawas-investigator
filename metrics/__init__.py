@@ -11,6 +11,12 @@ from .metrics import (
     set_running,
     set_uptime,
 )
+from .metrics import (
+    investigation_retry_exhausted_total,
+    investigation_retry_reclaimed_total,
+    investigation_retry_scheduled_total,
+    investigation_retry_errors_total,
+)
 
 __all__ = [
     "increment_db_errors",
@@ -24,4 +30,8 @@ __all__ = [
     "observe_truncations",
     "set_running",
     "set_uptime",
+    "investigation_retry_exhausted_total",
+    "investigation_retry_reclaimed_total",
+    "investigation_retry_scheduled_total",
+    "investigation_retry_errors_total",
 ]
