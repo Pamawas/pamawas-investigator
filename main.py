@@ -547,16 +547,24 @@ async def status():
 
 
 @app.post("/api/v1/summaries")
-async def summarize_day(body: DailySummaryRequest):
+async def summarize_day(
+    body: DailySummaryRequest,
+    x_service_token: str | None = Header(None),
+):
     """Write a short prose summary of a day's incidents.
 
     The reporter calls this while rendering the daily digest, so the summary is
     part of the message that goes out rather than a follow-up. All LLM access
     lives here: the reporter never holds model credentials or prompts.
 
+    Service-token protected like every other mutation endpoint: this call costs
+    an LLM request, so it must not be reachable by anything in the cluster.
+
     Degrades instead of failing: any model problem returns an empty summary and
     a 200, and the reporter renders its deterministic incident lists alone.
     """
+    await _verify_service_token(x_service_token)
+
     if investigator is None:
         return {"summary": "", "reason": "investigator_not_initialized"}
     if not body.incidents:
