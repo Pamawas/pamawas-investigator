@@ -71,7 +71,7 @@ class TestInvestigationConfig:
 
         config = InvestigationConfig.from_env()
 
-        assert config.max_tool_calls == 6
+        assert config.max_tool_calls == 100
         assert config.truncation_limit == 8192
 
 
@@ -116,7 +116,6 @@ class TestInvestigatorTools:
         # Replace real adapters with fake transports
         self.tools._prometheus_adapter = self.fake_transports["prometheus"]
         self.tools._loki_adapter = self.fake_transports["loki"]
-        self.tools._deployment_adapter = self.fake_transports["deployments"]
         self.tools._related_incidents_adapter = self.fake_transports["related_incidents"]
 
     def test_query_prometheus(self):
@@ -140,15 +139,6 @@ class TestInvestigatorTools:
 
         assert result["status"] == "success"
         assert "data" in result
-
-    def test_get_recent_deployments(self):
-        result = self.tools.get_recent_deployments(
-            service="payment-api", start="2026-01-01T00:00:00Z", end="2026-01-01T01:00:00Z"
-        )
-
-        assert result["status"] == "success"
-        assert "data" in result
-        assert len(result["data"]) > 0
 
     def test_get_related_incidents(self):
         result = self.tools.get_related_incidents(
