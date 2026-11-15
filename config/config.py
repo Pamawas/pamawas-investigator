@@ -82,7 +82,7 @@ class Config:
         if port_str.startswith("tcp://"):
             port_str = port_str.split(":")[-1]
 
-        return cls(
+        cfg = cls(
             database_url=database_url,
             port=int(port_str),
             llm_base_url=os.getenv("LLM_BASE_URL", "https://api.openai.com/v1"),
