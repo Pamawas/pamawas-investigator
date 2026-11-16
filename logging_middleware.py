@@ -44,6 +44,16 @@ trace_propagator = TraceContextTextMapPropagator()
 PROBE_PATHS = frozenset({"/health", "/healthz", "/livez", "/ready", "/readyz", "/metrics"})
 
 
+def is_probe_path(path: str) -> bool:
+    """True for a probe path, with or without a trailing slash.
+
+    FastAPI redirects /metrics to /metrics/, and the redirect target is a second
+    request that would otherwise be traced. Normalizing here keeps both halves
+    of that exchange out of the trace backend.
+    """
+    return path.rstrip("/") in PROBE_PATHS or path in PROBE_PATHS
+
+
 def get_trace_context() -> dict[str, str]:
     """Return the trace and span IDs of the current span, for structured logs.
 
@@ -84,7 +94,7 @@ class LoggingMiddleware(BaseHTTPMiddleware):
         # fills the backend with spans that explain nothing and, at a sample
         # ratio below 1, competes with the traffic that does matter. The Go
         # services make the same exception, so Tempo holds only real work.
-        if request.url.path in PROBE_PATHS:
+        if is_probe_path(request.url.path):
             # Still logged, so "did the probe reach us" stays answerable, but
             # without a span and without a trace ID it does not have.
             response = await call_next(request)
