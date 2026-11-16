@@ -279,3 +279,69 @@ def test_tool_call_resets_the_text_patience_budget(investigator):
     assert state.consecutive_text_turns == 3
     # Three in a row is the limit: this one completes rather than asking again.
     assert state.completed is True
+
+
+def test_reasoning_preamble_is_not_recorded_as_a_finding(investigator):
+    """Chain-of-thought must not become the "Likely cause" on a critical card.
+
+    A real run stored "Let me analyze the data more carefully. I need to convert
+    the Unix timestamps to understand the timeline..." as a hypothesis, and the
+    reporter promoted it to the top of a critical alert — a wall of working
+    notes where a paged engineer expects a conclusion.
+    """
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    state.consecutive_text_turns = investigator.MAX_CONSECUTIVE_TEXT_TURNS - 1
+
+    investigator._handle_text_response(
+        response(
+            "Let me analyze the data more carefully. I need to convert the Unix "
+            "timestamps to understand the timeline. The incident started at "
+            "2026-11-16 01:37:20+00:00."
+        ),
+        state,
+        is_final_turn=False,
+        messages=[],
+    )
+
+    assert state.completed is True
+    assert state.findings == [], "reasoning preamble is not a finding"
+
+
+def test_unwraps_tool_call_nested_in_a_functions_envelope():
+    """Some endpoints nest the real call inside a generic `functions` call.
+
+    Treated literally every such call was an unknown tool: production runs
+    burned ten tool calls this way, each one a round trip that returned an
+    error to a call the model had made correctly.
+    """
+    from service.investigator import unwrap_tool_call_envelope
+
+    name, args = unwrap_tool_call_envelope(
+        "functions",
+        {"name": "query_loki", "arguments": {"logql": "{job=\"x\"}", "limit": 20}},
+    )
+    assert name == "query_loki"
+    assert args == {"logql": "{job=\"x\"}", "limit": 20}
+
+
+def test_unwraps_a_no_argument_tool():
+    from service.investigator import unwrap_tool_call_envelope
+
+    name, args = unwrap_tool_call_envelope("functions", {"name": "get_loki_labels"})
+    assert name == "get_loki_labels"
+    assert args == {}
+
+
+def test_leaves_ordinary_tool_calls_alone():
+    from service.investigator import unwrap_tool_call_envelope
+
+    name, args = unwrap_tool_call_envelope("query_loki", {"logql": "{job=\"x\"}"})
+    assert name == "query_loki"
+    assert args == {"logql": "{job=\"x\"}"}
+
+    # A `functions` call with no inner name is not an envelope; leave it as an
+    # unknown tool so the model gets a real error instead of a silent guess.
+    name, args = unwrap_tool_call_envelope("functions", {"label": "unit"})
+    assert name == "functions"

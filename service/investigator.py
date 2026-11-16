@@ -47,6 +47,79 @@ except ImportError:
     UTC = tz.utc
 
 
+# Openers that mean the model is narrating its process rather than stating a
+# conclusion. A text-only reply that begins with one of these is working notes,
+# not a finding: rendered under "🎯 Likely cause" on a critical alert card it
+# read as a wall of chain-of-thought ("Let me analyze the data more carefully.
+# I need to convert the Unix timestamps to understand the timeline...").
+_REASONING_OPENERS = (
+    "let me",
+    "i need to",
+    "i should",
+    "i will",
+    "first, i",
+    "now let me",
+    "looking at",
+    "let's",
+    "to understand",
+    "to determine",
+    "i'll",
+    "we need to",
+)
+
+
+def _is_reasoning_preamble(text: str) -> bool:
+    """True when a reply is process narration with no conclusion in it."""
+    lowered = " ".join((text or "").lower().split())
+    if not lowered:
+        return False
+    if not any(lowered.startswith(opener) for opener in _REASONING_OPENERS):
+        return False
+    # A preamble that nonetheless states a conclusion is still worth keeping.
+    return not any(
+        marker in lowered
+        for marker in ("the cause", "likely cause", "the root cause", "conclusion", "therefore")
+    )
+
+
+def unwrap_tool_call_envelope(name: str, args: dict) -> tuple[str, dict]:
+    """Unwrap a tool call that arrived wrapped in a second function envelope.
+
+    Some [OI]-compatible endpoints return the whole tool call as the arguments
+    of a generic `functions` call:
+
+        {"name": "functions", "arguments": {"name": "query_loki",
+                                            "arguments": {"logql": "..."}}}
+
+    Treated literally, every such call is an unknown tool and the model gets an
+    error back for a call it made correctly — production runs burned ten calls
+    this way, each one a round trip that produced nothing.
+    """
+    if name != "functions" or not isinstance(args, dict):
+        return name, args
+
+    inner_name = args.get("name")
+    if not isinstance(inner_name, str) or not inner_name:
+        return name, args
+
+    inner_args = args.get("arguments")
+    if inner_args is None:
+        # A no-argument tool (get_loki_labels) arrives as {"name": "..."} with
+        # no arguments key at all.
+        logger.warning("Unwrapped nested tool call envelope: functions -> %s", inner_name)
+        return inner_name, {}
+    if isinstance(inner_args, str):
+        try:
+            inner_args = json.loads(inner_args)
+        except json.JSONDecodeError:
+            return name, args
+    if not isinstance(inner_args, dict):
+        return name, args
+
+    logger.warning("Unwrapped nested tool call envelope: functions -> %s", inner_name)
+    return inner_name, inner_args
+
+
 class InvestigatorLLM:
     """OpenAI-compatible LLM client with endpoint redundancy for investigator."""
 
@@ -664,10 +737,22 @@ class PamawasInvestigator:
                 "Text response without tool use (%d consecutive) - recording it as a hypothesis",
                 state.consecutive_text_turns,
             )
+            content = (response.content or "").strip()
+            if _is_reasoning_preamble(content):
+                # The model narrated its process instead of stating a
+                # conclusion ("Let me analyze the data more carefully. I need to
+                # convert the Unix timestamps..."). Storing that as a finding
+                # put a wall of chain-of-thought under "🎯 Likely cause" on a
+                # critical card. There is no conclusion here to record.
+                logger.warning(
+                    "Discarding reasoning preamble as a finding: %s", content[:120]
+                )
+                state.completed = True
+                return
             state.findings.append(
                 Finding(
                     type=EvidenceType.HYPOTHESIS,
-                    content=response.content or "Investigation completed via text response",
+                    content=content or "Investigation completed via text response",
                     source=EvidenceSource.LLM,
                     confidence=0.3,
                 )
@@ -934,6 +1019,9 @@ class PamawasInvestigator:
             for tool_call in response.tool_calls:
                 function_name = tool_call.function.name
                 function_args = json.loads(tool_call.function.arguments)
+                function_name, function_args = unwrap_tool_call_envelope(
+                    function_name, function_args
+                )
 
                 logger.info(f"Calling tool: {function_name} with args: {function_args}")
 

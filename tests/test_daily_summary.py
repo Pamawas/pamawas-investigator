@@ -91,3 +91,45 @@ def test_write_day_summary_asks_for_no_tools():
     assert kwargs["tools"] is None
     assert "tool_choice" not in kwargs
     assert MAX_SENTENCES == 3
+
+
+def test_prompt_echo_is_dropped():
+    """A model that restates its instructions must not reach the digest.
+
+    A delivered report opened with "We need answer user's request. Need produce
+    final summary at most three sentences, no bullets/headings, no preamble..."
+    — instructions, not a summary, sitting above the incident list where a
+    reader expects the state of production.
+    """
+    echo = (
+        "We need answer user's request. Need produce final summary at most "
+        "three sentences, no bullets/headings/preamble. Lead with whether "
+        "anything still broken and needs action today."
+    )
+    llm = MagicMock()
+    llm.chat_completion.return_value = SimpleNamespace(content=echo)
+
+    assert write_day_summary(llm, FACTS) == ""
+
+
+def test_real_summary_survives_the_echo_filter():
+    summary = (
+        "Nothing is broken this morning; all incidents recovered overnight. "
+        "Two monitoring conditions kept recurring, on last-labs and koba-labs. "
+        "No action is needed today."
+    )
+    llm = MagicMock()
+    llm.chat_completion.return_value = SimpleNamespace(content=summary)
+
+    assert write_day_summary(llm, FACTS) == summary
+
+
+def test_looks_like_prompt_echo_requires_two_markers():
+    """One incidental phrase must not discard an otherwise good summary."""
+    from service.daily_summary import looks_like_prompt_echo
+
+    assert not looks_like_prompt_echo("The node ran out of memory at 02:14.")
+    assert not looks_like_prompt_echo("")
+    assert looks_like_prompt_echo(
+        "No bullets, no headings. Write the summary in the past tense."
+    )

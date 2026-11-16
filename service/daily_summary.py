@@ -95,4 +95,46 @@ def write_day_summary(llm, facts: dict[str, Any]) -> str:
         return ""
 
     content = getattr(response, "content", "") or ""
-    return clamp_sentences(content)
+    summary = clamp_sentences(content)
+    if looks_like_prompt_echo(summary):
+        logger.warning("Daily summary echoed the prompt; dropping it: %s", summary[:200])
+        return ""
+    return summary
+
+
+# Phrases that only appear in an instruction, never in a summary of an
+# incident report. A model that echoes its prompt produces text like
+# "We need answer user's request. Need produce final summary at most three
+# sentences..." and that landed as the first line of a delivered digest.
+_PROMPT_ECHO_MARKERS = (
+    "we need answer",
+    "need produce",
+    "no bullet points",
+    "no bullets",
+    "no headings",
+    "no preamble",
+    "at most three sentences",
+    "at most 3 sentences",
+    "write the summary",
+    "user's request",
+    "user request",
+    "lead with whether",
+    "use only the facts given",
+    "do not speculate",
+    "in the past tense",
+    "system prompt",
+)
+
+
+def looks_like_prompt_echo(text: str) -> bool:
+    """True when the reply is instructions rather than a summary.
+
+    A digest whose opening line restates the prompt is worse than a digest with
+    no summary at all: it looks like a rendering bug to the reader and buries
+    the actual state of production underneath it.
+    """
+    lowered = " ".join((text or "").lower().split())
+    if not lowered:
+        return False
+    hits = sum(1 for marker in _PROMPT_ECHO_MARKERS if marker in lowered)
+    return hits >= 2
