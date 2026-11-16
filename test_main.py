@@ -108,7 +108,11 @@ class TestInvestigatorLLM:
         mock_openai.assert_called_once_with(
             base_url="https://api.openai.com/v1",
             api_key="test-key",
-            timeout=30.0,
+            # The SDK floor, from LLM_REQUEST_TIMEOUT_SECONDS. It is a floor and
+            # not a cap: each call is given a share of the remaining
+            # investigation budget when that is larger, so a slow endpoint can
+            # finish instead of being cut off mid-generation.
+            timeout=60.0,
         )
 
 
