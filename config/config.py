@@ -204,6 +204,7 @@ class Config:
 
         for field, env_var in [
             ("investigation_timeout_seconds", "INVESTIGATION_TIMEOUT_SECONDS"),
+            ("llm_request_timeout_seconds", "LLM_REQUEST_TIMEOUT_SECONDS"),
             ("circuit_breaker_timeout_seconds", "CIRCUIT_BREAKER_TIMEOUT_SECONDS"),
             ("prometheus_timeout_seconds", "PROMETHEUS_TIMEOUT_SECONDS"),
             ("loki_timeout_seconds", "LOKI_TIMEOUT_SECONDS"),
