@@ -389,8 +389,12 @@ def test_mutation_endpoints_require_the_service_token():
     service.investigate_async = AsyncMock()
     os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
 
-    body = {"contract_version": 1, "incident_id": "inc-1",
-            "reason": "incident_created", "correlation_version": 1}
+    body = {
+        "contract_version": 1,
+        "incident_id": "inc-1",
+        "reason": "incident_created",
+        "correlation_version": 1,
+    }
     with client_with(service) as client:
         response = client.post("/api/v1/investigations", json=body)
         assert response.status_code == 401, "accepted an anonymous call"
@@ -401,9 +405,15 @@ def test_mutation_endpoints_require_the_service_token():
         assert response.status_code == 401, "accepted a wrong token"
 
         # Costs an LLM request, so it is protected too.
-        response = client.post("/api/v1/summaries", json={
-            "period_start": "a", "period_end": "b", "timezone": "UTC", "incidents": [],
-        })
+        response = client.post(
+            "/api/v1/summaries",
+            json={
+                "period_start": "a",
+                "period_end": "b",
+                "timezone": "UTC",
+                "incidents": [],
+            },
+        )
         assert response.status_code == 401
 
 

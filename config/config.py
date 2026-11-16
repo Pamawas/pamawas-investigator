@@ -154,15 +154,11 @@ class Config:
             investigation_timeout_seconds=float(
                 os.getenv("INVESTIGATION_TIMEOUT_SECONDS", "600.0")
             ),
-            max_investigation_attempts=int(
-                os.getenv("MAX_INVESTIGATION_ATTEMPTS", "5")
-            ),
+            max_investigation_attempts=int(os.getenv("MAX_INVESTIGATION_ATTEMPTS", "5")),
             investigation_retry_backoff_seconds=int(
                 os.getenv("INVESTIGATION_RETRY_BACKOFF_SECONDS", "60")
             ),
-            retry_scheduler_tick_seconds=float(
-                os.getenv("RETRY_SCHEDULER_TICK_SECONDS", "15")
-            ),
+            retry_scheduler_tick_seconds=float(os.getenv("RETRY_SCHEDULER_TICK_SECONDS", "15")),
         )
         cfg.validate()
         return cfg

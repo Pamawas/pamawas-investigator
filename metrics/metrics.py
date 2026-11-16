@@ -15,6 +15,16 @@ max_tool_calls_reached = Counter(
     "Total number of investigations that hit max tool calls without submitting findings",
 )
 
+deadline_exceeded = Counter(
+    "pamawas_investigator_deadline_exceeded_total",
+    "Total number of investigations that ran out of wall-clock budget without submitting findings",
+)
+
+forced_submissions = Counter(
+    "pamawas_investigator_forced_submissions_total",
+    "Total number of investigations whose findings submission was forced by the deadline reserve",
+)
+
 tool_calls_total = Counter(
     "pamawas_investigator_tool_calls_total",
     "Total number of tool calls made",
@@ -83,6 +93,14 @@ investigator_uptime = Gauge(
 
 def increment_max_tool_calls_reached():
     max_tool_calls_reached.inc()
+
+
+def increment_deadline_exceeded():
+    deadline_exceeded.inc()
+
+
+def increment_forced_submission():
+    forced_submissions.inc()
 
 
 def increment_investigations():

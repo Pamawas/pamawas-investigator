@@ -91,13 +91,19 @@ def test_loki_fetch_returns_log_entry_models():
 
 def test_fetchers_skip_without_a_service():
     """No service means no truthful selector, so enrichment yields nothing."""
-    assert asyncio.run(
-        PrometheusFetcher(base_url="http://prometheus:9090").fetch_async(
-            incident_id="inc_1", start="", end="", service=None
+    assert (
+        asyncio.run(
+            PrometheusFetcher(base_url="http://prometheus:9090").fetch_async(
+                incident_id="inc_1", start="", end="", service=None
+            )
         )
-    ) == []
-    assert asyncio.run(
-        LokiFetcher(base_url="http://loki:3100").fetch_async(
-            incident_id="inc_1", start="", end="", service=None
+        == []
+    )
+    assert (
+        asyncio.run(
+            LokiFetcher(base_url="http://loki:3100").fetch_async(
+                incident_id="inc_1", start="", end="", service=None
+            )
         )
-    ) == []
+        == []
+    )

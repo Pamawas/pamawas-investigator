@@ -145,9 +145,7 @@ class InvestigatorTools:
                 asyncio.set_event_loop(loop)
 
             if label:
-                result = loop.run_until_complete(
-                    self._loki_adapter.query_label_values(label)
-                )
+                result = loop.run_until_complete(self._loki_adapter.query_label_values(label))
             else:
                 result = loop.run_until_complete(self._loki_adapter.query_labels())
 
@@ -401,8 +399,8 @@ class ToolRegistry:
                                             "type": "string",
                                             "description": (
                                                 "The specific query/stream/metric it rests "
-                                                "on, e.g. 'up{job=\"system_node\", "
-                                                "instance=\"koba-labs\"}' or "
+                                                'on, e.g. \'up{job="system_node", '
+                                                'instance="koba-labs"}\' or '
                                                 "'kubernetes_container_name=netbird-agent'"
                                             ),
                                         },

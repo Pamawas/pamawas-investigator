@@ -30,6 +30,7 @@ class EvidenceType(StrEnum):
     UNKNOWN = "unknown"
     RECOMMENDATION = "recommendation"
 
+
 class EvidenceSource(StrEnum):
     """Which system a finding's evidence came from.
 

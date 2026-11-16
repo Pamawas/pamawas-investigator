@@ -130,6 +130,4 @@ def test_looks_like_prompt_echo_requires_two_markers():
 
     assert not looks_like_prompt_echo("The node ran out of memory at 02:14.")
     assert not looks_like_prompt_echo("")
-    assert looks_like_prompt_echo(
-        "No bullets, no headings. Write the summary in the past tense."
-    )
+    assert looks_like_prompt_echo("No bullets, no headings. Write the summary in the past tense.")

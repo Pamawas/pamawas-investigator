@@ -247,9 +247,7 @@ class LokiFetcher(LogsFetcher):
 
         return logs
 
-    def fetch(
-        self, incident_id: str, start: str, end: str, limit: int = 100
-    ) -> list[LogEntry]:
+    def fetch(self, incident_id: str, start: str, end: str, limit: int = 100) -> list[LogEntry]:
         """Synchronous wrapper for async fetch."""
         try:
             loop = asyncio.get_running_loop()

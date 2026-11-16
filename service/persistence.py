@@ -221,8 +221,7 @@ class InvestigationPersistence:
             conn = self._get_connection()
             with conn.cursor() as cursor:
                 cursor.execute(
-                    "SELECT status, attempts, max_attempts "
-                    "FROM investigation_runs WHERE id = %s",
+                    "SELECT status, attempts, max_attempts FROM investigation_runs WHERE id = %s",
                     (run_id,),
                 )
                 row = cursor.fetchone()

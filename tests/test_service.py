@@ -47,11 +47,12 @@ def test_llm_initialization_and_completion(config):
 def test_llm_failover_to_next_endpoint_when_first_is_unavailable(config):
     """When the first endpoint exhausts its retries on a retryable (5xx)
     error, the client must fail over to the next endpoint instead of raising."""
+
     def make_retryable(msg):
-        response = httpx.Response(503, request=httpx.Request("POST", "https://x/v1/chat/completions"))
-        return openai.APIStatusError(
-            message=msg, response=response, body=object()
+        response = httpx.Response(
+            503, request=httpx.Request("POST", "https://x/v1/chat/completions")
         )
+        return openai.APIStatusError(message=msg, response=response, body=object())
 
     client1 = MagicMock()
     client1.chat.completions.create.side_effect = make_retryable("endpoint 1 down")
@@ -259,9 +260,7 @@ def test_repeated_text_only_turns_stop_early(investigator):
 
     findings = investigator.investigate("inc")
 
-    assert investigator.llm.chat_completion.call_count == (
-        investigator.MAX_CONSECUTIVE_TEXT_TURNS
-    )
+    assert investigator.llm.chat_completion.call_count == (investigator.MAX_CONSECUTIVE_TEXT_TURNS)
     assert findings[0].type is EvidenceType.HYPOTHESIS
     assert findings[0].content == "I think the node rebooted"
 
@@ -274,7 +273,7 @@ def test_tool_call_resets_the_text_patience_budget(investigator):
     state.consecutive_text_turns = 2
 
     investigator._handle_text_response(
-        response("still here"), state, is_final_turn=False, messages=[]
+        response("still here"), state, must_submit=False, messages=[]
     )
     assert state.consecutive_text_turns == 3
     # Three in a row is the limit: this one completes rather than asking again.
@@ -301,12 +300,17 @@ def test_reasoning_preamble_is_not_recorded_as_a_finding(investigator):
             "2026-11-16 01:37:20+00:00."
         ),
         state,
-        is_final_turn=False,
+        must_submit=False,
         messages=[],
     )
 
     assert state.completed is True
-    assert state.findings == [], "reasoning preamble is not a finding"
+    # The reasoning itself is not stored, but the run still gets one honest
+    # terminal row so the report says the investigation ended without a
+    # conclusion rather than showing no evidence at all.
+    assert len(state.findings) == 1
+    assert state.findings[0].type is EvidenceType.UNKNOWN
+    assert "Let me analyze" not in state.findings[0].content
 
 
 def test_unwraps_tool_call_nested_in_a_functions_envelope():
@@ -320,10 +324,10 @@ def test_unwraps_tool_call_nested_in_a_functions_envelope():
 
     name, args = unwrap_tool_call_envelope(
         "functions",
-        {"name": "query_loki", "arguments": {"logql": "{job=\"x\"}", "limit": 20}},
+        {"name": "query_loki", "arguments": {"logql": '{job="x"}', "limit": 20}},
     )
     assert name == "query_loki"
-    assert args == {"logql": "{job=\"x\"}", "limit": 20}
+    assert args == {"logql": '{job="x"}', "limit": 20}
 
 
 def test_unwraps_a_no_argument_tool():
@@ -337,11 +341,146 @@ def test_unwraps_a_no_argument_tool():
 def test_leaves_ordinary_tool_calls_alone():
     from service.investigator import unwrap_tool_call_envelope
 
-    name, args = unwrap_tool_call_envelope("query_loki", {"logql": "{job=\"x\"}"})
+    name, args = unwrap_tool_call_envelope("query_loki", {"logql": '{job="x"}'})
     assert name == "query_loki"
-    assert args == {"logql": "{job=\"x\"}"}
+    assert args == {"logql": '{job="x"}'}
 
     # A `functions` call with no inner name is not an envelope; leave it as an
     # unknown tool so the model gets a real error instead of a silent guess.
     name, args = unwrap_tool_call_envelope("functions", {"label": "unit"})
     assert name == "functions"
+
+
+def _advancing_clock(monkeypatch, step=0.5):
+    """Replace time.monotonic with a clock that advances on every read.
+
+    The deadline logic compares against the wall clock, so a test that runs in
+    microseconds never reaches the reserve. A fake clock makes the turn at
+    which the reserve opens deterministic instead of timing-dependent.
+    """
+    now = [1000.0]
+
+    def fake_monotonic():
+        now[0] += step
+        return now[0]
+
+    monkeypatch.setattr("service.investigator.time.monotonic", fake_monotonic)
+
+
+def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigator, monkeypatch):
+    """The bug this fixes: runs that hit the wall-clock deadline reported nothing.
+
+    A production investigation ran 10m21s, made 18 successful Prometheus and
+    Loki queries, and ended with "deadline exceeded without submitting
+    findings" — every result it had gathered was discarded. The deadline was
+    only checked at the top of a turn, so the model was never told to stop.
+
+    Now the last part of the budget is reserved for writing up, and the turn
+    that enters the reserve is required to call submit_findings.
+    """
+    from unittest.mock import AsyncMock
+
+    investigator.config.max_tool_calls = 50
+    investigator.config.investigation_timeout_seconds = 4.0
+    investigator.DEADLINE_RESERVE_MIN_SECONDS = 2.0
+    _advancing_clock(monkeypatch, step=0.5)
+
+    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": [1]}
+    )
+
+    seen_tool_choices = []
+
+    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000):
+        seen_tool_choices.append(tool_choice)
+        if isinstance(tool_choice, dict):
+            return response(
+                tool_calls=[
+                    tool_call(
+                        "submit_findings",
+                        {
+                            "findings": [
+                                {
+                                    "type": "fact",
+                                    "content": "load1 spiked to 25 on a 2-CPU node",
+                                    "source": "prometheus",
+                                    "confidence": 0.9,
+                                }
+                            ]
+                        },
+                    )
+                ]
+            )
+        return response(
+            tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
+        )
+
+    investigator.llm.chat_completion = MagicMock(side_effect=fake_completion)
+
+    findings = investigator.investigate("inc")
+
+    forced = [c for c in seen_tool_choices if isinstance(c, dict)]
+    assert forced, "the loop must force submit_findings once the reserve is reached"
+    assert findings[0].type is EvidenceType.FACT
+    assert "load1" in findings[0].content
+    assert investigator.tools._prometheus_adapter.query_range.await_count < 50, (
+        "the reserve must stop exploration before the turn budget runs out"
+    )
+
+
+def test_forced_turn_that_ignores_tool_choice_does_not_spend_the_reserve(investigator, monkeypatch):
+    """Some endpoints ignore tool_choice and return another tool call.
+
+    Executing it would burn the reserve that exists to write the findings, and
+    the run would end with nothing — so the reply is treated as the final
+    answer instead.
+    """
+    from unittest.mock import AsyncMock
+
+    investigator.config.max_tool_calls = 50
+    investigator.config.investigation_timeout_seconds = 4.0
+    investigator.DEADLINE_RESERVE_MIN_SECONDS = 2.0
+    _advancing_clock(monkeypatch, step=0.5)
+
+    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": [1]}
+    )
+
+    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000):
+        # Never submits, and ignores the forced tool_choice.
+        return response(
+            tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
+        )
+
+    investigator.llm.chat_completion = MagicMock(side_effect=fake_completion)
+
+    findings = investigator.investigate("inc")
+
+    assert findings, "a run must never finish with no finding at all"
+    assert findings[0].type is EvidenceType.UNKNOWN
+    assert investigator.tools._prometheus_adapter.query_range.await_count < 50, (
+        "the forced turn's query must not be executed"
+    )
+
+
+def test_nested_envelope_is_recognised_as_submit_findings():
+    """The forced-submit guard must look through the envelope too.
+
+    Otherwise a correctly-submitted finding wrapped as
+    {"name": "functions", "arguments": {"name": "submit_findings", ...}} is
+    treated as a stray query and the run is cut off with no findings.
+    """
+    from service.investigator import _resolve_tool_call, _resolved_tool_name
+
+    nested = tool_call(
+        "functions",
+        {"name": "submit_findings", "arguments": {"findings": []}},
+    )
+    assert _resolved_tool_name(nested) == "submit_findings"
+    assert _resolve_tool_call(nested) == ("submit_findings", {"findings": []})
+
+    plain = tool_call("submit_findings", {"findings": []})
+    assert _resolved_tool_name(plain) == "submit_findings"
+    assert _resolve_tool_call(plain) == ("submit_findings", {"findings": []})

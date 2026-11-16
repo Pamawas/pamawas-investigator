@@ -43,7 +43,7 @@ def build_user_prompt(facts: dict[str, Any]) -> str:
     ]
     for inc in incidents:
         line = (
-            f"- \"{inc.get('title', '')}\" | severity={inc.get('severity', '')} "
+            f'- "{inc.get("title", "")}" | severity={inc.get("severity", "")} '
             f"| status={inc.get('status', '')} | affected={inc.get('affected', '')} "
             f"| started={inc.get('started_at', '')}"
         )

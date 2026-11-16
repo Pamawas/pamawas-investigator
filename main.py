@@ -317,6 +317,7 @@ class DailySummaryRequest(BaseModel):
     timezone: str
     incidents: list[dict[str, Any]]
 
+
 async def _verify_service_token(x_service_token: str | None = Header(None)) -> str:
     """Verify the service token for internal mutation endpoints."""
     expected_token = os.getenv("PAMAWAS_SERVICE_TOKEN", "")
@@ -507,6 +508,7 @@ async def summarize_day(
         return {"summary": "", "reason": "no_incidents"}
     return {"summary": investigator.write_day_summary(body.model_dump())}
 
+
 @app.get("/api/v1/investigations/{run_id}")
 async def get_investigation_status(run_id: str):
     """Fetch the current status of an investigation run.
@@ -536,7 +538,7 @@ def _retry_backoff_seconds(attempts: int, base: int) -> float:
     """Exponential back-off for investigation retries: base * 2^attempts, capped at 1h."""
     if attempts > 5:
         return 3600.0
-    delay = base * (2 ** attempts)
+    delay = base * (2**attempts)
     return float(min(delay, 3600))
 
 
@@ -643,11 +645,11 @@ def _get_run_incident_id(run_id: str) -> str | None:
             row = cursor.fetchone()
         conn.commit()
         return row[0] if row else None
-    except (psycopg2.Error, RuntimeError):
+    except psycopg2.Error, RuntimeError:
         if conn is not None:
             try:
                 conn.rollback()
-            except (psycopg2.Error, AttributeError):
+            except psycopg2.Error, AttributeError:
                 pass
         return None
     finally:
@@ -670,11 +672,11 @@ def _get_run_request_key(run_id: str) -> str:
             row = cursor.fetchone()
         conn.commit()
         return row[0] if row else ""
-    except (psycopg2.Error, RuntimeError):
+    except psycopg2.Error, RuntimeError:
         if conn is not None:
             try:
                 conn.rollback()
-            except (psycopg2.Error, AttributeError):
+            except psycopg2.Error, AttributeError:
                 pass
         return ""
     finally:

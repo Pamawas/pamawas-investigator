@@ -20,7 +20,9 @@ from adapters import (
 from config import Config
 from metrics import (
     increment_db_errors,
+    increment_deadline_exceeded,
     increment_findings_by_type,
+    increment_forced_submission,
     increment_investigations,
     increment_max_tool_calls_reached,
 )
@@ -118,6 +120,26 @@ def unwrap_tool_call_envelope(name: str, args: dict) -> tuple[str, dict]:
 
     logger.warning("Unwrapped nested tool call envelope: functions -> %s", inner_name)
     return inner_name, inner_args
+
+
+def _resolve_tool_call(tool_call) -> tuple[str, dict]:
+    """Return the real tool name and arguments for a tool call."""
+    name = tool_call.function.name
+    args = json.loads(tool_call.function.arguments)
+    return unwrap_tool_call_envelope(name, args)
+
+
+def _resolved_tool_name(tool_call) -> str:
+    """The tool name after unwrapping a nested envelope, without parsing args."""
+    name = tool_call.function.name
+    if name != "functions":
+        return name
+    try:
+        args = json.loads(tool_call.function.arguments)
+    except json.JSONDecodeError, TypeError:
+        return name
+    inner = args.get("name") if isinstance(args, dict) else None
+    return inner if isinstance(inner, str) and inner else name
 
 
 class InvestigatorLLM:
@@ -265,6 +287,21 @@ class PamawasInvestigator:
     # three times running has stopped investigating; asking it a fourth time
     # only burns wall-clock budget that a paged engineer is waiting on.
     MAX_CONSECUTIVE_TEXT_TURNS = 3
+
+    # Wall-clock budget reserved at the end of an investigation for the model to
+    # write its findings and for them to be persisted.
+    #
+    # Without a reserve the deadline was only noticed at the top of a turn, so a
+    # run that spent its last minutes inside tool calls discovered it had no
+    # time left only after the model had gathered evidence it never got to
+    # report. Runs of 10m21s ended with "deadline exceeded without submitting
+    # findings" despite every Prometheus and Loki query having succeeded.
+    DEADLINE_RESERVE_FRACTION = 0.25
+    DEADLINE_RESERVE_MIN_SECONDS = 90.0
+
+    # How long before the reserve begins the model is told to wrap up. It gets a
+    # chance to synthesise what it has rather than being cut off mid-exploration.
+    DEADLINE_WARN_FRACTION = 0.5
 
     def __init__(self, config: Config):
         self.config = config
@@ -454,7 +491,7 @@ class PamawasInvestigator:
             "- llm: your own synthesis across sources (correlation, inference)\n"
             "- system: a harness limit such as a timeout\n"
             "Also set source_detail to the specific query, stream, or metric the "
-            "finding rests on, e.g. 'up{job=\"system_node\", instance=\"koba-labs\"}'. "
+            'finding rests on, e.g. \'up{job="system_node", instance="koba-labs"}\'. '
             "If a finding combines metrics AND logs, say so in source_detail "
             "(e.g. 'prometheus up + loki docker_logs') and use source llm, since "
             "the combination is your synthesis, not a single observation.\n"
@@ -484,13 +521,13 @@ class PamawasInvestigator:
             "- Never use 'OR' between stream selectors like {a} OR {b} — Loki "
             "cannot parse. Combine selectors or use pipe-separated values with |~\n"
             "- Never use '|=' with parentheses grouping alternation like |= "
-            "(\"term\" OR \"other\") — Loki only supports pipe-separated values "
-            "inside the string: |= \"term|other\"\n"
+            '("term" OR "other") — Loki only supports pipe-separated values '
+            'inside the string: |= "term|other"\n'
             "- Use |!= for a 'does not contain' line filter, e.g. {app=\"x\"} |= "
-            "\"error\" |!= \"debug\". Note: a bare '!=' without the pipe (label "
-            "matcher) goes inside curly braces: {service!=\"value\"}\n"
+            '"error" |!= "debug". Note: a bare \'!=\' without the pipe (label '
+            'matcher) goes inside curly braces: {service!="value"}\n'
             "- When grouping alternatives, use |~ with pipe-separated values, "
-            "e.g. |~ \"error|timeout|refused\" or combine streams: {service} |~ \"x|y\"\n"
+            'e.g. |~ "error|timeout|refused" or combine streams: {service} |~ "x|y"\n'
             "\n"
             "CRITICAL: LABEL NAMES ARE DEPLOYMENT-SPECIFIC.\n"
             "- A selector naming a label or value that does not exist returns "
@@ -562,10 +599,14 @@ class PamawasInvestigator:
                 start = function_args.get("start")
                 end = function_args.get("end")
                 if promql is None or start is None or end is None:
-                    return {
-                        "status": "error",
-                        "error": "query_prometheus requires promql, start, end",
-                    }, None, False
+                    return (
+                        {
+                            "status": "error",
+                            "error": "query_prometheus requires promql, start, end",
+                        },
+                        None,
+                        False,
+                    )
                 result = await self.tools._prometheus_adapter.query_range(promql, start, end)
                 return result, None, False
 
@@ -582,10 +623,14 @@ class PamawasInvestigator:
                 start = function_args.get("start")
                 end = function_args.get("end")
                 if logql is None or start is None or end is None:
-                    return {
-                        "status": "error",
-                        "error": "query_loki requires logql, start, end",
-                    }, None, False
+                    return (
+                        {
+                            "status": "error",
+                            "error": "query_loki requires logql, start, end",
+                        },
+                        None,
+                        False,
+                    )
                 result = await self.tools._loki_adapter.query_range(
                     logql,
                     start,
@@ -598,36 +643,52 @@ class PamawasInvestigator:
                 service = function_args.get("service")
                 keywords = function_args.get("symptom_keywords") or []
                 if service is None:
-                    return {
-                        "status": "error",
-                        "error": "get_related_incidents requires service",
-                    }, None, False
+                    return (
+                        {
+                            "status": "error",
+                            "error": "get_related_incidents requires service",
+                        },
+                        None,
+                        False,
+                    )
                 result = await self.tools._related_incidents_adapter.find_related(service, keywords)
                 return result, None, False
 
             elif function_name == "submit_findings":
                 raw = function_args.get("findings")
                 if not isinstance(raw, list) or not raw:
-                    return {
-                        "status": "error",
-                        "error": "submit_findings requires a non-empty findings list",
-                    }, None, False
+                    return (
+                        {
+                            "status": "error",
+                            "error": "submit_findings requires a non-empty findings list",
+                        },
+                        None,
+                        False,
+                    )
                 findings = []
                 for f in raw:
                     if not isinstance(f, dict):
-                        return {
-                            "status": "error",
-                            "error": "submit_findings: each finding must be an object",
-                        }, None, False
+                        return (
+                            {
+                                "status": "error",
+                                "error": "submit_findings: each finding must be an object",
+                            },
+                            None,
+                            False,
+                        )
                     ftype = f.get("type")
                     content = f.get("content")
                     source = f.get("source")
                     confidence = f.get("confidence")
                     if not ftype or content is None or not source or confidence is None:
-                        return {
-                            "status": "error",
-                            "error": "submit_findings: finding missing required fields",
-                        }, None, False
+                        return (
+                            {
+                                "status": "error",
+                                "error": "submit_findings: finding missing required fields",
+                            },
+                            None,
+                            False,
+                        )
                     # A finding's source decides how the report labels it and
                     # whether the claim is checkable, so an unrecognized value
                     # is a tool-call error the model must correct rather than
@@ -635,13 +696,17 @@ class PamawasInvestigator:
                     try:
                         evidence_source = EvidenceSource(source)
                     except ValueError:
-                        return {
-                            "status": "error",
-                            "error": (
-                                "submit_findings: source must be one of "
-                                "prometheus, loki, incidents, llm, system"
-                            ),
-                        }, None, False
+                        return (
+                            {
+                                "status": "error",
+                                "error": (
+                                    "submit_findings: source must be one of "
+                                    "prometheus, loki, incidents, llm, system"
+                                ),
+                            },
+                            None,
+                            False,
+                        )
                     findings.append(
                         Finding(
                             type=EvidenceType(ftype),
@@ -683,6 +748,7 @@ class PamawasInvestigator:
         self,
         tool_call,
         function_name: str,
+        function_args: dict,
         result: any,
         tool_start: float,
         state: InvestigationState,
@@ -697,7 +763,9 @@ class PamawasInvestigator:
         state.tool_calls.append(
             ToolResult(
                 tool_name=function_name,
-                arguments=json.loads(tool_call.function.arguments),
+                # The resolved arguments, not the envelope: a nested call would
+                # otherwise be recorded as {"name": ..., "arguments": {...}}.
+                arguments=function_args,
                 result=result,
                 duration_ms=(time.time() - tool_start) * 1000,
             )
@@ -706,10 +774,10 @@ class PamawasInvestigator:
         state.tool_call_count += 1
 
     def _check_max_tools_reached(
-        self, state: InvestigationState, is_final_turn: bool, messages: list[dict]
+        self, state: InvestigationState, must_submit: bool, messages: list[dict]
     ):
         """Check if max tool calls reached and prompt for submission if needed."""
-        if state.tool_call_count >= state.max_tool_calls and not is_final_turn:
+        if state.tool_call_count >= state.max_tool_calls and not must_submit:
             logger.info("Reached max tool calls, forcing findings submission")
             messages.append(
                 {
@@ -722,13 +790,13 @@ class PamawasInvestigator:
             )
 
     def _handle_text_response(
-        self, response, state: InvestigationState, is_final_turn: bool, messages: list[dict]
+        self, response, state: InvestigationState, must_submit: bool, messages: list[dict]
     ):
         """Handle text response (no tool calls)."""
         logger.info(f"LLM response (no tool calls): {response.content[:100]}...")
         state.consecutive_text_turns += 1
 
-        if is_final_turn or state.consecutive_text_turns >= self.MAX_CONSECUTIVE_TEXT_TURNS:
+        if must_submit or state.consecutive_text_turns >= self.MAX_CONSECUTIVE_TEXT_TURNS:
             # Either the turn budget or the patience budget is gone. Take what
             # the model has said as a hypothesis rather than discarding it: a
             # partial answer beats the null "deadline exceeded" result this
@@ -738,21 +806,49 @@ class PamawasInvestigator:
                 state.consecutive_text_turns,
             )
             content = (response.content or "").strip()
+            if not content:
+                # Nothing was written, so there is no hypothesis to record.
+                # Inventing one ("Investigation completed via text response")
+                # put a sentence on the report that the model never said.
+                state.findings.append(
+                    Finding(
+                        type=EvidenceType.UNKNOWN,
+                        content=(
+                            "Investigation ended without a stated conclusion; "
+                            "the model returned no text and no findings."
+                        ),
+                        source=EvidenceSource.SYSTEM,
+                        confidence=0.0,
+                    )
+                )
+                state.completed = True
+                return
             if _is_reasoning_preamble(content):
                 # The model narrated its process instead of stating a
                 # conclusion ("Let me analyze the data more carefully. I need to
                 # convert the Unix timestamps..."). Storing that as a finding
                 # put a wall of chain-of-thought under "🎯 Likely cause" on a
-                # critical card. There is no conclusion here to record.
-                logger.warning(
-                    "Discarding reasoning preamble as a finding: %s", content[:120]
+                # critical card. There is no conclusion here to record, but the
+                # run still needs an honest terminal row so the report says the
+                # investigation ended without one rather than showing nothing.
+                logger.warning("Discarding reasoning preamble as a finding: %s", content[:120])
+                state.findings.append(
+                    Finding(
+                        type=EvidenceType.UNKNOWN,
+                        content=(
+                            "Investigation ended without a stated conclusion; the "
+                            "model only described its process."
+                        ),
+                        source=EvidenceSource.SYSTEM,
+                        confidence=0.0,
+                    )
                 )
                 state.completed = True
                 return
             state.findings.append(
                 Finding(
                     type=EvidenceType.HYPOTHESIS,
-                    content=content or "Investigation completed via text response",
+                    content=content,
                     source=EvidenceSource.LLM,
                     confidence=0.3,
                 )
@@ -856,6 +952,59 @@ class PamawasInvestigator:
         )
         return findings
 
+    def _deadline_action(
+        self,
+        incident_id: str,
+        remaining: float,
+        warned: bool,
+        forced_already: bool,
+        messages: list[dict],
+    ) -> tuple[bool, bool]:
+        """Decide what the remaining wall-clock budget means for this turn.
+
+        Returns (force_submit, warned). The budget is spent in three phases:
+        exploring, then a nudge to wrap up, then a hard requirement to submit.
+        The reserve exists so evidence already gathered reaches the report
+        instead of being thrown away as "deadline exceeded".
+        """
+        reserve = max(
+            self.DEADLINE_RESERVE_MIN_SECONDS,
+            self.config.investigation_timeout_seconds * self.DEADLINE_RESERVE_FRACTION,
+        )
+        if remaining <= reserve:
+            if not forced_already:
+                logger.warning(
+                    "Incident %s is into its deadline reserve (%.0fs left); "
+                    "forcing findings submission",
+                    incident_id,
+                    remaining,
+                )
+                increment_forced_submission()
+            return True, warned
+
+        if not warned and remaining <= reserve * (1 + self.DEADLINE_WARN_FRACTION):
+            # A softer warning first: the model can still choose to submit on
+            # its own terms, which reads better than a forced summary.
+            logger.info(
+                "Incident %s has %.0fs left; asking the model to wrap up",
+                incident_id,
+                remaining,
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"You have about {int(remaining)} seconds left. Stop "
+                        "investigating and submit your findings now with "
+                        "submit_findings, reporting what you have established "
+                        "so far."
+                    ),
+                }
+            )
+            return False, True
+
+        return False, warned
+
     async def _run_investigation_loop(
         self,
         incident_id: str,
@@ -876,6 +1025,8 @@ class PamawasInvestigator:
         # advanced the counter such a turn would loop forever until the
         # wall-clock deadline and end with a synthesized UNKNOWN.
         exhausted_by = ""
+        warned_about_deadline = False
+        forced_submission_started = False
         while state.turn_count < state.max_tool_calls:
             # Enforce overall deadline: if no time remains, stop and submit.
             remaining = deadline - time.monotonic()
@@ -886,6 +1037,16 @@ class PamawasInvestigator:
                     incident_id,
                 )
                 break
+
+            force_submit, warned_about_deadline = self._deadline_action(
+                incident_id=incident_id,
+                remaining=remaining,
+                warned=warned_about_deadline,
+                forced_already=forced_submission_started,
+                messages=messages,
+            )
+            if force_submit:
+                forced_submission_started = True
 
             state.turn_count += 1
             logger.info(
@@ -901,6 +1062,8 @@ class PamawasInvestigator:
                     request_key_hash=request_key_hash,
                     state=state,
                     messages=messages,
+                    force_submit=force_submit,
+                    deadline=deadline,
                 )
                 if result is not None:
                     return result
@@ -944,14 +1107,19 @@ class PamawasInvestigator:
             else:
                 reason = "Investigation exhausted its turn budget"
             if state.tool_calls:
-                summaries = []
-                for tc in state.tool_calls[-3:]:
-                    r = tc.result
-                    status = r.get("status", "unknown") if isinstance(r, dict) else "unknown"
-                    summaries.append(f"{tc.tool_name}: {status}")
+                # Count what actually succeeded, rather than reporting the
+                # status of the last three calls. "query_prometheus: success;
+                # query_loki: success" told a reader nothing about whether the
+                # investigation had learned anything before it ran out of time.
+                succeeded = sum(
+                    1
+                    for tc in state.tool_calls
+                    if not (isinstance(tc.result, dict) and tc.result.get("status") == "error")
+                )
                 content = (
                     f"{reason} without submitting findings. "
-                    "Tool results: " + "; ".join(summaries)
+                    f"{succeeded} of {len(state.tool_calls)} tool calls returned "
+                    "data; no conclusion was recorded before the budget ran out."
                 )
             else:
                 content = f"{reason} without calling any tools"
@@ -965,7 +1133,10 @@ class PamawasInvestigator:
             )
 
         increment_findings_by_type(state.findings)
-        increment_max_tool_calls_reached()
+        if exhausted_by == "deadline":
+            increment_deadline_exceeded()
+        else:
+            increment_max_tool_calls_reached()
         await self._persist_investigation(
             incident_id=incident_id,
             request_key_hash=request_key_hash,
@@ -987,14 +1158,18 @@ class PamawasInvestigator:
         request_key_hash: str,
         state: InvestigationState,
         messages: list[dict],
+        force_submit: bool = False,
+        deadline: float | None = None,
     ) -> list[Finding] | None:
         """Run a single investigation turn (LLM call + tool handling);
         returns findings if complete."""
         is_final_turn = state.turn_count >= state.max_tool_calls
+        # A forced submission is a hard requirement, not a hint: the model is
+        # told to call submit_findings and the API refuses anything else, so the
+        # turn cannot be spent on another query with no time left to report it.
+        must_submit = is_final_turn or force_submit
         tool_choice = (
-            {"type": "function", "function": {"name": "submit_findings"}}
-            if is_final_turn
-            else "auto"
+            {"type": "function", "function": {"name": "submit_findings"}} if must_submit else "auto"
         )
         tools = ToolRegistry.get_tools()
 
@@ -1012,16 +1187,43 @@ class PamawasInvestigator:
         messages.append({"role": "assistant", "content": response.content or ""})
 
         # Handle tool calls
-        if hasattr(response, "tool_calls") and response.tool_calls:
+        tool_calls = getattr(response, "tool_calls", None)
+
+        # A forced turn that comes back with anything other than submit_findings
+        # means the endpoint ignored tool_choice. Running that query would spend
+        # the reserve that exists to write the findings, and the run would end
+        # with nothing to show — the exact failure the reserve was added to
+        # prevent. Treat the reply as the final answer instead.
+        if (
+            force_submit
+            and tool_calls
+            and not any(_resolved_tool_name(tc) == "submit_findings" for tc in tool_calls)
+        ):
+            logger.warning(
+                "Forced submission turn returned tool calls instead of findings; "
+                "completing with the model's text"
+            )
+            tool_calls = None
+
+        if tool_calls:
             # Real progress: the model is still investigating, so the
             # no-tool patience budget starts over.
             state.consecutive_text_turns = 0
-            for tool_call in response.tool_calls:
-                function_name = tool_call.function.name
-                function_args = json.loads(tool_call.function.arguments)
-                function_name, function_args = unwrap_tool_call_envelope(
-                    function_name, function_args
-                )
+            for tool_call in tool_calls:
+                function_name, function_args = _resolve_tool_call(tool_call)
+
+                # A turn may carry several tool calls and each can take up to
+                # the tool timeout, so a burst can consume the reserve set aside
+                # for writing the findings. Stop executing here rather than
+                # discovering the overrun at the next turn boundary — but always
+                # run submit_findings, which is the write-up itself.
+                if (
+                    deadline is not None
+                    and function_name != "submit_findings"
+                    and time.monotonic() >= deadline
+                ):
+                    logger.warning("Deadline reached mid-turn; not executing remaining tool calls")
+                    return None
 
                 logger.info(f"Calling tool: {function_name} with args: {function_args}")
 
@@ -1036,7 +1238,7 @@ class PamawasInvestigator:
                     return findings
 
                 self._handle_tool_result(
-                    tool_call, function_name, result, tool_start, state, messages
+                    tool_call, function_name, function_args, result, tool_start, state, messages
                 )
 
                 # Incremental persistence after each non-final tool call
@@ -1053,10 +1255,10 @@ class PamawasInvestigator:
                     max_tool_calls=self.config.max_tool_calls,
                 )
 
-                self._check_max_tools_reached(state, is_final_turn, messages)
+                self._check_max_tools_reached(state, must_submit, messages)
             return None
 
-        self._handle_text_response(response, state, is_final_turn, messages)
+        self._handle_text_response(response, state, must_submit, messages)
         if state.completed:
             increment_findings_by_type(state.findings)
             await self._persist_investigation(
@@ -1186,7 +1388,7 @@ class PamawasInvestigator:
             if "run_id" in locals():
                 try:
                     self.persistence.update_run_status(run_id, "failed_terminal")
-                except (psycopg2.Error, RuntimeError):
+                except psycopg2.Error, RuntimeError:
                     pass
 
     async def _persist_incremental(
@@ -1259,11 +1461,11 @@ class PamawasInvestigator:
                 row = cursor.fetchone()
             conn.commit()
             return row[0] if row else -1
-        except (psycopg2.Error, RuntimeError):
+        except psycopg2.Error, RuntimeError:
             if conn is not None:
                 try:
                     conn.rollback()
-                except (psycopg2.Error, AttributeError):
+                except psycopg2.Error, AttributeError:
                     pass
             return -1
         finally:
