@@ -392,7 +392,7 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
 
     seen_tool_choices = []
 
-    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000):
+    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
         seen_tool_choices.append(tool_choice)
         if isinstance(tool_choice, dict):
             return response(
@@ -448,7 +448,7 @@ def test_forced_turn_that_ignores_tool_choice_does_not_spend_the_reserve(investi
         return_value={"status": "success", "data": [1]}
     )
 
-    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000):
+    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
         # Never submits, and ignores the forced tool_choice.
         return response(
             tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
@@ -484,3 +484,81 @@ def test_nested_envelope_is_recognised_as_submit_findings():
     plain = tool_call("submit_findings", {"findings": []})
     assert _resolved_tool_name(plain) == "submit_findings"
     assert _resolve_tool_call(plain) == ("submit_findings", {"findings": []})
+
+
+def test_system_prompt_names_the_incident_it_serves(investigator):
+    """Each investigation's system prompt states which incident it covers.
+
+    A fresh conversation is necessary but not sufficient: the model is handed
+    real neighbouring incidents by get_related_incidents, and Prometheus and
+    Loki are queried by host, so another incident's symptoms are one query
+    away. Without a stated scope the model can explain this incident using the
+    neighbour's evidence.
+    """
+    context = IncidentContext(
+        incident_id="inc_scope_test",
+        title="Monitoring Target Down",
+        status="open",
+        severity="critical",
+        started_at="2026-11-16T01:37:20Z",
+        affected_services=["last-labs"],
+    )
+
+    prompt = investigator._build_system_prompt(context)
+
+    assert "inc_scope_test" in prompt
+    assert "last-labs" in prompt
+    assert "Monitoring Target Down" in prompt
+    # The out-of-scope rule must be explicit, not implied.
+    assert "THIS incident" in prompt
+    assert "different host" in prompt
+
+
+def test_each_investigation_gets_its_own_conversation(investigator):
+    """Two investigations must not share a message list.
+
+    State living on the investigator (not on the call) would leak one
+    incident's evidence into another's report the moment two run in sequence.
+    """
+    seen: list[list[dict]] = []
+
+    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
+        # Snapshot the conversation as the model saw it.
+        seen.append([m.get("content", "") for m in messages])
+        return response(content="nothing conclusive", tool_calls=None)
+
+    investigator.config.max_tool_calls = 1
+    investigator.llm.chat_completion = MagicMock(side_effect=fake_completion)
+    investigator._get_incident_context = MagicMock(
+        side_effect=lambda incident_id: IncidentContext(incident_id, f"Outage {incident_id}")
+    )
+
+    investigator.investigate("inc_first")
+    investigator.investigate("inc_second")
+
+    assert len(seen) == 2
+    first, second = seen
+    # Neither conversation contains the other incident's context.
+    assert not any("inc_second" in part for part in first)
+    assert not any("inc_first" in part for part in second)
+    # Both start from a clean two-message session.
+    assert len(first) >= 2 and len(second) >= 2
+
+
+def test_llm_calls_are_labelled_with_their_session(investigator):
+    """A slow or failing LLM call must be traceable to one incident."""
+    sessions = []
+
+    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
+        sessions.append(session)
+        return response(content="done", tool_calls=None)
+
+    investigator.config.max_tool_calls = 1
+    investigator.llm.chat_completion = MagicMock(side_effect=fake_completion)
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc_session_label", "Outage")
+    )
+
+    investigator.investigate("inc_session_label")
+
+    assert sessions == ["inc_session_label"]

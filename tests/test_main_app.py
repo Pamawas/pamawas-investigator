@@ -1,8 +1,10 @@
+import asyncio
 import os
 from contextlib import asynccontextmanager, contextmanager
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import main
@@ -427,3 +429,72 @@ def test_legacy_investigate_endpoint_is_gone():
     with client_with(service) as client:
         response = client.post("/api/v1/investigate", params={"incident_id": "inc-1"})
     assert response.status_code == 404
+
+
+def test_post_investigation_queues_instead_of_spawning():
+    """The handler persists the run and returns 202; workers execute it.
+
+    Previously the handler spawned an unbounded background task per request and
+    bounded them with an in-process semaphore. A burst of incidents therefore
+    started one LLM loop each, and runs waiting for a slot existed only in
+    memory: a restart lost them, leaving rows stuck in `queued` forever.
+    """
+    import os
+
+    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
+
+    mock_persistence = MagicMock()
+    mock_persistence.create_investigation_run.return_value = ("irun_queued", True)
+
+    service = MagicMock()
+    service.persistence = mock_persistence
+    service.db_conn = MagicMock()
+    service.investigate_async = AsyncMock()
+
+    with client_with(service) as client:
+        response = client.post(
+            "/api/v1/investigations",
+            json={
+                "contract_version": 1,
+                "incident_id": "inc-queue-test",
+                "reason": "incident_created",
+                "correlation_version": 1,
+            },
+            headers={"x-service-token": "test-token"},
+        )
+
+    assert response.status_code == 202
+    assert response.json()["data"]["status"] == "queued"
+    # The handler must not start the investigation itself: the worker pool
+    # claims the queued row from the database.
+    service.investigate_async.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_worker_runs_one_claimed_run_then_polls_again(monkeypatch):
+    """A worker executes the run it claimed and never spawns work itself.
+
+    Concurrency is the number of workers, not the number of incoming webhooks.
+    """
+    claimed = [("irun_1", "inc-1", "hash-1"), None]
+    executed = []
+
+    async def fake_run(run_id, incident_id, request_key_hash):
+        executed.append(run_id)
+        # Stop the loop once the claimed run has been executed.
+        raise asyncio.CancelledError
+
+    class FakePersistence:
+        def claim_next_queued_run(self):
+            return claimed.pop(0) if claimed else None
+
+    fake_investigator = MagicMock()
+    fake_investigator.persistence = FakePersistence()
+
+    monkeypatch.setattr(main, "investigator", fake_investigator)
+    monkeypatch.setattr(main, "_run_investigation_task", fake_run)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._investigation_worker(0, MagicMock(investigation_timeout_seconds=600))
+
+    assert executed == ["irun_1"]

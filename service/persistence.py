@@ -173,6 +173,115 @@ class InvestigationPersistence:
         finally:
             self._put_connection(conn)
 
+    def requeue_stale_running(self, stale_after_seconds: float) -> int:
+        """Return runs abandoned by a dead worker to the queue.
+
+        A run is `running` only while a worker is executing it. If the pod
+        restarts mid-investigation nothing is left to finish that row, so it
+        stays `running` forever — the status endpoint reports progress that
+        will never come, and the scheduler's high-severity follow-up waits for a
+        terminal state that never arrives.
+
+        `updated_at` advances on every tool execution persisted, so a run whose
+        timestamp is older than the investigation deadline plus a generous
+        margin belongs to a worker that is gone. The cutoff is measured against
+        the deadline, not a fixed number, so a long investigation is never
+        mistaken for an abandoned one.
+
+        Returns how many rows were requeued.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs
+                    SET status = 'queued',
+                        updated_at = %s
+                    WHERE status = 'running'
+                      AND updated_at < now() - (%s * interval '1 second')
+                    """,
+                    (now, stale_after_seconds),
+                )
+                requeued = cursor.rowcount
+            conn.commit()
+            if requeued:
+                logger.warning(
+                    "Requeued %d investigation run(s) abandoned by a dead worker", requeued
+                )
+            return requeued
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to requeue stale running investigations: %s", e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return 0
+        finally:
+            self._put_connection(conn)
+
+    def claim_next_queued_run(self) -> tuple[str, str, str] | None:
+        """Atomically claim one queued run and return (run_id, incident_id, request_key_hash).
+
+        This is the queue read. `investigation_runs` rows with status `queued`
+        ARE the queue: the HTTP handler only persists the row and returns 202,
+        and a fixed pool of workers claims from this table.
+
+        Claiming in the database rather than in process memory is what makes the
+        queue survive a restart. An earlier version spawned one background task
+        per request and bounded them with an in-process semaphore: a run waiting
+        for a slot held no state anywhere, so when the pod restarted the waiting
+        runs were simply gone — production had two runs stuck in `queued` for
+        thirteen hours for exactly this reason. A row cannot be lost that way.
+
+        `FOR UPDATE SKIP LOCKED` makes concurrent claims safe: two workers
+        polling at the same moment take different rows instead of racing for the
+        same one, so no run is executed twice and no worker blocks on a row
+        another worker already holds.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs r
+                    SET status = 'running',
+                        started_at = COALESCE(r.started_at, %s),
+                        updated_at = %s
+                    WHERE r.id = (
+                        SELECT id FROM investigation_runs
+                        WHERE status = 'queued'
+                        ORDER BY started_at, id
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    RETURNING r.id, r.incident_id, r.request_key_hash
+                    """,
+                    (now, now),
+                )
+                row = cursor.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            conn.commit()
+            logger.info(f"Claimed queued investigation run {row[0]}")
+            return row[0], row[1], row[2]
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error(f"Failed to claim queued investigation run: {e}")
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return None
+        finally:
+            self._put_connection(conn)
+
     def mark_run_failed(
         self,
         run_id: str,
@@ -312,10 +421,15 @@ class InvestigationPersistence:
                 self._put_connection(conn)
 
     def reclaim_due_investigation_retry(self, run_id: str) -> bool:
-        """Atomically move a due `failed_retryable` run back to `running`.
+        """Atomically move a due `failed_retryable` run back to `queued`.
 
-        Guards the auto-retry against double-execution: only one worker can flip
-        a run from `failed_retryable` (with `next_retry_at <= now`) to `running`,
+        It goes back to `queued`, not straight to `running`: the worker pool is
+        the only thing that executes runs, and it claims from the queue. Setting
+        `running` here would make the run look busy to the pool and to anyone
+        polling the status endpoint while nothing was actually running it.
+
+        Guards the auto-retry against double-execution: only one caller can flip
+        a run from `failed_retryable` (with `next_retry_at <= now`) to `queued`,
         so a racing second reclaim is a no-op.
 
         `completed_at` and `safe_error_code` are cleared because they describe
@@ -332,7 +446,7 @@ class InvestigationPersistence:
                 cursor.execute(
                     """
                     UPDATE investigation_runs
-                    SET status = 'running',
+                    SET status = 'queued',
                         next_retry_at = NULL,
                         completed_at = NULL,
                         safe_error_code = NULL,

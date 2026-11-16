@@ -209,9 +209,16 @@ class InvestigatorLLM:
         tools: list[dict] | None = None,
         tool_choice: str = "auto",
         max_tokens: int = 2000,
+        session: str = "",
     ):
         """Call the LLM with optional tool use; failing over across endpoints
-        and raising the last error."""
+        and raising the last error.
+
+        `session` labels the call in logs (the incident id). The client is
+        stateless — it holds no conversation — so the label exists to make a
+        log line traceable to exactly one investigation when several run at
+        once, not because any state is attached to it.
+        """
         import time as _time
 
         # Tool kwargs are only sent when there are tools. Passing
@@ -235,7 +242,11 @@ class InvestigatorLLM:
                         **optional,
                     )
                     if idx > 0:
-                        logger.warning("LLM failover succeeded on %s", endpoint_label)
+                        logger.warning(
+                            "LLM failover succeeded on %s (session=%s)",
+                            endpoint_label,
+                            session,
+                        )
                     return response.choices[0].message
                 except (
                     openai.OpenAIError,
@@ -251,7 +262,11 @@ class InvestigatorLLM:
                         # Non-retryable, or retries exhausted on this endpoint:
                         # fail over to the next endpoint rather than aborting.
                         if not retryable:
-                            logger.error("LLM call failed (non-retryable): %s", e)
+                            logger.error(
+                                "LLM call failed (non-retryable, session=%s): %s",
+                                session,
+                                e,
+                            )
                         else:
                             logger.warning(
                                 "LLM retries exhausted on %s (%d); failing over",
@@ -264,11 +279,12 @@ class InvestigatorLLM:
                         self.MAX_BACKOFF_SECONDS,
                     )
                     logger.warning(
-                        "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs: %s",
+                        "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs (session=%s): %s",
                         attempt + 1,
                         self.MAX_RETRIES,
                         endpoint_label,
                         backoff,
+                        session,
                         e,
                     )
                     _time.sleep(backoff)
@@ -456,9 +472,35 @@ class PamawasInvestigator:
         half = (limit - marker_len) // 2
         return text[:half] + marker + text[-half:]
 
-    def _build_system_prompt(self) -> str:
-        """Build the system prompt for the investigator."""
-        return (
+    def _build_system_prompt(self, context: IncidentContext | None = None) -> str:
+        """Build the system prompt for the investigator.
+
+        The incident's identity is part of the system prompt, not only of the
+        first user message. Every investigation gets a fresh conversation, but a
+        model with no stated scope will happily explain the incident using
+        another incident's evidence — the related-incidents tool hands it real
+        neighbours, and Prometheus and Loki are queried by host, so a
+        neighbouring host's symptoms are one query away. Naming the incident at
+        the top and stating what is out of scope keeps the findings about this
+        incident.
+        """
+        scope = ""
+        if context is not None:
+            affected = ", ".join(context.affected_services or []) or "unspecified"
+            scope = (
+                "\n=== SESSION SCOPE ===\n"
+                f"This session investigates exactly one incident: {context.incident_id}.\n"
+                f"Title: {context.title}\n"
+                f"Affected service(s) for this incident: {affected}\n"
+                "Every finding you submit must describe THIS incident. Evidence "
+                "about a different host, service or alert is not this incident's "
+                "cause, even when it looks similar: say so and leave it out. Use "
+                "get_related_incidents only to tell the operator whether this "
+                "condition keeps recurring — never as the cause of this "
+                "occurrence.\n"
+                "=== END SESSION SCOPE ===\n\n"
+            )
+        return scope + (
             "You are an expert infrastructure incident investigator. Your goal is to:\n"
             "1. Understand the symptom and blast radius\n"
             "2. Find the first abnormal signal, not just the loudest alert\n"
@@ -896,6 +938,13 @@ class PamawasInvestigator:
     ) -> list[Finding]:
         """Run the bounded investigation loop; every terminal path persists
         the run and its evidence."""
+        """Run the bounded investigation loop; every terminal path persists
+        the run and its evidence.
+
+        Concurrency is bounded outside this method, by the worker pool that
+        claims runs from the database. The deadline below starts here, so time
+        spent queued is not charged against the investigation's own budget.
+        """
         logger.info(f"Starting investigation for incident {incident_id}")
         increment_investigations()
 
@@ -1015,7 +1064,7 @@ class PamawasInvestigator:
     ) -> list[Finding]:
         """Run the bounded investigation tool-calling loop and persist final findings."""
         # Build system prompt and initial message
-        system_prompt = self._build_system_prompt()
+        system_prompt = self._build_system_prompt(context)
         initial_message = self._build_initial_message(context)
 
         messages = [{"role": "system", "content": system_prompt}, initial_message]
@@ -1181,6 +1230,7 @@ class PamawasInvestigator:
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
+            session=incident_id,
         )
 
         # Add the assistant's response to the conversation
@@ -1297,7 +1347,7 @@ class PamawasInvestigator:
 
         try:
             # Create or get investigation run
-            run_id, created_new = self.persistence.create_investigation_run(
+            run_id, _ = self.persistence.create_investigation_run(
                 incident_id=incident_id,
                 request_key_hash=request_key_hash,
                 model_provider=model_provider,
@@ -1410,7 +1460,7 @@ class PamawasInvestigator:
             return
 
         try:
-            run_id, created_new = self.persistence.create_investigation_run(
+            run_id, _ = self.persistence.create_investigation_run(
                 incident_id=incident_id,
                 request_key_hash=request_key_hash,
                 model_provider=model_provider,
@@ -1420,9 +1470,14 @@ class PamawasInvestigator:
                 max_tool_calls=max_tool_calls,
             )
 
-            # Mark run as running if newly created
-            if created_new:
-                self.persistence.update_run_status(run_id, "running")
+            # Mark the run as running. Not only when it was just created: the
+            # HTTP handler creates the run as `queued` before the work starts,
+            # so by the time the first tool result is persisted `created_new`
+            # is always False and the run stayed `queued` for its entire life.
+            # Anything watching for a terminal status — the scheduler's
+            # high-severity follow-up, an operator checking whether a run is
+            # alive — saw a run that never started.
+            self.persistence.update_run_status(run_id, "running")
 
             # Insert any new tool executions not yet persisted. We track by
             # sequence_no; insert all tool calls each time is idempotent if the

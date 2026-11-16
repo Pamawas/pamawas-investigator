@@ -64,18 +64,6 @@ def print_startup_banner(version: str, port: int) -> None:
 investigator: PamawasInvestigator = None
 start_time = time.time()
 
-# Strong references to fire-and-forget asyncio tasks. Without this, a task can
-# be garbage-collected mid-execution (asyncio only keeps weak references).
-_background_tasks: set[asyncio.Task] = set()
-
-
-def _spawn_background_task(coro) -> asyncio.Task:
-    """Create a tracked background task that removes itself when done."""
-    task = asyncio.get_running_loop().create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -120,20 +108,33 @@ async def lifespan(app: FastAPI):
         log.error("investigator_init_failed", error=str(e))
         raise
 
-    # Start the auto-retry scheduler (reclaims due failed_retryable runs).
+    # Start the investigation worker pool. Each worker claims one queued run at
+    # a time, so the pool size is the concurrency limit on the LLM endpoint —
+    # the scarce resource. A free endpoint serves a handful of concurrent
+    # requests; starting a loop per incident turned a burst into a storm of
+    # timeouts where every investigation failed for lack of capacity rather
+    # than lack of evidence.
+    workers = []
     retry_scheduler_task = None
     if investigator is not None and investigator.persistence:
+        for worker_id in range(max(1, config.max_concurrent_investigations)):
+            workers.append(asyncio.create_task(_investigation_worker(worker_id, config)))
+        # Reclaims due failed_retryable runs and stranded running ones, both of
+        # which then flow back through the same queue the workers claim from.
         retry_scheduler_task = asyncio.create_task(
             _investigation_retry_scheduler(config.retry_scheduler_tick_seconds)
         )
+        log.info("investigation_workers_started", count=len(workers))
 
     yield
 
     # Shutdown
-    if retry_scheduler_task is not None:
-        retry_scheduler_task.cancel()
+    for task in [*workers, retry_scheduler_task]:
+        if task is None:
+            continue
+        task.cancel()
         try:
-            await retry_scheduler_task
+            await task
         except asyncio.CancelledError:
             pass
     if otel_shutdown:
@@ -452,10 +453,10 @@ async def create_investigation(
             },
         )
 
-    # New run persisted. Kick off the investigation asynchronously in the
-    # background; return 202 with status "queued" per the frozen contract.
-    log.info("investigation_started", incident_id=incident_id, reason=reason)
-    _spawn_background_task(_run_investigation_task(run_id, incident_id, request_key_hash))
+    # The run row IS the queue entry. A worker claims it from the database, so
+    # the work survives a restart and concurrency is bounded by the pool size
+    # rather than by how many webhooks happened to arrive at once.
+    log.info("investigation_queued", incident_id=incident_id, reason=reason, run_id=run_id)
 
     return JSONResponse(
         status_code=202,
@@ -601,87 +602,86 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
                 )
 
 
-async def _investigation_retry_scheduler(tick_seconds: float):
-    """Reclaim due `failed_retryable` runs and re-execute them.
+async def _investigation_worker(worker_id: int, config: InvestigationConfig):
+    """Execute queued investigation runs, one at a time.
 
-    Runs as a background asyncio task for the lifetime of the process. It wakes
-    every `tick_seconds` (from config, RETRY_SCHEDULER_TICK_SECONDS, default
-    15), atomically reclaims any run whose retry back-off has elapsed, and
-    spawns a fresh _run_investigation_task for each. This both drives
-    in-process retries and self-heals runs that were mid-retry when the process
-    crashed (a failed_retryable run is simply reclaimed again).
+    The pool of these is the concurrency limit for the LLM endpoint. Each
+    iteration claims a single run from the queue in the database and executes
+    it; if nothing is queued it waits briefly and polls again. Nothing is
+    spawned per request and nothing waits in process memory, so a restart loses
+    no work — the row is still `queued` and the pool claims it on the way back
+    up.
+
+    Claiming is atomic (`FOR UPDATE SKIP LOCKED`), so two workers polling at the
+    same moment take different runs rather than racing for one.
+    """
+    poll_seconds = 1.0
+    logger_prefix = f"worker-{worker_id}"
+    while True:
+        if investigator is None or not investigator.persistence:
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        try:
+            claimed = await asyncio.to_thread(investigator.persistence.claim_next_queued_run)
+            if claimed is None:
+                await asyncio.sleep(poll_seconds)
+                continue
+
+            run_id, incident_id, request_key_hash = claimed
+            log.info(
+                "investigation_claimed",
+                worker=logger_prefix,
+                run_id=run_id,
+                incident_id=incident_id,
+            )
+            # Run in this task: the worker is the concurrency slot, so spawning
+            # here would reintroduce unbounded parallelism.
+            await _run_investigation_task(run_id, incident_id, request_key_hash)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            # A worker must never die: it is one of a fixed pool, and losing one
+            # silently reduces capacity for the life of the process.
+            log.error("investigation_worker_error", worker=logger_prefix, error=str(e))
+            await asyncio.sleep(poll_seconds)
+
+
+async def _investigation_retry_scheduler(tick_seconds: float):
+    """Sweep abandoned and retryable runs back into the queue.
+
+    Runs as a background asyncio task for the lifetime of the process, waking
+    every `tick_seconds` (RETRY_SCHEDULER_TICK_SECONDS, default 15). It does no
+    execution itself: it moves two kinds of stranded run back to `queued` and
+    the worker pool claims them.
+
+    - `running` runs whose worker died mid-investigation (a pod restart). Without
+      this they stay `running` forever, reporting progress that never comes.
+    - `failed_retryable` runs whose back-off has elapsed.
     """
     while True:
         try:
             if investigator is not None and investigator.persistence:
+                # Runs abandoned by a worker that died mid-investigation go back
+                # to the queue before retries are considered, so a restart
+                # recovers in-flight work instead of stranding it in `running`.
+                stale_after = (
+                    investigator.config.investigation_timeout_seconds * 2
+                    + investigator.config.retry_scheduler_tick_seconds
+                )
+                investigator.persistence.requeue_stale_running(stale_after)
+
                 due = investigator.persistence.list_due_investigation_retries(limit=10)
                 for run_id in due:
                     if investigator.persistence.reclaim_due_investigation_retry(run_id):
                         investigation_retry_reclaimed_total.inc()
-                        # reclaim moved it to running; re-run the investigation.
-                        # We don't have incident_id here, so look it up from the run.
-                        incident_id = _get_run_incident_id(run_id)
-                        if incident_id:
-                            _spawn_background_task(
-                                _run_investigation_task(
-                                    run_id, incident_id, _get_run_request_key(run_id)
-                                )
-                            )
+                        # The reclaim put it back in the queue; a worker picks
+                        # it up on its next poll. Nothing is spawned here.
+                        log.info("investigation_retry_requeued", run_id=run_id)
         except Exception as e:  # noqa: BLE001
             investigation_retry_errors_total.inc()
             log.error("investigation_retry_scheduler_error", error=str(e))
         await asyncio.sleep(tick_seconds)
-
-
-def _get_run_incident_id(run_id: str) -> str | None:
-    """Return a run's incident_id, or None on failure."""
-    if not investigator or not investigator.persistence:
-        return None
-    conn = None
-    try:
-        conn = investigator.persistence._get_connection()
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT incident_id FROM investigation_runs WHERE id = %s", (run_id,))
-            row = cursor.fetchone()
-        conn.commit()
-        return row[0] if row else None
-    except psycopg2.Error, RuntimeError:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except psycopg2.Error, AttributeError:
-                pass
-        return None
-    finally:
-        if conn is not None:
-            investigator.persistence._put_connection(conn)
-
-
-_GET_RUN_REQUEST_KEY_SQL = "SELECT request_key_hash FROM investigation_runs WHERE id = %s"
-
-
-def _get_run_request_key(run_id: str) -> str:
-    """Return a run's request_key_hash (used for idempotent re-execution)."""
-    if not investigator or not investigator.persistence:
-        return ""
-    conn = None
-    try:
-        conn = investigator.persistence._get_connection()
-        with conn.cursor() as cursor:
-            cursor.execute(_GET_RUN_REQUEST_KEY_SQL, (run_id,))
-            row = cursor.fetchone()
-        conn.commit()
-        return row[0] if row else ""
-    except psycopg2.Error, RuntimeError:
-        if conn is not None:
-            try:
-                conn.rollback()
-            except psycopg2.Error, AttributeError:
-                pass
-        return ""
-    finally:
-        if conn is not None:
-            investigator.persistence._put_connection(conn)
 
 
 def main():

@@ -419,3 +419,79 @@ class TestUpdateRunStatusStartedAt:
 
         query = mock_cursor.execute.call_args[0][0]
         assert "started_at = COALESCE(started_at, %s)" in query
+
+
+class TestClaimNextQueuedRun:
+    """The queue read: claim one queued run atomically."""
+
+    def test_claims_one_run_and_marks_it_running(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.fetchone.return_value = (
+            "irun_CLAIMED",
+            "inc-1",
+            "hash-1",
+        )
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                claimed = pers.claim_next_queued_run()
+
+        assert claimed == ("irun_CLAIMED", "inc-1", "hash-1")
+        sql = mock_cursor.execute.call_args[0][0]
+        # The claim must be atomic against other workers.
+        assert "FOR UPDATE SKIP LOCKED" in sql
+        assert "status = 'running'" in sql
+        assert "status = 'queued'" in sql
+        mock_conn.commit.assert_called_once()
+
+    def test_returns_none_when_queue_is_empty(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.fetchone.return_value = None
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                assert pers.claim_next_queued_run() is None
+
+        mock_conn.commit.assert_called_once()
+
+    def test_returns_none_instead_of_raising_on_db_error(self, mock_pool):
+        """A worker poll must not die because one query failed."""
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.execute.side_effect = psycopg2.OperationalError("connection lost")
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                assert pers.claim_next_queued_run() is None
+
+        mock_conn.rollback.assert_called_once()
+
+
+class TestRequeueStaleRunning:
+    """Runs abandoned by a dead worker must return to the queue."""
+
+    def test_requeues_and_reports_count(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 2
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                assert pers.requeue_stale_running(1200.0) == 2
+
+        sql = mock_cursor.execute.call_args[0][0]
+        assert "status = 'queued'" in sql
+        assert "status = 'running'" in sql
+        # The cutoff is derived from the investigation deadline, not hard-coded.
+        assert "updated_at < now()" in sql
+
+    def test_returns_zero_on_db_error(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.execute.side_effect = psycopg2.OperationalError("gone")
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
+                pers = InvestigationPersistence(database_url="test://url")
+                assert pers.requeue_stale_running(1200.0) == 0

@@ -50,6 +50,11 @@ class Config:
     prometheus_url: str = "http://prometheus:9090"
     loki_url: str = "http://loki:3100"
     max_tool_calls: int = 100
+    # How many investigations may call the LLM at once. The endpoint is the
+    # scarce resource — a free endpoint serves a handful of concurrent requests
+    # — so this is deliberately low. Investigations beyond the limit wait for a
+    # slot and then run normally, instead of all of them timing out together.
+    max_concurrent_investigations: int = 4
     truncation_limit: int = 8192
     # Labels that carry the service name, used to build enrichment
     # selectors. Neither store has an "incident" label, so enrichment selects
@@ -115,6 +120,7 @@ class Config:
             prometheus_service_label=os.getenv("PROMETHEUS_SERVICE_LABEL", "service"),
             loki_service_label=os.getenv("LOKI_SERVICE_LABEL", "kubernetes_container_name"),
             max_tool_calls=int(os.getenv("MAX_TOOL_CALLS", "100")),
+            max_concurrent_investigations=int(os.getenv("MAX_CONCURRENT_INVESTIGATIONS", "4")),
             truncation_limit=int(os.getenv("TRUNCATION_LIMIT", "8192")),
             # Adapter settings from env
             prometheus_timeout_seconds=float(os.getenv("PROMETHEUS_TIMEOUT_SECONDS", "10.0")),
@@ -174,6 +180,7 @@ class Config:
         bounds = [
             ("port", "PORT", 1),
             ("max_tool_calls", "MAX_TOOL_CALLS", 1),
+            ("max_concurrent_investigations", "MAX_CONCURRENT_INVESTIGATIONS", 1),
             ("truncation_limit", "TRUNCATION_LIMIT", 1),
             ("max_investigation_attempts", "MAX_INVESTIGATION_ATTEMPTS", 1),
             ("investigation_retry_backoff_seconds", "INVESTIGATION_RETRY_BACKOFF_SECONDS", 1),
