@@ -2,6 +2,7 @@
 
 import json
 import logging
+import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -61,23 +62,34 @@ class InvestigationPersistence:
     def __init__(self, database_url: str):
         self.database_url = database_url
         self._pool: psycopg2.pool.ThreadedConnectionPool | None = None
+        # Guarded because pool creation is now reached from several threads at
+        # once: the investigation worker pool claims runs through
+        # asyncio.to_thread, so a cold start has N workers plus the retry sweep
+        # all calling _get_connection simultaneously.
+        self._pool_lock = threading.Lock()
 
     def _get_connection(self) -> psycopg2.extensions.connection:
         """Get a database connection from the pool."""
         if not self.database_url:
             raise RuntimeError("Database URL not configured")
 
+        # Double-checked locking. Without it two threads can each build a pool;
+        # the second assignment discards the first, and a connection handed out
+        # by the discarded pool is unknown to the live one — putconn then raises
+        # "trying to put unkeyed connection" and that thread's work is lost.
         if self._pool is None:
-            try:
-                self._pool = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=1,
-                    maxconn=10,
-                    dsn=self.database_url,
-                    connect_timeout=5,
-                )
-            except psycopg2.Error as e:
-                logger.error("Failed to initialize database pool: %s", e)
-                raise
+            with self._pool_lock:
+                if self._pool is None:
+                    try:
+                        self._pool = psycopg2.pool.ThreadedConnectionPool(
+                            minconn=1,
+                            maxconn=10,
+                            dsn=self.database_url,
+                            connect_timeout=5,
+                        )
+                    except psycopg2.Error as e:
+                        logger.error("Failed to initialize database pool: %s", e)
+                        raise
 
         return self._pool.getconn()
 

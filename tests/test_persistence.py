@@ -495,3 +495,54 @@ class TestRequeueStaleRunning:
             with patch.object(InvestigationPersistence, "_put_connection", return_value=None):
                 pers = InvestigationPersistence(database_url="test://url")
                 assert pers.requeue_stale_running(1200.0) == 0
+
+
+class TestPoolInitializationIsThreadSafe:
+    """Two threads reaching a cold pool must not build two pools.
+
+    The worker pool claims runs through asyncio.to_thread, so a cold start has
+    several threads calling _get_connection at once. If each builds its own
+    pool, the second assignment discards the first and every connection handed
+    out by the discarded pool fails on return with "trying to put unkeyed
+    connection" — which is what production logged before this fix.
+    """
+
+    def test_concurrent_first_use_creates_one_pool(self):
+        import threading
+        import time
+
+        created = []
+
+        class FakePool:
+            def __init__(self, **kwargs):
+                # Widen the window between the "is the pool built?" check and
+                # the assignment. Connecting to postgres is slow, so the window
+                # is wide in production; an instantaneous fake would hide the
+                # race and the test would pass against the bug.
+                time.sleep(0.01)
+                created.append(kwargs)
+                self.conns = []
+
+            def getconn(self):
+                conn = MagicMock()
+                self.conns.append(conn)
+                return conn
+
+            def putconn(self, conn):
+                pass
+
+        pers = InvestigationPersistence(database_url="test://url")
+        barrier = threading.Barrier(8)
+
+        def worker():
+            barrier.wait()
+            pers._get_connection()
+
+        with patch("psycopg2.pool.ThreadedConnectionPool", side_effect=FakePool):
+            threads = [threading.Thread(target=worker) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert len(created) == 1, f"created {len(created)} pools, want exactly 1"
