@@ -39,6 +39,10 @@ log = structlog.get_logger()
 # continues that trace, or the chain breaks at this hop.
 trace_propagator = TraceContextTextMapPropagator()
 
+# Liveness, readiness and scrape endpoints. They run every few seconds forever
+# and have no incident behind them.
+PROBE_PATHS = frozenset({"/health", "/healthz", "/livez", "/ready", "/readyz", "/metrics"})
+
 
 def get_trace_context() -> dict[str, str]:
     """Return the trace and span IDs of the current span, for structured logs.
@@ -75,6 +79,22 @@ class LoggingMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         start = time.perf_counter()
+
+        # Probes and scrapes are not requests anyone will debug. Tracing them
+        # fills the backend with spans that explain nothing and, at a sample
+        # ratio below 1, competes with the traffic that does matter. The Go
+        # services make the same exception, so Tempo holds only real work.
+        if request.url.path in PROBE_PATHS:
+            # Still logged, so "did the probe reach us" stays answerable, but
+            # without a span and without a trace ID it does not have.
+            response = await call_next(request)
+            log.info(
+                "http_probe",
+                method=request.method,
+                path=request.url.path,
+                status_code=response.status_code,
+            )
+            return response
 
         # Continue an existing trace when the caller supplied one. Extract
         # before starting the span, or every request starts a second trace and

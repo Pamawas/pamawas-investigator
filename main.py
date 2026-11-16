@@ -74,7 +74,7 @@ async def lifespan(app: FastAPI):
     log.info("starting_pamawas_investigator")
 
     # Initialize OpenTelemetry tracing
-    otel_sample_ratio = float(os.getenv("OTEL_SAMPLE_RATIO", "0.1"))
+    otel_sample_ratio = float(os.getenv("OTEL_SAMPLE_RATIO", "1.0"))
     otel_config = OTelConfig(
         service_name="pamawas-investigator",
         otlp_endpoint=os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
