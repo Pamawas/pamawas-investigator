@@ -249,13 +249,16 @@ def test_text_only_turns_are_bounded_by_turn_budget(investigator):
     assert findings[0].content == "still thinking"
 
 
-def test_repeated_text_only_turns_stop_early(investigator):
-    """Three prose-only turns end the investigation instead of burning the budget.
+def test_repeated_text_only_turns_force_a_submission(investigator):
+    """Three prose-only turns escalate to a forced submit, not a null result.
 
     The model stops calling tools when it has gathered what it needs but forgets
     to submit. Previously the loop kept asking it to "continue" until either the
-    turn budget (100 LLM calls) or the wall-clock deadline ran out, then recorded
-    a null UNKNOWN. A partial answer beats a null one.
+    turn budget or the wall-clock deadline ran out, then recorded a null UNKNOWN;
+    a later version gave up after three prose turns and recorded "the model only
+    described its process" while the answer was one forced call away. Now the
+    next turn refuses anything but submit_findings, so the model's conclusion is
+    captured instead of discarded.
     """
     investigator.config.max_tool_calls = 100
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
@@ -263,24 +266,28 @@ def test_repeated_text_only_turns_stop_early(investigator):
 
     findings = investigator.investigate("inc")
 
-    assert investigator.llm.chat_completion.call_count == (investigator.MAX_CONSECUTIVE_TEXT_TURNS)
+    # Three patience turns, then one forced turn.
+    assert investigator.llm.chat_completion.call_count == (
+        investigator.MAX_CONSECUTIVE_TEXT_TURNS + 1
+    )
     assert findings[0].type is EvidenceType.HYPOTHESIS
     assert findings[0].content == "I think the node rebooted"
 
 
-def test_tool_call_resets_the_text_patience_budget(investigator):
-    """A real tool call proves the model is still working, so the count resets."""
+def test_text_patience_escalates_only_at_the_limit(investigator):
+    """A single prose turn is not escalated; the limit is what forces it."""
     from models import InvestigationState
 
     state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
-    state.consecutive_text_turns = 2
+    messages = []
 
-    investigator._handle_text_response(
-        response("still here"), state, must_submit=False, messages=[]
-    )
-    assert state.consecutive_text_turns == 3
-    # Three in a row is the limit: this one completes rather than asking again.
-    assert state.completed is True
+    state.consecutive_text_turns = investigator.MAX_CONSECUTIVE_TEXT_TURNS - 1
+    assert investigator._escalate_text_patience("inc", state, messages) is False
+    assert messages == []
+
+    state.consecutive_text_turns = investigator.MAX_CONSECUTIVE_TEXT_TURNS
+    assert investigator._escalate_text_patience("inc", state, messages) is True
+    assert "submit_findings" in messages[-1]["content"]
 
 
 def test_reasoning_preamble_is_not_recorded_as_a_finding(investigator):
@@ -294,7 +301,7 @@ def test_reasoning_preamble_is_not_recorded_as_a_finding(investigator):
     from models import InvestigationState
 
     state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
-    state.consecutive_text_turns = investigator.MAX_CONSECUTIVE_TEXT_TURNS - 1
+    state.consecutive_text_turns = investigator.MAX_CONSECUTIVE_TEXT_TURNS
 
     investigator._handle_text_response(
         response(
@@ -303,7 +310,7 @@ def test_reasoning_preamble_is_not_recorded_as_a_finding(investigator):
             "2026-11-16 01:37:20+00:00."
         ),
         state,
-        must_submit=False,
+        must_submit=True,
         messages=[],
     )
 
@@ -658,6 +665,24 @@ def test_working_notes_submitted_through_the_tool_are_rejected(investigator):
     assert cleaned[1].content == "An OOM kill in the wazuh container."
 
 
+def test_em_dashes_are_normalized_in_findings():
+    """Em dashes are the clearest generated-prose tell, and they reach the card.
+
+    The prompt asks for plain sentences, but a style instruction is a
+    preference. The typography is also normalized where findings are written, so
+    a model that ignores the instruction still cannot put one on a report.
+    """
+    from service.investigator import _plain_typography
+
+    em, en = chr(0x2014), chr(0x2013)
+    assert _plain_typography(f"Possible cause {em} not confirmed") == (
+        "Possible cause, not confirmed"
+    )
+    assert _plain_typography(f"up dropped 1 {en} 0") == "up dropped 1, 0"
+    assert _plain_typography("no dashes here") == "no dashes here"
+    assert _plain_typography("") == ""
+
+
 def test_no_tool_calls_start_once_the_reserve_opens(investigator, monkeypatch):
     """The reserve must be a wall, not a checkpoint.
 
@@ -689,9 +714,7 @@ def test_no_tool_calls_start_once_the_reserve_opens(investigator, monkeypatch):
         )
     )
 
-    state = InvestigationState(
-        incident_id="inc", findings=[], tool_calls=[], max_tool_calls=50
-    )
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[], max_tool_calls=50)
 
     def run(explore_deadline):
         state.tool_calls = []

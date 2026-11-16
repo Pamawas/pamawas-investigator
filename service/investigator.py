@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import re
 import time
+from dataclasses import replace
 from datetime import datetime
 from datetime import timezone as tz
 
@@ -133,6 +135,23 @@ def _is_reasoning_preamble(text: str) -> bool:
     return marker_hits >= 3
 
 
+def _plain_typography(text: str) -> str:
+    """Replace the punctuation the model reaches for with plain punctuation.
+
+    Em and en dashes are the clearest writing tell there is: they show up in
+    generated prose far more often than in anything a person types, and they
+    render badly in a proportional-font chat card. The prompt asks for plain
+    sentences, but a style instruction is a preference, not a constraint, so the
+    typography is also normalized where every finding passes through.
+    """
+    if not text:
+        return text
+    cleaned = re.sub(r"\s*[\N{EM DASH}\N{EN DASH}\N{HORIZONTAL BAR}]\s*", ", ", text)
+    cleaned = re.sub(r",\s*,", ",", cleaned)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    return cleaned.strip()
+
+
 def _sanitize_finding(finding: Finding) -> Finding:
     """Keep working notes out of a finding, whichever path produced it.
 
@@ -145,7 +164,10 @@ def _sanitize_finding(finding: Finding) -> Finding:
     The finding is replaced, not truncated. Half an essay is still an essay, and
     the honest record is that this claim was never made.
     """
-    if not _is_reasoning_preamble(finding.content):
+    content = _plain_typography(finding.content)
+    if not _is_reasoning_preamble(content):
+        if content != finding.content:
+            return replace(finding, content=content)
         return finding
     logger.warning(
         "Discarding a %s finding that was working notes (%d chars): %s",
@@ -646,7 +668,9 @@ class PamawasInvestigator:
             "You have access to tools to query Prometheus, Loki, check recent "
             "deployments, and find related incidents.\n"
             "You must use the submit_findings tool to end the investigation with your "
-            "final conclusions.\n"
+            "final conclusions. A plain text reply is not a submission: if you "
+            "answer in prose instead of calling submit_findings, the operator gets "
+            "no conclusion from this run. When you have enough evidence, submit.\n"
             "\n"
             "Every finding must be classified as:\n"
             "- FACT: directly observed in metrics/logs\n"
@@ -671,6 +695,27 @@ class PamawasInvestigator:
             "the combination is your synthesis, not a single observation.\n"
             "\n"
             "Always provide confidence scores (0.0 to 1.0) for your findings.\n"
+            "\n"
+            "HOW TO WRITE A FINDING:\n"
+            "A finding is a claim, in one or two plain sentences, that an on-call "
+            "engineer can act on. Write it the way an engineer writes in a "
+            "postmortem, not the way a marketing page reads.\n"
+            "- Lead with what happened, then the evidence: 'netbird-agent stopped "
+            'reporting at 07:12; up{job="system_node"} dropped from 1 to 0 at the '
+            "same minute.'\n"
+            "- Never narrate your process. No 'Let me check', 'I will now query', "
+            "'Looking at the data, I can see'. Those describe your work, not the "
+            "incident, and they are not findings.\n"
+            "- No em dashes or en dashes. Use a comma, a period, or 'and'.\n"
+            "- Avoid filler and inflated wording: delve, leverage, robust, "
+            "seamless, crucial, pivotal, comprehensive, holistic, 'it is worth "
+            "noting', 'it is important to', 'in conclusion', 'navigate the "
+            "complexities', 'unlock', 'showcase', 'underscore'. Say the thing.\n"
+            "- Do not use the 'not just X, but Y' construction, and do not pad "
+            "lists to three items for rhythm. State the findings you actually "
+            "have.\n"
+            "- No hedging stacks ('it may potentially possibly'). One qualifier is "
+            "enough, and the confidence score already carries it.\n"
             "\n"
             "Always end with at least one RECOMMENDATION: the concrete next step "
             "the on-call engineer should take. If the incident self-resolved, say "
@@ -970,11 +1015,14 @@ class PamawasInvestigator:
         logger.info(f"LLM response (no tool calls): {response.content[:100]}...")
         state.consecutive_text_turns += 1
 
-        if must_submit or state.consecutive_text_turns >= self.MAX_CONSECUTIVE_TEXT_TURNS:
-            # Either the turn budget or the patience budget is gone. Take what
-            # the model has said as a hypothesis rather than discarding it: a
-            # partial answer beats the null "deadline exceeded" result this
-            # path used to produce after burning the full wall-clock budget.
+        if must_submit:
+            # Either the turn budget or the patience budget is gone, and the
+            # turn was a forced submission — the API was told it may only call
+            # submit_findings. A text reply therefore means the endpoint ignored
+            # tool_choice. Take what the model said as a hypothesis rather than
+            # discarding it: a partial answer beats the null "deadline exceeded"
+            # result this path used to produce after burning the full wall-clock
+            # budget.
             logger.warning(
                 "Text response without tool use (%d consecutive) - recording it as a hypothesis",
                 state.consecutive_text_turns,
@@ -1022,7 +1070,7 @@ class PamawasInvestigator:
             state.findings.append(
                 Finding(
                     type=EvidenceType.HYPOTHESIS,
-                    content=content,
+                    content=_plain_typography(content),
                     source=EvidenceSource.LLM,
                     confidence=0.3,
                 )
@@ -1134,6 +1182,67 @@ class PamawasInvestigator:
         )
         return findings
 
+    def _submission_pressure(
+        self,
+        incident_id: str,
+        remaining: float,
+        warned: bool,
+        forced_already: bool,
+        state: InvestigationState,
+        messages: list[dict],
+    ) -> tuple[bool, bool]:
+        """Decide whether this turn must be a forced submission.
+
+        Two things can force it: the wall-clock deadline entering its reserve,
+        and the model spending its no-tool patience on prose instead of a
+        submission. Keeping both here means the loop stays one branch.
+        """
+        force_submit, warned = self._deadline_action(
+            incident_id=incident_id,
+            remaining=remaining,
+            warned=warned,
+            forced_already=forced_already,
+            messages=messages,
+        )
+        if force_submit or forced_already:
+            return force_submit, warned
+        return self._escalate_text_patience(incident_id, state, messages), warned
+
+    def _escalate_text_patience(
+        self, incident_id: str, state: InvestigationState, messages: list[dict]
+    ) -> bool:
+        """Force a structured submission once the model stops calling tools.
+
+        A model that has written several turns without calling a tool and
+        without submitting is not going to submit on its own. Giving up here is
+        what produced cards that said "UNKNOWN (0%): the model only described
+        its process" on a critical incident even though the model had just seen
+        real evidence: its prose was discarded while a structured answer was
+        still one forced call away.
+
+        Returns True when this turn must be a forced submission.
+        """
+        if state.consecutive_text_turns < self.MAX_CONSECUTIVE_TEXT_TURNS:
+            return False
+        logger.warning(
+            "Incident %s replied %d times without a tool call; forcing findings "
+            "submission instead of recording a null result",
+            incident_id,
+            state.consecutive_text_turns,
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Stop writing prose. Call submit_findings now and record what you "
+                    "have established from the evidence you already gathered, "
+                    "including anything you are still unsure about."
+                ),
+            }
+        )
+        increment_forced_submission()
+        return True
+
     def _deadline_action(
         self,
         incident_id: str,
@@ -1229,11 +1338,12 @@ class PamawasInvestigator:
                 )
                 break
 
-            force_submit, warned_about_deadline = self._deadline_action(
+            force_submit, warned_about_deadline = self._submission_pressure(
                 incident_id=incident_id,
                 remaining=remaining,
                 warned=warned_about_deadline,
                 forced_already=forced_submission_started,
+                state=state,
                 messages=messages,
             )
             if force_submit:
@@ -1563,6 +1673,11 @@ class PamawasInvestigator:
                     logger.info(f"Fetched {len(enriched_logs)} logs for enrichment")
                 except (OSError, ValueError, RuntimeError) as e:
                     logger.warning(f"Failed to fetch Loki logs for enrichment: {e}")
+
+            # Every finding reaches the report and the API through this one
+            # call, so normalize its typography here. The prompt asks for plain
+            # sentences; this makes it a guarantee rather than a preference.
+            findings = [replace(f, content=_plain_typography(f.content)) for f in findings]
 
             # Insert evidence with enrichment
             self.persistence.insert_evidence(

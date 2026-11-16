@@ -66,17 +66,16 @@ def init_tracer(config: OTelConfig) -> Callable | None:
             }
         )
 
-        # Create trace provider with batch span processor
+        # Create trace provider with batch span processor. The sampler is a
+        # constructor argument: assigning it afterwards left the provider's
+        # decisions to whatever default it had already built.
         provider = TracerProvider(
             resource=resource,
+            sampler=ParentBased(root=TraceIdRatioBased(config.sample_ratio)),
         )
 
         # Add batch span processor
         provider.add_span_processor(BatchSpanProcessor(exporter))
-
-        # Set sampler
-        sampler = ParentBased(root=TraceIdRatioBased(config.sample_ratio))
-        provider._sampler = sampler  # type: ignore
 
         # Set global tracer provider
         trace.set_tracer_provider(provider)
