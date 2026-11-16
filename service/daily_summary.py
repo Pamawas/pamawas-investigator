@@ -12,6 +12,7 @@ incident lists.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -29,8 +30,29 @@ SYSTEM_PROMPT = (
     "- Use only the facts given. Do not speculate about causes that are not "
     "stated, and do not invent numbers.\n"
     "- If nothing happened, say that in one sentence.\n"
-    "- Write in the past tense, plainly, without hype."
+    "- Write in the past tense, plainly, without hype.\n"
+    "- No em dashes or en dashes. Use a comma, a period, or 'and'.\n"
+    "- Avoid words nobody says out loud: delve, leverage, robust, seamless, "
+    "crucial, pivotal, comprehensive, holistic, landscape, realm, 'it is worth "
+    "noting', 'it is important to', 'navigate the', 'unlock', 'underscore'. "
+    "Say the thing instead.\n"
+    "- Do not use the 'not just X, but Y' construction, and do not pad to three "
+    "items for rhythm. Report what happened."
 )
+
+
+def plain_typography(text: str) -> str:
+    """Replace em and en dashes with plain punctuation.
+
+    They are the clearest generated-prose tell there is, and a digest line
+    rendered in a proportional font reads worse for them. The prompt asks for
+    plain sentences; this makes it hold even when the model ignores it.
+    """
+    if not text:
+        return text
+    cleaned = re.sub(r"\s*[\N{EM DASH}\N{EN DASH}\N{HORIZONTAL BAR}]\s*", ", ", text)
+    cleaned = re.sub(r",\s*,", ",", cleaned)
+    return re.sub(r"\s+([,.;:])", r"\1", cleaned).strip()
 
 
 def build_user_prompt(facts: dict[str, Any]) -> str:
@@ -95,7 +117,7 @@ def write_day_summary(llm, facts: dict[str, Any]) -> str:
         return ""
 
     content = getattr(response, "content", "") or ""
-    summary = clamp_sentences(content)
+    summary = plain_typography(clamp_sentences(content))
     if looks_like_prompt_echo(summary):
         logger.warning("Daily summary echoed the prompt; dropping it: %s", summary[:200])
         return ""
