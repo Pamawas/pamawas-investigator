@@ -123,6 +123,45 @@ class InvestigatorTools:
             logger.error("Prometheus query failed: %s", e)
             return {"status": "error", "error": str(e)}
 
+    def get_prometheus_labels(self, label: str = "") -> dict[str, Any]:
+        """List Prometheus label names, or the values of one label.
+
+        Without a label this returns every label name in the Prometheus
+        instance; with a label it returns that label's values. The
+        investigation uses this to build selectors against the real schema, so
+        it keeps working when Prometheus is swapped for one whose labels are
+        named differently.
+        """
+        start_time = time.time()
+        try:
+            import asyncio
+
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            if label:
+                result = loop.run_until_complete(self._prometheus_adapter.query_label_values(label))
+            else:
+                result = loop.run_until_complete(self._prometheus_adapter.query_labels())
+
+            duration = time.time() - start_time
+            observe_tool_call_duration("prometheus", duration)
+            if result.get("status") == "unavailable":
+                increment_tool_calls("prometheus", "circuit_open")
+                return result
+            increment_tool_calls("prometheus", "success")
+            return result
+
+        except (PrometheusError, TimeoutError, RuntimeError, OSError) as e:
+            duration = time.time() - start_time
+            observe_tool_call_duration("prometheus", duration)
+            increment_tool_calls("prometheus", "error")
+            logger.error("Prometheus label query failed: %s", e)
+            return {"status": "error", "error": str(e)}
+
     def get_loki_labels(self, label: str = "") -> dict[str, Any]:
         """List Loki label names, or the values of one label.
 
@@ -279,6 +318,35 @@ class ToolRegistry:
                             },
                         },
                         "required": ["promql", "start", "end"],
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_prometheus_labels",
+                    "description": (
+                        "List the Prometheus label schema: with no argument, all "
+                        "label names; with a label name, that label's values. Call "
+                        "this before writing a PromQL selector when unsure which "
+                        "labels or values exist, or when this deployment's labels "
+                        "are unknown — a selector naming a label that does not "
+                        "exist returns an empty result, which looks the same as "
+                        "'no data'. Discovering the schema first is what lets the "
+                        "investigation work against any Prometheus."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "label": {
+                                "type": "string",
+                                "description": (
+                                    "Optional label name whose values to list. "
+                                    "Omit to list all label names."
+                                ),
+                            },
+                        },
+                        "required": [],
                     },
                 },
             },

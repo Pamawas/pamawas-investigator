@@ -65,6 +65,7 @@ def test_tool_registry_names_match_definitions():
     assert names == [item["function"]["name"] for item in definitions]
     assert names == [
         "query_prometheus",
+        "get_prometheus_labels",
         "get_loki_labels",
         "query_loki",
         "get_related_incidents",

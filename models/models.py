@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -143,6 +143,17 @@ class InvestigationState:
     # deadline, ending with a null result a human could have had in one turn.
     consecutive_text_turns: int = 0
     completed: bool = False
+    # Results already produced in this run, keyed by (tool, arguments). A model
+    # that asks the same question again is answered from here instead of paying
+    # for it twice.
+    #
+    # Production runs showed why this matters: one investigation issued eleven
+    # identical `get_loki_labels {}` calls, got the same fifteen label names
+    # every time, and hit the tool limit having learned nothing after the second
+    # call. Every run that exhausted its budget had this shape. The prompt asks
+    # the model not to repeat itself, but a prompt is a preference and this is
+    # a guarantee.
+    seen_calls: dict[str, str] = field(default_factory=dict)
     error: str | None = None
     request_key_hash: str | None = None
     # Affected service for this incident; selects the Loki stream during

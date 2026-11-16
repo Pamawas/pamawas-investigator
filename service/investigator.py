@@ -152,6 +152,26 @@ def _plain_typography(text: str) -> str:
     return cleaned.strip()
 
 
+def _normalize_finding(finding: Finding) -> Finding:
+    """Apply the rules every finding must satisfy before it is stored.
+
+    Typography: no em or en dashes, which are the clearest generated-prose tell
+    and render as a stray line in a proportional font.
+
+    Confidence on an UNKNOWN: zero. The model was submitting `unknown` findings
+    at 0.9 confidence — "I am 90% confident that I do not know" — and the report
+    printed `UNKNOWN (90%)`, which reads as a strong claim about a non-answer.
+    Confidence belongs to a claim; an UNKNOWN is the absence of one.
+    """
+    content = _plain_typography(finding.content)
+    confidence = finding.confidence
+    if finding.type == EvidenceType.UNKNOWN:
+        confidence = 0.0
+    if content == finding.content and confidence == finding.confidence:
+        return finding
+    return replace(finding, content=content, confidence=confidence)
+
+
 def _sanitize_finding(finding: Finding) -> Finding:
     """Keep working notes out of a finding, whichever path produced it.
 
@@ -920,6 +940,14 @@ class PamawasInvestigator:
                 result = await self.tools._prometheus_adapter.query_range(promql, start, end)
                 return result, None, False
 
+            elif function_name == "get_prometheus_labels":
+                label = function_args.get("label") or ""
+                if label:
+                    result = await self.tools._prometheus_adapter.query_label_values(label)
+                else:
+                    result = await self.tools._prometheus_adapter.query_labels()
+                return result, None, False
+
             elif function_name == "get_loki_labels":
                 label = function_args.get("label") or ""
                 if label:
@@ -1053,6 +1081,66 @@ class PamawasInvestigator:
             result_str = self._truncate_context(result_str, self.config.truncation_limit)
             result = {"truncated": result_str}
         return result_str
+
+    @staticmethod
+    def _call_signature(function_name: str, function_args: dict) -> str:
+        """A stable identity for one tool call.
+
+        Arguments are sorted and serialized so that two spellings of the same
+        request — same keys in a different order — compare equal. A model
+        re-asking a question rarely re-types it identically.
+        """
+        try:
+            rendered = json.dumps(function_args or {}, sort_keys=True, default=str)
+        except TypeError, ValueError:
+            rendered = str(function_args)
+        return f"{function_name}:{rendered}"
+
+    def _serve_repeated_call(
+        self,
+        tool_call,
+        function_name: str,
+        function_args: dict,
+        state: InvestigationState,
+        messages: list[dict],
+    ) -> bool:
+        """Answer a repeated tool call from the first result.
+
+        Returns True when the call was served from the cache, in which case the
+        caller must not execute it. The API requires a message for every tool
+        call id, so the model still gets a reply — the same result it already
+        has, plus a note saying so. `tool_call_count` is deliberately not
+        incremented: the point is that a repeat costs no budget.
+
+        `submit_findings` is never cached. It is the terminal action, and its
+        arguments carry the findings themselves.
+        """
+        if function_name == "submit_findings":
+            return False
+
+        signature = self._call_signature(function_name, function_args)
+        previous = state.seen_calls.get(signature)
+        if previous is None:
+            return False
+
+        logger.warning(
+            "Repeated tool call served from cache: %s (args=%s)",
+            function_name,
+            function_args,
+        )
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": (
+                    "You already made this exact call earlier in this "
+                    "investigation. Its result is unchanged and repeated below. "
+                    "Do not call it again. Either query something different or "
+                    "submit your findings with submit_findings.\n\n" + previous
+                ),
+            }
+        )
+        return True
 
     def _handle_tool_result(
         self,
@@ -1637,6 +1725,16 @@ class PamawasInvestigator:
 
                 logger.info(f"Calling tool: {function_name} with args: {function_args}")
 
+                # Answer a repeated question from the first answer instead of
+                # paying for it again. A real run asked for the same Loki label
+                # list eleven times, received the same fifteen names each time,
+                # and reached the tool limit having learned nothing after the
+                # second call.
+                if self._serve_repeated_call(
+                    tool_call, function_name, function_args, state, messages
+                ):
+                    continue
+
                 tool_start = time.time()
                 result, findings, is_final = await self._execute_tool(function_name, function_args)
 
@@ -1646,6 +1744,10 @@ class PamawasInvestigator:
                     )
                     increment_findings_by_type(state.findings)
                     return findings
+
+                state.seen_calls[self._call_signature(function_name, function_args)] = (
+                    self._truncate_result(result)
+                )
 
                 self._handle_tool_result(
                     tool_call, function_name, function_args, result, tool_start, state, messages
@@ -1770,9 +1872,8 @@ class PamawasInvestigator:
                     logger.warning(f"Failed to fetch Loki logs for enrichment: {e}")
 
             # Every finding reaches the report and the API through this one
-            # call, so normalize its typography here. The prompt asks for plain
-            # sentences; this makes it a guarantee rather than a preference.
-            findings = [replace(f, content=_plain_typography(f.content)) for f in findings]
+            # call, so normalize it here rather than trusting the prompt.
+            findings = [_normalize_finding(f) for f in findings]
 
             # Insert evidence with enrichment
             self.persistence.insert_evidence(

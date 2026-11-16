@@ -766,3 +766,111 @@ def test_the_call_timeout_never_exceeds_the_remaining_budget_share():
     for budget, attempts in ((600.0, 3), (300.0, 2), (120.0, 3), (30.0, 1)):
         timeout = _call_timeout(60.0, budget, attempts_left=attempts)
         assert timeout <= max(60.0, budget), (budget, attempts, timeout)
+
+
+def test_a_repeated_tool_call_is_answered_from_the_first_result(investigator):
+    """A model that re-asks a question must not pay for it twice.
+
+    One production run issued eleven identical `get_loki_labels {}` calls,
+    received the same fifteen label names every time, and reached the tool limit
+    having learned nothing after the second call. Every exhausted run had this
+    shape.
+    """
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    messages = []
+
+    signature = investigator._call_signature("get_loki_labels", {})
+    state.seen_calls[signature] = '{"data": ["job", "instance"]}'
+
+    call = tool_call("get_loki_labels", {})
+    served = investigator._serve_repeated_call(call, "get_loki_labels", {}, state, messages)
+
+    assert served is True
+    assert len(messages) == 1
+    assert messages[0]["role"] == "tool"
+    assert messages[0]["tool_call_id"] == call.id
+    # The model gets the original answer back, plus a note saying it repeated.
+    assert '{"data": ["job", "instance"]}' in messages[0]["content"]
+    assert "Do not call it again" in messages[0]["content"]
+    # A repeat costs no budget: that is the whole point.
+    assert state.tool_call_count == 0
+
+
+def test_a_new_call_is_not_served_from_cache(investigator):
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    state.seen_calls[investigator._call_signature("get_loki_labels", {})] = "prior"
+    messages = []
+
+    # Different arguments: a genuinely different question.
+    served = investigator._serve_repeated_call(
+        tool_call("get_loki_labels", {"label": "job"}),
+        "get_loki_labels",
+        {"label": "job"},
+        state,
+        messages,
+    )
+
+    assert served is False
+    assert messages == []
+
+
+def test_argument_order_does_not_defeat_repeat_detection(investigator):
+    """Same request, keys in a different order, is the same request."""
+    a = investigator._call_signature("query_loki", {"logql": '{job="x"}', "limit": 20})
+    b = investigator._call_signature("query_loki", {"limit": 20, "logql": '{job="x"}'})
+    assert a == b
+
+
+def test_submit_findings_is_never_served_from_cache(investigator):
+    """The terminal action must always run: its arguments are the findings."""
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    state.seen_calls[investigator._call_signature("submit_findings", {"findings": []})] = "prior"
+
+    served = investigator._serve_repeated_call(
+        tool_call("submit_findings", {"findings": []}),
+        "submit_findings",
+        {"findings": []},
+        state,
+        [],
+    )
+    assert served is False
+
+
+def test_an_unknown_finding_carries_no_confidence():
+    """UNKNOWN (90%) is a contradiction: confidence belongs to a claim.
+
+    Production reports printed `❓ UNKNOWN (90%) Whether the Uptime Kuma probe
+    also failed ... is not established`. The model was expressing confidence in
+    a non-answer.
+    """
+    from models import EvidenceSource, Finding
+    from service.investigator import _normalize_finding
+
+    unknown = Finding(
+        type=EvidenceType.UNKNOWN,
+        content="Whether the external probe also failed is not established.",
+        source=EvidenceSource.LLM,
+        confidence=0.9,
+    )
+    normalized = _normalize_finding(unknown)
+    assert normalized.confidence == 0.0
+    assert normalized.content == unknown.content
+
+
+def test_a_fact_keeps_its_confidence():
+    from models import EvidenceSource, Finding
+    from service.investigator import _normalize_finding
+
+    fact = Finding(
+        type=EvidenceType.FACT,
+        content="up dropped to 0 at 14:20.",
+        source=EvidenceSource.PROMETHEUS,
+        confidence=1.0,
+    )
+    assert _normalize_finding(fact).confidence == 1.0

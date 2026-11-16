@@ -332,3 +332,121 @@ class PrometheusAdapter:
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus instant query failed: %s", e)
             raise PrometheusError(f"Prometheus query failed: {e}")
+
+    async def query_label_values(self, label: str) -> dict[str, Any]:
+        """Get the values for one Prometheus label.
+
+        Exposing the real label schema keeps the investigation honest when the
+        deployment changes: a selector built on a label that does not exist
+        returns an empty result, which reads as "no data" instead of "wrong
+        query". The model builds selectors that match the Prometheus it is
+        actually running against, not one this code was written for.
+        """
+        start_time = time.time()
+        client = await self._get_client()
+
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "circuit_open")
+            logger.warning("Prometheus circuit breaker open, rejecting label values query")
+            return self._unavailable_response("circuit_breaker_open")
+
+        try:
+            response = await client.get(f"/api/v1/label/{label}/values")
+            response.raise_for_status()
+            self._validate_response_size(len(response.content))
+            data = response.json()
+
+            if data.get("status") != "success":
+                error_msg = data.get("error", "Unknown Prometheus error")
+                self._circuit_breaker.record_failure()
+                raise PrometheusError(f"Prometheus error: {error_msg}")
+
+            self._circuit_breaker.record_success()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "success")
+            return {
+                "status": "success",
+                "label": label,
+                "data": data.get("data", []),
+            }
+
+        except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "timeout")
+            raise PrometheusTimeoutError(
+                f"Prometheus label values query timed out after {self.config.timeout_seconds}s"
+            )
+        except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            raise PrometheusError(
+                f"Prometheus HTTP error {e.response.status_code}: {e.response.text}"
+            )
+        except PrometheusError:
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            raise
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            logger.error("Prometheus label values query failed: %s", e)
+            raise PrometheusError(f"Prometheus label values query failed: {e}")
+
+    async def query_labels(self) -> dict[str, Any]:
+        """Get all label names from Prometheus."""
+        start_time = time.time()
+        client = await self._get_client()
+
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "circuit_open")
+            logger.warning("Prometheus circuit breaker open, rejecting labels query")
+            return self._unavailable_response("circuit_breaker_open")
+
+        try:
+            response = await client.get("/api/v1/labels")
+            response.raise_for_status()
+            self._validate_response_size(len(response.content))
+            data = response.json()
+
+            if data.get("status") != "success":
+                error_msg = data.get("error", "Unknown Prometheus error")
+                self._circuit_breaker.record_failure()
+                raise PrometheusError(f"Prometheus error: {error_msg}")
+
+            self._circuit_breaker.record_success()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "success")
+            return {
+                "status": "success",
+                "data": data.get("data", []),
+            }
+
+        except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "timeout")
+            raise PrometheusTimeoutError(
+                f"Prometheus labels query timed out after {self.config.timeout_seconds}s"
+            )
+        except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            raise PrometheusError(
+                f"Prometheus HTTP error {e.response.status_code}: {e.response.text}"
+            )
+        except PrometheusError:
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            raise
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            logger.error("Prometheus labels query failed: %s", e)
+            raise PrometheusError(f"Prometheus labels query failed: {e}")
