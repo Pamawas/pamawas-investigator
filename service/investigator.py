@@ -70,17 +70,97 @@ _REASONING_OPENERS = (
 )
 
 
+# Longest text that can still be a finding. A finding is a claim — a sentence or
+# two — not an essay. This also bounds what a report has to render.
+MAX_FINDING_CHARS = 1200
+
+# Phrases that appear when the model narrates its process rather than stating a
+# result: "Let me check...", "Wait —", "Actually, let me reconsider".
+_PROCESS_MARKERS = (
+    "let me",
+    "let's ",
+    "i need to",
+    "i should ",
+    "i'll ",
+    "i will ",
+    "wait —",
+    "wait,",
+    "hmm",
+    "actually,",
+    "but actually",
+    "let me step back",
+    "the key question is",
+    "i already ",
+    "let me think",
+    "let me reconsider",
+    "to summarize what i",
+    "checking ",
+)
+
+
 def _is_reasoning_preamble(text: str) -> bool:
-    """True when a reply is process narration with no conclusion in it."""
+    """True when a reply is process narration rather than a stated conclusion.
+
+    The first version of this only looked at the opening words and then gave up
+    if the text mentioned "likely cause" anywhere. That was trivially defeated:
+    a 6,292-character essay of working notes began with "Let me organize what I
+    know so far:" and contained the phrase "what the most likely cause is", so
+    the conclusion check passed and the whole essay was stored as a hypothesis
+    and published as the likely cause on a critical card.
+
+    Length is the reliable signal. A finding is one or two sentences; anything
+    long enough to contain a reconsidered line of reasoning is reasoning, no
+    matter which phrases it happens to include.
+    """
     lowered = " ".join((text or "").lower().split())
     if not lowered:
         return False
-    if not any(lowered.startswith(opener) for opener in _REASONING_OPENERS):
-        return False
-    # A preamble that nonetheless states a conclusion is still worth keeping.
-    return not any(
-        marker in lowered
-        for marker in ("the cause", "likely cause", "the root cause", "conclusion", "therefore")
+
+    # An essay is not a finding. This alone catches the case above.
+    if len(lowered) > MAX_FINDING_CHARS:
+        return True
+
+    opens_with_narration = any(lowered.startswith(opener) for opener in _REASONING_OPENERS)
+    marker_hits = sum(1 for marker in _PROCESS_MARKERS if marker in lowered)
+
+    if opens_with_narration:
+        # Narration followed by a conclusion is still worth reading, but only
+        # when it stays short; several process markers mean the model never
+        # reached a conclusion at all.
+        return marker_hits >= 2 or len(lowered) > 400
+
+    # Not opening with narration, but visibly reasoning throughout.
+    return marker_hits >= 3
+
+
+def _sanitize_finding(finding: Finding) -> Finding:
+    """Keep working notes out of a finding, whichever path produced it.
+
+    A model that narrates its reasoning does so through both exits of the loop:
+    as a plain text reply, and as a `submit_findings` call whose content is the
+    transcript rather than a conclusion. The text path rejects that; this covers
+    the tool path, so an essay cannot reach the report by being submitted
+    instead of typed.
+
+    The finding is replaced, not truncated. Half an essay is still an essay, and
+    the honest record is that this claim was never made.
+    """
+    if not _is_reasoning_preamble(finding.content):
+        return finding
+    logger.warning(
+        "Discarding a %s finding that was working notes (%d chars): %s",
+        finding.type,
+        len(finding.content),
+        " ".join(finding.content.split())[:120],
+    )
+    return Finding(
+        type=EvidenceType.UNKNOWN,
+        content=(
+            "Investigation ended without a stated conclusion; the model submitted "
+            "its working notes instead of a finding."
+        ),
+        source=EvidenceSource.SYSTEM,
+        confidence=0.0,
     )
 
 
@@ -140,6 +220,46 @@ def _resolved_tool_name(tool_call) -> str:
         return name
     inner = args.get("name") if isinstance(args, dict) else None
     return inner if isinstance(inner, str) and inner else name
+
+
+# Floor for a single LLM call. Below this a call cannot return anything useful,
+# so failing fast and letting the investigation submit what it has beats opening
+# another connection.
+_MIN_CALL_TIMEOUT_SECONDS = 5.0
+
+
+def _call_timeout(request_timeout: float, budget_seconds: float | None) -> float:
+    """How long one LLM request may take, given what is left of the budget.
+
+    A single call can outlast the whole investigation: 30s x 3 retries x 2
+    endpoints is 180 seconds, while the loop only checks the deadline *between*
+    turns. One slow call therefore ran a 300-second investigation for 540
+    seconds, and the run ended without submitting anything. Capping each call at
+    what remains keeps the reserve for writing findings meaningful.
+    """
+    if budget_seconds is None:
+        return request_timeout
+    return max(_MIN_CALL_TIMEOUT_SECONDS, min(request_timeout, budget_seconds))
+
+
+def _remaining_budget(started: float, budget_seconds: float | None) -> float | None:
+    """Seconds left of the budget, measured from when the call began."""
+    if budget_seconds is None:
+        return None
+    import time as _time
+
+    return max(0.0, budget_seconds - (_time.monotonic() - started))
+
+
+def _out_of_time(remaining: float | None, attempt: int) -> bool:
+    """True when a further retry cannot finish inside what is left.
+
+    The first attempt always runs: with the budget gone it still gets the floor
+    timeout, because returning an error without trying is strictly worse.
+    """
+    if remaining is None or attempt == 0:
+        return False
+    return remaining <= _MIN_CALL_TIMEOUT_SECONDS
 
 
 class InvestigatorLLM:
@@ -210,6 +330,7 @@ class InvestigatorLLM:
         tool_choice: str = "auto",
         max_tokens: int = 2000,
         session: str = "",
+        budget_seconds: float | None = None,
     ):
         """Call the LLM with optional tool use; failing over across endpoints
         and raising the last error.
@@ -229,16 +350,27 @@ class InvestigatorLLM:
         if tools is not None:
             optional = {"tools": tools, "tool_choice": tool_choice}
 
+        # Counted down across every attempt and every endpoint. A snapshot
+        # would let 3 retries x 30s run 90 seconds past the point where the
+        # investigation needed its reserve, which is exactly how a run with 13
+        # successful tool calls ended with no conclusion.
+        started = _time.monotonic()
+
         last_error: Exception | None = None
         for idx, (client, model) in enumerate(zip(self.clients, self.models)):
             endpoint_label = f"endpoint {idx + 1}/{len(self.endpoints)}"
             for attempt in range(self.MAX_RETRIES):
+                remaining = _remaining_budget(started, budget_seconds)
+                if _out_of_time(remaining, attempt):
+                    break
+                call_timeout = _call_timeout(self.REQUEST_TIMEOUT, remaining)
                 try:
                     response = client.chat.completions.create(
                         model=model,
                         messages=messages,
                         temperature=0.1,  # Low temperature for deterministic output
                         max_tokens=max_tokens,
+                        timeout=call_timeout,
                         **optional,
                     )
                     if idx > 0:
@@ -916,6 +1048,7 @@ class PamawasInvestigator:
     ):
         """Handle submit_findings tool call."""
         logger.info("Investigation completed via submit_findings")
+        findings = [_sanitize_finding(f) for f in findings]
         state.findings = findings
         state.completed = True
 
@@ -1073,6 +1206,15 @@ class PamawasInvestigator:
         # turn may issue zero tool calls (a prose reply), and if only tool calls
         # advanced the counter such a turn would loop forever until the
         # wall-clock deadline and end with a synthesized UNKNOWN.
+        # The reserve exists so the model has time to write up what it found.
+        # Exploring must stop when the reserve opens, which is earlier than the
+        # hard deadline; tool execution enforces this boundary.
+        reserve = max(
+            self.DEADLINE_RESERVE_MIN_SECONDS,
+            self.config.investigation_timeout_seconds * self.DEADLINE_RESERVE_FRACTION,
+        )
+        explore_deadline = deadline - reserve
+
         exhausted_by = ""
         warned_about_deadline = False
         forced_submission_started = False
@@ -1113,6 +1255,7 @@ class PamawasInvestigator:
                     messages=messages,
                     force_submit=force_submit,
                     deadline=deadline,
+                    explore_deadline=explore_deadline,
                 )
                 if result is not None:
                     return result
@@ -1209,6 +1352,7 @@ class PamawasInvestigator:
         messages: list[dict],
         force_submit: bool = False,
         deadline: float | None = None,
+        explore_deadline: float | None = None,
     ) -> list[Finding] | None:
         """Run a single investigation turn (LLM call + tool handling);
         returns findings if complete."""
@@ -1225,12 +1369,17 @@ class PamawasInvestigator:
         # Call the LLM off the asyncio event loop — chat_completion is a
         # synchronous OpenAI call (30s timeout x 3 retries) that would block
         # health probes and kill the background investigation task.
+        # The call may spend at most what is left of the budget. Without this a
+        # single retried call could consume the whole investigation, including
+        # the reserve set aside for writing the findings.
+        budget = None if deadline is None else max(0.0, deadline - time.monotonic())
         response = await asyncio.to_thread(
             self.llm.chat_completion,
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
             session=incident_id,
+            budget_seconds=budget,
         )
 
         # Add the assistant's response to the conversation
@@ -1262,17 +1411,23 @@ class PamawasInvestigator:
             for tool_call in tool_calls:
                 function_name, function_args = _resolve_tool_call(tool_call)
 
-                # A turn may carry several tool calls and each can take up to
-                # the tool timeout, so a burst can consume the reserve set aside
-                # for writing the findings. Stop executing here rather than
-                # discovering the overrun at the next turn boundary — but always
-                # run submit_findings, which is the write-up itself.
+                # The reserve is a wall, not a checkpoint. A single turn may
+                # carry several tool calls and each can take up to the tool
+                # timeout, so the reserve can be consumed entirely inside one
+                # turn: a real run made 13 successful tool calls, blew through
+                # its 90-second reserve, hit the hard deadline at the top of the
+                # next iteration and submitted nothing. No new tool call starts
+                # once the reserve opens — submit_findings always runs, because
+                # that is the write-up the reserve exists to protect.
+                explore_until = explore_deadline if explore_deadline is not None else deadline
                 if (
-                    deadline is not None
+                    explore_until is not None
                     and function_name != "submit_findings"
-                    and time.monotonic() >= deadline
+                    and time.monotonic() >= explore_until
                 ):
-                    logger.warning("Deadline reached mid-turn; not executing remaining tool calls")
+                    logger.warning(
+                        "Investigation is into its reserve; not starting further tool calls"
+                    )
                     return None
 
                 logger.info(f"Calling tool: {function_name} with args: {function_args}")

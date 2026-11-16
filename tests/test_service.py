@@ -37,6 +37,9 @@ def test_llm_initialization_and_completion(config):
     client.chat.completions.create.assert_called_once_with(
         model="test-model",
         messages=[{"role": "user", "content": "hi"}],
+        # Each call is capped so one slow request cannot outlast the whole
+        # investigation budget.
+        timeout=30.0,
         tools=[],
         tool_choice="auto",
         temperature=0.1,
@@ -404,7 +407,9 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
 
     seen_tool_choices = []
 
-    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
+    def fake_completion(
+        messages, tools=None, tool_choice="auto", max_tokens=2000, session="", budget_seconds=None
+    ):
         seen_tool_choices.append(tool_choice)
         if isinstance(tool_choice, dict):
             return response(
@@ -460,7 +465,9 @@ def test_forced_turn_that_ignores_tool_choice_does_not_spend_the_reserve(investi
         return_value={"status": "success", "data": [1]}
     )
 
-    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
+    def fake_completion(
+        messages, tools=None, tool_choice="auto", max_tokens=2000, session="", budget_seconds=None
+    ):
         # Never submits, and ignores the forced tool_choice.
         return response(
             tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
@@ -534,7 +541,9 @@ def test_each_investigation_gets_its_own_conversation(investigator):
     """
     seen: list[list[dict]] = []
 
-    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
+    def fake_completion(
+        messages, tools=None, tool_choice="auto", max_tokens=2000, session="", budget_seconds=None
+    ):
         # Snapshot the conversation as the model saw it.
         seen.append([m.get("content", "") for m in messages])
         return response(content="nothing conclusive", tool_calls=None)
@@ -561,7 +570,9 @@ def test_llm_calls_are_labelled_with_their_session(investigator):
     """A slow or failing LLM call must be traceable to one incident."""
     sessions = []
 
-    def fake_completion(messages, tools=None, tool_choice="auto", max_tokens=2000, session=""):
+    def fake_completion(
+        messages, tools=None, tool_choice="auto", max_tokens=2000, session="", budget_seconds=None
+    ):
         sessions.append(session)
         return response(content="done", tool_calls=None)
 
@@ -574,3 +585,131 @@ def test_llm_calls_are_labelled_with_their_session(investigator):
     investigator.investigate("inc_session_label")
 
     assert sessions == ["inc_session_label"]
+
+
+def test_long_working_notes_are_not_a_finding_even_when_they_say_likely_cause():
+    """The regression that reached a critical card.
+
+    A 6,293-character essay of working notes began "Let me organize what I know
+    so far:" and contained the phrase "what the most likely cause is". The first
+    detector gave up as soon as it saw "likely cause", so the whole essay was
+    stored as a hypothesis and published as the likely cause.
+
+    Length is the reliable signal: a finding is a claim, not an investigation
+    transcript, however many conclusion-shaped phrases it happens to contain.
+    """
+    from service.investigator import MAX_FINDING_CHARS, _is_reasoning_preamble
+
+    blob = (
+        "Let me organize what I know so far:\n\n"
+        'up{job="docker_cadvisor", instance="koba-labs"} shows intermittent '
+        "single-scrape failures at 14:31, 14:43, 14:56, 15:23. "
+        "At 14:51:00 the system_node was also down. "
+        "Hmm, actually let me reconsider whether this is a Prometheus-side issue. "
+        "Let me check a few more things. "
+        "The key question is what caused the alert. "
+        "Actually, let me step back. "
+        "So the most likely cause is a transient network issue. " + "Details follow. " * 400
+    )
+    assert len(blob) > MAX_FINDING_CHARS
+
+    assert _is_reasoning_preamble(blob) is True
+
+
+def test_a_short_finding_may_use_the_word_cause():
+    """The honest case must not be caught by the same rule."""
+    from service.investigator import _is_reasoning_preamble
+
+    assert not _is_reasoning_preamble(
+        "The likely cause is an OOM kill in the wazuh container at 03:42 UTC."
+    )
+    assert not _is_reasoning_preamble(
+        "The node ran out of memory; the wazuh container leaked heap until the "
+        "kernel OOM-killed it. Restarting the pod cleared the condition."
+    )
+
+
+def test_working_notes_submitted_through_the_tool_are_rejected(investigator):
+    """The essay could also arrive by being submitted, not typed.
+
+    Both exits from the loop must apply the same rule, or the model just picks
+    the other one.
+    """
+    from models import EvidenceSource, Finding
+    from service.investigator import _sanitize_finding
+
+    long_notes = Finding(
+        type=EvidenceType.HYPOTHESIS,
+        content="Let me organize what I know so far: " + "then I checked the metrics. " * 200,
+        source=EvidenceSource.LLM,
+        confidence=0.3,
+    )
+    real = Finding(
+        type=EvidenceType.LIKELY_CAUSE,
+        content="An OOM kill in the wazuh container.",
+        source=EvidenceSource.LLM,
+        confidence=0.85,
+    )
+
+    cleaned = [_sanitize_finding(f) for f in (long_notes, real)]
+
+    assert cleaned[0].type is EvidenceType.UNKNOWN
+    assert "working notes" in cleaned[0].content
+    assert cleaned[1].content == "An OOM kill in the wazuh container."
+
+
+def test_no_tool_calls_start_once_the_reserve_opens(investigator, monkeypatch):
+    """The reserve must be a wall, not a checkpoint.
+
+    A real run made 13 successful tool calls, blew through its 90-second
+    reserve inside a single turn, hit the hard deadline at the top of the next
+    iteration and submitted nothing — "13 of 13 tool calls returned data; no
+    conclusion was recorded before the budget ran out".
+
+    The loop only checked the deadline between turns, but a turn can carry
+    several tool calls, each taking up to the tool timeout. This exercises the
+    guard inside one turn, which is where the budget was actually lost.
+    """
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock
+
+    from models import InvestigationState
+
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": [1]}
+    )
+    investigator.llm.chat_completion = MagicMock(
+        side_effect=lambda *a, **kw: response(
+            tool_calls=[
+                tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"}, "c1"),
+                tool_call("query_prometheus", {"promql": "load", "start": "s", "end": "e"}, "c2"),
+                tool_call("query_prometheus", {"promql": "mem", "start": "s", "end": "e"}, "c3"),
+            ]
+        )
+    )
+
+    state = InvestigationState(
+        incident_id="inc", findings=[], tool_calls=[], max_tool_calls=50
+    )
+
+    def run(explore_deadline):
+        state.tool_calls = []
+        state.turn_count = 1
+        asyncio.run(
+            investigator._handle_investigation_turn(
+                incident_id="inc",
+                request_key_hash="h",
+                state=state,
+                messages=[],
+                force_submit=False,
+                deadline=None,
+                explore_deadline=explore_deadline,
+            )
+        )
+        return len(state.tool_calls)
+
+    # Reserve already open: no new query may start.
+    assert run(explore_deadline=0.0) == 0, "no tool call may start inside the reserve"
+    # Plenty of exploration time left: all three run.
+    assert run(explore_deadline=time.monotonic() + 3600) == 3
