@@ -249,19 +249,43 @@ def _resolved_tool_name(tool_call) -> str:
 # another connection.
 _MIN_CALL_TIMEOUT_SECONDS = 5.0
 
+# Ceiling for a single LLM call. It exists so a hung endpoint cannot consume the
+# whole investigation on one attempt, not to say how long a healthy call takes.
+MAX_CALL_TIMEOUT_SECONDS = 180.0
 
-def _call_timeout(request_timeout: float, budget_seconds: float | None) -> float:
+
+def _call_timeout(
+    request_timeout: float, budget_seconds: float | None, attempts_left: int = 1
+) -> float:
     """How long one LLM request may take, given what is left of the budget.
 
-    A single call can outlast the whole investigation: 30s x 3 retries x 2
-    endpoints is 180 seconds, while the loop only checks the deadline *between*
-    turns. One slow call therefore ran a 300-second investigation for 540
-    seconds, and the run ended without submitting anything. Capping each call at
-    what remains keeps the reserve for writing findings meaningful.
+    This used to be `min(request_timeout, budget)`, which capped every call at
+    30 seconds regardless of how much budget remained. That is a paid-API
+    assumption: a free endpoint generating a tool-call response routinely needs
+    60 to 120 seconds, so every call was cut off mid-generation, retried against
+    the same slow endpoint, and eventually failed over to a second slow endpoint
+    that timed out the same way. Production logs show exactly that — six
+    consecutive `Request timed out` lines for one incident — and the run ended
+    with no findings after burning its whole budget on timeouts.
+
+    The budget, not a fixed number, is the authority. Each attempt gets an equal
+    share of what is left, which lets a slow model finish while still leaving
+    room for a retry. `request_timeout` is now a floor for the normal case, not a
+    cap.
+
+    Two bounds keep the share honest. It never exceeds what is left, so a call
+    cannot promise time the investigation does not have; and it never exceeds
+    `MAX_CALL_TIMEOUT_SECONDS`, so one hung endpoint cannot consume the whole
+    run on a single attempt. The only exception to the first bound is the
+    floor: with seconds left, a 5-second attempt is still worth making.
     """
     if budget_seconds is None:
         return request_timeout
-    return max(_MIN_CALL_TIMEOUT_SECONDS, min(request_timeout, budget_seconds))
+    share = max(request_timeout, budget_seconds / max(1, attempts_left))
+    return max(
+        _MIN_CALL_TIMEOUT_SECONDS,
+        min(share, MAX_CALL_TIMEOUT_SECONDS, budget_seconds),
+    )
 
 
 def _remaining_budget(started: float, budget_seconds: float | None) -> float | None:
@@ -271,6 +295,11 @@ def _remaining_budget(started: float, budget_seconds: float | None) -> float | N
     import time as _time
 
     return max(0.0, budget_seconds - (_time.monotonic() - started))
+
+
+def _is_timeout(error: Exception) -> bool:
+    """True when the endpoint accepted the request but did not answer in time."""
+    return isinstance(error, (openai.APITimeoutError, TimeoutError))
 
 
 def _out_of_time(remaining: float | None, attempt: int) -> bool:
@@ -292,11 +321,15 @@ class InvestigatorLLM:
     MAX_RETRIES = 3
     INITIAL_BACKOFF_SECONDS = 0.5
     MAX_BACKOFF_SECONDS = 4.0
-    # SDK-level timeout (seconds) applied to every request. Without this a
-    # hung endpoint blocks the investigation loop with no wall-clock cap.
-    REQUEST_TIMEOUT = 30.0
 
     def __init__(self, config: Config):
+        # Floor for a single request, from LLM_REQUEST_TIMEOUT_SECONDS. It is a
+        # floor rather than a cap: `_call_timeout` gives each attempt a share of
+        # the remaining investigation budget, so a slow free endpoint is allowed
+        # the time it actually needs. Tuning this below the model's real latency
+        # is what made every call time out.
+        self.request_timeout = float(getattr(config, "llm_request_timeout_seconds", 0) or 60.0)
+
         # Build ordered endpoint list from plural env vars only.
         endpoints: list[tuple[str, str | None, str | None]] = []
         if config.llm_base_urls:
@@ -321,7 +354,7 @@ class InvestigatorLLM:
         for url, key, model in endpoints:
             try:
                 self.clients.append(
-                    OpenAI(base_url=url, api_key=key or "", timeout=self.REQUEST_TIMEOUT)
+                    OpenAI(base_url=url, api_key=key or "", timeout=self.request_timeout)
                 )
                 self.models.append(model or config.llm_model)
             except openai.OpenAIError as e:
@@ -344,6 +377,52 @@ class InvestigatorLLM:
         if isinstance(error, openai.APIStatusError) and error.status_code >= 500:
             return True
         return False
+
+    def _should_fail_over(
+        self,
+        error: Exception,
+        endpoint_index: int,
+        attempt: int,
+        call_timeout: float,
+        endpoint_label: str,
+        session: str,
+    ) -> bool:
+        """Decide whether to abandon this endpoint and try the next one.
+
+        A timeout is a capacity signal, not a blip: the endpoint accepted the
+        request and could not answer inside the time it was given. Retrying the
+        same slow endpoint spends the budget waiting for the same result, so the
+        next endpoint is tried instead. Retries stay for connection errors and
+        5xx responses, which really are transient.
+
+        With only one endpoint configured there is nothing to fail over to, so
+        the normal retry policy applies and the endpoint gets another attempt.
+        """
+        retryable = self._is_retryable(error)
+        has_another_endpoint = endpoint_index < len(self.clients) - 1
+
+        if _is_timeout(error) and has_another_endpoint:
+            logger.warning(
+                "LLM call timed out on %s after %.0fs; failing over instead of "
+                "retrying the same endpoint (session=%s)",
+                endpoint_label,
+                call_timeout,
+                session,
+            )
+            return True
+
+        if retryable and attempt < self.MAX_RETRIES - 1:
+            return False
+
+        if retryable:
+            logger.warning(
+                "LLM retries exhausted on %s (%d); failing over",
+                endpoint_label,
+                self.MAX_RETRIES,
+            )
+        else:
+            logger.error("LLM call failed (non-retryable, session=%s): %s", session, error)
+        return True
 
     def chat_completion(
         self,
@@ -385,7 +464,9 @@ class InvestigatorLLM:
                 remaining = _remaining_budget(started, budget_seconds)
                 if _out_of_time(remaining, attempt):
                     break
-                call_timeout = _call_timeout(self.REQUEST_TIMEOUT, remaining)
+                call_timeout = _call_timeout(
+                    self.request_timeout, remaining, self.MAX_RETRIES - attempt
+                )
                 try:
                     response = client.chat.completions.create(
                         model=model,
@@ -411,22 +492,9 @@ class InvestigatorLLM:
                     TimeoutError,
                 ) as e:
                     last_error = e
-                    retryable = self._is_retryable(e)
-                    if not retryable or attempt == self.MAX_RETRIES - 1:
-                        # Non-retryable, or retries exhausted on this endpoint:
-                        # fail over to the next endpoint rather than aborting.
-                        if not retryable:
-                            logger.error(
-                                "LLM call failed (non-retryable, session=%s): %s",
-                                session,
-                                e,
-                            )
-                        else:
-                            logger.warning(
-                                "LLM retries exhausted on %s (%d); failing over",
-                                endpoint_label,
-                                self.MAX_RETRIES,
-                            )
+                    if self._should_fail_over(
+                        e, idx, attempt, call_timeout, endpoint_label, session
+                    ):
                         break
                     backoff = min(
                         self.INITIAL_BACKOFF_SECONDS * (2**attempt),
@@ -1499,13 +1567,17 @@ class PamawasInvestigator:
         )
         tools = ToolRegistry.get_tools()
 
-        # Call the LLM off the asyncio event loop — chat_completion is a
-        # synchronous OpenAI call (30s timeout x 3 retries) that would block
-        # health probes and kill the background investigation task.
-        # The call may spend at most what is left of the budget. Without this a
-        # single retried call could consume the whole investigation, including
-        # the reserve set aside for writing the findings.
-        budget = None if deadline is None else max(0.0, deadline - time.monotonic())
+        # Call the LLM off the asyncio event loop: chat_completion is a
+        # synchronous SDK call (retries with backoff) that would block health
+        # probes and kill the background investigation task.
+        #
+        # An exploring turn may spend what is left before the reserve opens, not
+        # what is left before the hard deadline. Using the deadline here let one
+        # slow explore call eat the reserve that exists to write the findings,
+        # and the run then ended with nothing to report. The forced-submission
+        # turn is the write-up itself, so it may use the whole remainder.
+        budget_deadline = deadline if must_submit else (explore_deadline or deadline)
+        budget = None if budget_deadline is None else max(0.0, budget_deadline - time.monotonic())
         response = await asyncio.to_thread(
             self.llm.chat_completion,
             messages=messages,

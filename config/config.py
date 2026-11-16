@@ -84,6 +84,10 @@ class Config:
     circuit_breaker_half_open_max_calls: int = 3
     # Overall investigation deadline (wall clock, seconds)
     investigation_timeout_seconds: float = 600.0
+    # Floor for a single LLM request. A call is allowed a share of the remaining
+    # investigation budget when that is larger, so this is not a cap: a free
+    # endpoint that needs 90 seconds to answer still gets to answer.
+    llm_request_timeout_seconds: float = 60.0
     # Auto-retry budget for a single investigation run: how many times it may be
     # (re)executed total before going failed_terminal (default: initial + 4).
     max_investigation_attempts: int = 5
@@ -160,6 +164,7 @@ class Config:
             investigation_timeout_seconds=float(
                 os.getenv("INVESTIGATION_TIMEOUT_SECONDS", "600.0")
             ),
+            llm_request_timeout_seconds=float(os.getenv("LLM_REQUEST_TIMEOUT_SECONDS", "60.0")),
             max_investigation_attempts=int(os.getenv("MAX_INVESTIGATION_ATTEMPTS", "5")),
             investigation_retry_backoff_seconds=int(
                 os.getenv("INVESTIGATION_RETRY_BACKOFF_SECONDS", "60")

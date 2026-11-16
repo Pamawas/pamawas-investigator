@@ -32,14 +32,15 @@ def test_llm_initialization_and_completion(config):
     openai.assert_called_once_with(
         base_url=config.llm_base_urls[0],
         api_key=config.llm_api_keys[0],
-        timeout=30.0,
+        # The floor for one request, not a cap. A call gets a share of the
+        # remaining investigation budget when that is larger.
+        timeout=60.0,
     )
     client.chat.completions.create.assert_called_once_with(
         model="test-model",
         messages=[{"role": "user", "content": "hi"}],
-        # Each call is capped so one slow request cannot outlast the whole
-        # investigation budget.
-        timeout=30.0,
+        # With no budget supplied, the floor applies.
+        timeout=60.0,
         tools=[],
         tool_choice="auto",
         temperature=0.1,
@@ -736,3 +737,32 @@ def test_no_tool_calls_start_once_the_reserve_opens(investigator, monkeypatch):
     assert run(explore_deadline=0.0) == 0, "no tool call may start inside the reserve"
     # Plenty of exploration time left: all three run.
     assert run(explore_deadline=time.monotonic() + 3600) == 3
+
+
+def test_a_slow_model_gets_the_budget_not_a_30_second_cap():
+    """A free endpoint that needs 90 seconds must not be cut off at 30.
+
+    Production runs failed with six consecutive `Request timed out` lines: every
+    call was capped at 30 seconds regardless of how much investigation budget
+    remained, so a slow endpoint could never finish and the run ended with no
+    findings. The budget is the authority, not a fixed per-call number.
+    """
+    from service.investigator import MAX_CALL_TIMEOUT_SECONDS, _call_timeout
+
+    # Plenty of budget: the share is far more than the floor.
+    assert _call_timeout(60.0, 540.0, attempts_left=3) == MAX_CALL_TIMEOUT_SECONDS
+    # Two thirds of the way through: still generous enough to answer.
+    assert _call_timeout(60.0, 200.0, attempts_left=2) == 100.0
+    # Nearly out of budget: the floor, so the call still gets a chance.
+    assert _call_timeout(60.0, 4.0, attempts_left=1) == 5.0
+    # No budget at all (tool-free callers such as the daily summary).
+    assert _call_timeout(60.0, None) == 60.0
+
+
+def test_the_call_timeout_never_exceeds_the_remaining_budget_share():
+    """A single attempt cannot promise more time than the budget holds."""
+    from service.investigator import _call_timeout
+
+    for budget, attempts in ((600.0, 3), (300.0, 2), (120.0, 3), (30.0, 1)):
+        timeout = _call_timeout(60.0, budget, attempts_left=attempts)
+        assert timeout <= max(60.0, budget), (budget, attempts, timeout)
