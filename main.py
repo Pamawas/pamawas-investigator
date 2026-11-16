@@ -151,6 +151,14 @@ app = FastAPI(
     description="Bounded tool-calling LLM investigation engine for infrastructure incidents",
     version=APP_VERSION,
     lifespan=lifespan,
+    # FastAPI's own OpenTelemetry integration activates itself as soon as a
+    # tracer provider exists, and it cannot be told to skip liveness probes.
+    # Left on, every request produced two server spans — one from FastAPI
+    # (scope "fastapi") and one from LoggingMiddleware — and /healthz, /ready
+    # and /metrics filled Tempo with spans nobody opens. LoggingMiddleware is
+    # the single span owner here, matching the four Go services, so the access
+    # log lines and the trace share one set of IDs and probes stay untraced.
+    telemetry={"tracing": False},
 )
 
 # Per-route rate limiting (design review P5). Installed at app construction,
