@@ -352,19 +352,31 @@ def test_leaves_ordinary_tool_calls_alone():
 
 
 def _advancing_clock(monkeypatch, step=0.5):
-    """Replace time.monotonic with a clock that advances on every read.
+    """Give the investigator module a clock that advances on every read.
 
     The deadline logic compares against the wall clock, so a test that runs in
     microseconds never reaches the reserve. A fake clock makes the turn at
     which the reserve opens deterministic instead of timing-dependent.
+
+    The fake replaces the `time` name in service.investigator's namespace, not
+    time.monotonic on the shared module. Patching the module attribute rewrote
+    the clock for everything in the process — including asyncio's event loop,
+    which reads monotonic constantly — so the investigation's budget expired
+    before its first turn and the test failed for reasons unrelated to the code.
     """
     now = [1000.0]
 
-    def fake_monotonic():
-        now[0] += step
-        return now[0]
+    class FakeTime:
+        @staticmethod
+        def monotonic():
+            now[0] += step
+            return now[0]
 
-    monkeypatch.setattr("service.investigator.time.monotonic", fake_monotonic)
+        @staticmethod
+        def time():
+            return now[0]
+
+    monkeypatch.setattr("service.investigator.time", FakeTime)
 
 
 def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigator, monkeypatch):
