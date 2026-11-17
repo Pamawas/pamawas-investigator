@@ -88,6 +88,12 @@ class Config:
     # investigation budget when that is larger, so this is not a cap: a free
     # endpoint that needs 90 seconds to answer still gets to answer.
     llm_request_timeout_seconds: float = 60.0
+    # Tool-call budget for a single stale-incident verification. A verification
+    # answers one question ("is the target still down?") and stops, so it needs
+    # far fewer calls than a full investigation.
+    verify_max_tool_calls: int = 6
+    # Wall-clock budget, in seconds, for a single verification.
+    verify_timeout_seconds: float = 180.0
     # Auto-retry budget for a single investigation run: how many times it may be
     # (re)executed total before going failed_terminal (default: initial + 4).
     max_investigation_attempts: int = 5
@@ -170,6 +176,8 @@ class Config:
                 os.getenv("INVESTIGATION_RETRY_BACKOFF_SECONDS", "60")
             ),
             retry_scheduler_tick_seconds=float(os.getenv("RETRY_SCHEDULER_TICK_SECONDS", "15")),
+            verify_max_tool_calls=int(os.getenv("VERIFY_TOOL_CALLS", "6")),
+            verify_timeout_seconds=float(os.getenv("VERIFY_TIMEOUT_SECONDS", "180.0")),
         )
         cfg.validate()
         return cfg
@@ -205,6 +213,7 @@ class Config:
         for field, env_var in [
             ("investigation_timeout_seconds", "INVESTIGATION_TIMEOUT_SECONDS"),
             ("llm_request_timeout_seconds", "LLM_REQUEST_TIMEOUT_SECONDS"),
+            ("verify_timeout_seconds", "VERIFY_TIMEOUT_SECONDS"),
             ("circuit_breaker_timeout_seconds", "CIRCUIT_BREAKER_TIMEOUT_SECONDS"),
             ("prometheus_timeout_seconds", "PROMETHEUS_TIMEOUT_SECONDS"),
             ("loki_timeout_seconds", "LOKI_TIMEOUT_SECONDS"),

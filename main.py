@@ -18,6 +18,7 @@ from config import Config as InvestigationConfig
 from config import rate_limit_from_env
 from logging_middleware import LoggingMiddleware, get_logger
 from metrics import (
+    increment_verify,
     investigation_retry_errors_total,
     investigation_retry_exhausted_total,
     investigation_retry_reclaimed_total,
@@ -327,6 +328,16 @@ class DailySummaryRequest(BaseModel):
     incidents: list[dict[str, Any]]
 
 
+class VerifyRequest(BaseModel):
+    """Request body for POST /api/v1/verify (a stale-incident verification).
+
+    Matches the contract in stale-incident-verification.md §4a.
+    """
+
+    contract_version: int
+    incident_id: str
+
+
 async def _verify_service_token(x_service_token: str | None = Header(None)) -> str:
     """Verify the service token for internal mutation endpoints."""
     expected_token = os.getenv("PAMAWAS_SERVICE_TOKEN", "")
@@ -516,6 +527,50 @@ async def summarize_day(
     if not body.incidents:
         return {"summary": "", "reason": "no_incidents"}
     return {"summary": investigator.write_day_summary(body.model_dump())}
+
+
+@app.post("/api/v1/verify")
+async def verify_incident(
+    body: VerifyRequest,
+    x_service_token: str | None = Header(None),
+):
+    """Verify whether an incident is still actually down (stale check).
+
+    Contract: stale-incident-verification.md §4a. The correlator calls this when
+    an open incident has gone silent past INCIDENT_STALE_AFTER, and acts on the
+    verdict: close the incident only on "recovered", otherwise keep it open and
+    alert why.
+
+    Unlike POST /api/v1/investigations this runs synchronously (not queued): the
+    caller needs the verdict now to decide. It is service-token protected like
+    every other mutation endpoint.
+    """
+    await _verify_service_token(x_service_token)
+
+    if investigator is None:
+        return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
+
+    start = time.time()
+    try:
+        result = await investigator.verify_incident(body.incident_id)
+    except Exception as e:  # noqa: BLE001
+        log.error("verify_incident_failed", incident_id=body.incident_id, error=str(e))
+        # A verification that fails must not close the incident: treat it as
+        # still_down so the correlator keeps it open.
+        return {
+            "request_id": f"req_{body.incident_id[:16]}",
+            "data": {
+                "verdict": "still_down",
+                "reason": f"Verification failed: {e}",
+                "findings": [],
+            },
+        }
+
+    increment_verify(result.get("verdict", "still_down"), time.time() - start)
+    return {
+        "request_id": f"req_{body.incident_id[:16]}",
+        "data": result,
+    }
 
 
 @app.get("/api/v1/investigations/{run_id}")

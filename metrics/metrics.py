@@ -10,6 +10,17 @@ investigations_total = Counter(
     "Total number of investigations started",
 )
 
+verify_total = Counter(
+    "pamawas_investigator_verify_total",
+    "Total number of stale-incident verifications run",
+    ["verdict"],
+)
+
+verify_duration = Histogram(
+    "pamawas_investigator_verify_duration_seconds",
+    "Stale-incident verification wall-clock duration in seconds",
+)
+
 max_tool_calls_reached = Counter(
     "pamawas_investigator_max_tool_calls_reached_total",
     "Total number of investigations that hit max tool calls without submitting findings",
@@ -105,6 +116,12 @@ def increment_forced_submission():
 
 def increment_investigations():
     investigations_total.inc()
+
+
+def increment_verify(verdict: str, duration_seconds: float):
+    """Record a stale-incident verification and its wall-clock duration."""
+    verify_total.labels(verdict=verdict).inc()
+    verify_duration.observe(duration_seconds)
 
 
 def increment_tool_calls(tool: str, status: str):

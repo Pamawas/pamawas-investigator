@@ -8,6 +8,7 @@ import time
 from dataclasses import replace
 from datetime import datetime
 from datetime import timezone as tz
+from typing import Any
 
 import openai
 import psycopg2
@@ -320,6 +321,31 @@ def _remaining_budget(started: float, budget_seconds: float | None) -> float | N
 def _is_timeout(error: Exception) -> bool:
     """True when the endpoint accepted the request but did not answer in time."""
     return isinstance(error, (openai.APITimeoutError, TimeoutError))
+
+
+def _claim_recovered(text: str) -> bool:
+    """True when a finding states the condition is no longer failing.
+
+    A verification only closes an incident on a positive claim of recovery.
+    Anything phrased as a negative ("no longer down", "recovered", "back up",
+    "reachable") counts; anything phrased as uncertainty or a status does not.
+    """
+    lowered = " ".join((text or "").lower().split())
+    positive_recovery = (
+        "recovered",
+        "back up",
+        "backup",
+        "is up",
+        "is back",
+        "no longer down",
+        "no longer failing",
+        "returned",
+        "reachable",
+        "is alive",
+        "restored",
+        "self-resolved",
+    )
+    return any(marker in lowered for marker in positive_recovery)
 
 
 def _out_of_time(remaining: float | None, attempt: int) -> bool:
@@ -870,6 +896,38 @@ class PamawasInvestigator:
             "- Do not assume a 'service' or 'app' label exists.\n"
         )
 
+    def _build_verification_prompt(self, context: IncidentContext | None = None) -> str:
+        """Build the system prompt for a stale-incident verification.
+
+        A verification answers one question — "is this condition actually still
+        down?" — that decides whether a silent incident is closed or kept open.
+        It is deliberately narrower than a full investigation: the model is told
+        to determine the current state of the affected target and stop, not to
+        chase a root cause.
+        """
+        affected = "unspecified"
+        if context is not None:
+            affected = ", ".join(context.affected_services or []) or "unspecified"
+        incident = context.incident_id if context else "unknown"
+        title = context.title if context else "unknown"
+
+        return (
+            "\n=== SESSION SCOPE (VERIFICATION) ===\n"
+            f"This session verifies one incident: {incident}.\n"
+            f"Title: {title}\n"
+            f"Affected service(s): {affected}\n"
+            "Answer ONE question: is this condition actually still down right now?\n"
+            "- Query Prometheus and Uptime Kuma first (monitor_status, up, "
+            "scrape_duration_seconds) to establish the current state. Call "
+            "get_prometheus_labels / get_loki_labels first if the label schema is "
+            "unknown.\n"
+            "- Then check logs in Loki and incident history (get_related_incidents) "
+            "only if the metrics are ambiguous.\n"
+            "- Submit a FACT: 'The target is still down' or 'The target has "
+            "recovered'. An UNKNOWN must not claim recovery.\n"
+            "=== END SESSION SCOPE ===\n"
+        )
+
     def _build_initial_message(self, context: IncidentContext) -> dict:
         """Build the initial user message with incident context."""
         return {
@@ -1339,6 +1397,77 @@ class PamawasInvestigator:
             deadline=deadline,
         )
 
+    async def verify_incident(self, incident_id: str) -> dict[str, Any]:
+        """Return a verdict on whether an incident is still actually down.
+
+        This answers a stale-open incident: the correlator found one that has
+        gone silent past INCIDENT_STALE_AFTER, and asks whether the condition is
+        real before deciding to close it. It runs synchronously here (not queued)
+        because the caller needs the verdict now to act on it.
+
+        The verdict is evidence-backed. Only a positive claim that the target
+        recovered closes the incident; anything else — still down, uncertain, or
+        an empty result — keeps it open. Returns a dict with verdict, a one-line
+        reason drawn from the highest-confidence finding, and the findings.
+        """
+        context = self._get_incident_context(incident_id)
+        if hasattr(context, "error") and context.error:
+            return {
+                "verdict": "still_down",
+                "reason": context.error,
+                "findings": [f.to_dict() for f in self._handle_error_context(context)],
+            }
+
+        state = InvestigationState(
+            incident_id=incident_id,
+            findings=[],
+            tool_calls=[],
+            # A verification is one question, not a full investigation. Keep the
+            # budget small so it checks the target's availability and stops.
+            max_tool_calls=self.config.verify_max_tool_calls,
+            request_key_hash="verification",
+            service=context.affected_services[0] if context.affected_services else None,
+        )
+
+        deadline = time.monotonic() + self.config.verify_timeout_seconds
+        findings = await self._run_investigation_loop(
+            incident_id=incident_id,
+            request_key_hash=f"verification:{incident_id}",
+            state=state,
+            context=context,
+            deadline=deadline,
+            verification=True,
+        )
+
+        # Highest-confidence evidence drives the reason. A positive recovery
+        # claim closes the incident; the default is still_down so an inconclusive
+        # verification never closes it.
+        verdict = "still_down"
+        reason = "The verification did not confirm the condition recovered."
+        ranked = sorted(findings, key=lambda f: f.confidence, reverse=True)
+        for f in ranked:
+            if f.type in (EvidenceType.FACT, EvidenceType.LIKELY_CAUSE) and _claim_recovered(
+                f.content
+            ):
+                verdict = "recovered"
+                reason = f.content
+                break
+        else:
+            for f in ranked:
+                if f.type in (
+                    EvidenceType.FACT,
+                    EvidenceType.LIKELY_CAUSE,
+                    EvidenceType.HYPOTHESIS,
+                ):
+                    reason = f.content
+                    break
+
+        return {
+            "verdict": verdict,
+            "reason": reason,
+            "findings": [f.to_dict() for f in findings],
+        }
+
     async def _handle_error_context_path(
         self,
         incident_id: str,
@@ -1482,10 +1611,15 @@ class PamawasInvestigator:
         state: InvestigationState,
         context: IncidentContext,
         deadline: float,
+        verification: bool = False,
     ) -> list[Finding]:
         """Run the bounded investigation tool-calling loop and persist final findings."""
         # Build system prompt and initial message
-        system_prompt = self._build_system_prompt(context)
+        system_prompt = (
+            self._build_verification_prompt(context)
+            if verification
+            else self._build_system_prompt(context)
+        )
         initial_message = self._build_initial_message(context)
 
         messages = [{"role": "system", "content": system_prompt}, initial_message]

@@ -1,6 +1,6 @@
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import openai
@@ -874,3 +874,76 @@ def test_a_fact_keeps_its_confidence():
         confidence=1.0,
     )
     assert _normalize_finding(fact).confidence == 1.0
+
+
+def test_claim_recovered_recognizes_positive_recovery():
+    """A verification only closes an incident on a positive recovery claim."""
+    from service.investigator import _claim_recovered
+
+    assert _claim_recovered("The target has recovered; up is 1 again.")
+    assert _claim_recovered("up{job='x'} is back up since 14:32.")
+    assert _claim_recovered("no longer down; the host is reachable.")
+    # Uncertainty or a status is not recovery.
+    assert not _claim_recovered("The target may still be down.")
+    assert not _claim_recovered("up is 0; still failing.")
+
+
+@pytest.mark.asyncio
+async def test_verify_incident_closes_only_on_recovery(investigator):
+    """A stale incident closes only when the evidence says it recovered.
+
+    The correlator acts on this verdict. A finding that the target is still down
+    must keep the incident open (still_down), never close it.
+    """
+    from models import EvidenceSource, EvidenceType, Finding, IncidentContext
+
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "Outage", affected_services=["svc"])
+    )
+    investigator._run_investigation_loop = AsyncMock(
+        return_value=[
+            Finding(
+                type=EvidenceType.FACT,
+                content="The target has recovered; up is 1 since 14:32.",
+                source=EvidenceSource.PROMETHEUS,
+                confidence=1.0,
+            )
+        ]
+    )
+
+    result = await investigator.verify_incident("inc")
+    assert result["verdict"] == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_verify_incident_keeps_open_when_still_down(investigator):
+    from models import EvidenceSource, EvidenceType, Finding, IncidentContext
+
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "Outage", affected_services=["svc"])
+    )
+    investigator._run_investigation_loop = AsyncMock(
+        return_value=[
+            Finding(
+                type=EvidenceType.FACT,
+                content="up is 0; scrape_duration_seconds is 30s.",
+                source=EvidenceSource.PROMETHEUS,
+                confidence=1.0,
+            )
+        ]
+    )
+
+    result = await investigator.verify_incident("inc")
+    assert result["verdict"] == "still_down"
+
+
+@pytest.mark.asyncio
+async def test_verify_incident_defaults_to_still_down_when_inconclusive(investigator):
+    """An empty or UNKNOWN verification never closes the incident."""
+    from models import IncidentContext
+
+    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator._run_investigation_loop = AsyncMock(return_value=[])
+
+    result = await investigator.verify_incident("inc")
+    assert result["verdict"] == "still_down"
