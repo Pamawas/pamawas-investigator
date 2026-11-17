@@ -896,7 +896,15 @@ class InvestigationPersistence:
 
         try:
             with conn.cursor() as cursor:
-                for ordinal, finding in enumerate(findings):
+                cursor.execute(
+                    "SELECT COALESCE(MAX(ordinal), -1) FROM evidence WHERE run_id = %s",
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+                start_ordinal = (row[0] if row else -1) + 1
+
+                for i, finding in enumerate(findings):
+                    ordinal = start_ordinal + i
                     evidence_id = f"evd_{uuid.uuid4().hex[:26].upper()}"
                     cursor.execute(
                         """
@@ -906,6 +914,13 @@ class InvestigationPersistence:
                             supports_evidence, contradicts_evidence, ordinal,
                             created_at, metrics, logs, version, updated_at
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (run_id, ordinal) DO UPDATE SET
+                            type = EXCLUDED.type,
+                            content = EXCLUDED.content,
+                            source = EXCLUDED.source,
+                            source_detail = EXCLUDED.source_detail,
+                            confidence = EXCLUDED.confidence,
+                            updated_at = EXCLUDED.updated_at
                         """,
                         (
                             evidence_id,

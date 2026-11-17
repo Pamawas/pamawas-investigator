@@ -397,6 +397,34 @@ class TestInsertEvidenceSerialization:
         assert any('"at":' in str(p) for p in params)
         assert any('"timestamp":' in str(p) for p in params)
 
+    def test_insert_evidence_computes_ordinal_from_existing_max(self, mock_pool):
+        from models import EvidenceSource, EvidenceType, Finding
+
+        _mock_pool_obj, mock_conn, mock_cursor = mock_pool
+        mock_cursor.fetchone.return_value = (4,)
+
+        with (
+            patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn),
+            patch.object(InvestigationPersistence, "_put_connection", return_value=None),
+        ):
+            pers = InvestigationPersistence(database_url="test://url")
+            pers.insert_evidence(
+                incident_id=INCIDENT_ID,
+                run_id=RUN_ID_NEW,
+                findings=[
+                    Finding(
+                        type=EvidenceType.FACT,
+                        content="new finding",
+                        source=EvidenceSource.PROMETHEUS,
+                        confidence=0.8,
+                    )
+                ],
+            )
+
+        # The ordinal in the INSERT statement should be max_ordinal + 1 = 5
+        params = mock_cursor.execute.call_args[0][1]
+        assert params[10] == 5
+
 
 class TestUpdateRunStatusStartedAt:
     """started_at must record when the run actually began."""
