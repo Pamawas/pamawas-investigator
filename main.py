@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from config import Config as InvestigationConfig
 from config import rate_limit_from_env
-from logging_middleware import LoggingMiddleware, get_logger
+from logging_middleware import LoggingMiddleware, configure_uvicorn_logging, get_logger
 from metrics import (
     increment_stale_verification_claimed,
     increment_stale_verification_completed,
@@ -51,6 +51,8 @@ APP_VERSION = get_app_version()
 
 
 def print_startup_banner(version: str, port: int) -> None:
+    import sys
+
     banner = r""" _____       /\      __  __      /\     __          __     /\      _____
 |  __ \     /  \    |  \/  |    /  \    \ \        / /    /  \    / ____|
 | |__) |   / /\ \   | \  / |   / /\ \    \ \  /\  / /    / /\ \   \___ \
@@ -62,7 +64,10 @@ def print_startup_banner(version: str, port: int) -> None:
   | |   | |\  |   \ \/ /   |  __|    ___) |    | |      | |   | | |_ |  / ____ \     | |    | |_| | |  _  /
  _| |_  |_| \_|    \__/    |______| |____/     |_|     _| |_   \_____| /_/    \_\    |_|     \___/  |_| \_\
 """.rstrip("\n")  # noqa: E501
-    print(f"\033[1;36m{banner}\n{service_art}\033[0m\nVersion: {version} | Port: :{port}\n")
+    # Write to stderr so the banner doesn't contaminate the structured JSON stream on stdout.
+    sys.stderr.write(
+        f"\033[1;36m{banner}\n{service_art}\033[0m\nVersion: {version} | Port: :{port}\n\n"
+    )
 
 
 # Global investigator instance
@@ -835,11 +840,19 @@ def main():
     print_startup_banner(APP_VERSION, config.port)
     log.info("starting_server", port=config.port)
 
+    # Must be called BEFORE uvicorn.run() so our JSON handler is in place.
+    # log_config=None tells uvicorn NOT to call dictConfig(), which would
+    # overwrite our formatters. access_log=False suppresses uvicorn's own
+    # access handler; our LoggingMiddleware logs HTTP at the application level
+    # and uvicorn.access is re-routed to our JSON formatter anyway.
+    configure_uvicorn_logging()
+
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=config.port,
-        log_level="info",
+        log_config=None,
+        access_log=True,
     )
 
 

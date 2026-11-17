@@ -1,8 +1,10 @@
 """Structured logging middleware for FastAPI with OpenTelemetry integration."""
 
 import logging
+import re
 import time
 from collections.abc import Callable
+from typing import Any
 
 import structlog
 from fastapi import Request, Response
@@ -12,7 +14,44 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
-# Configure structlog and route standard library logging through the same JSON formatter.
+# ---------------------------------------------------------------------------
+# Uvicorn access-log → structured fields processor.
+#
+# Uvicorn's default access handler emits a flat string like:
+#   10.0.0.1:12345 - "GET /metrics/ HTTP/1.1" 200
+# We intercept that at the structlog `foreign_pre_chain` level and break it
+# into discrete fields so Loki can filter by status_code, method, path, etc.
+# ---------------------------------------------------------------------------
+_ACCESS_RE = re.compile(
+    r'^(?P<client_addr>\S+)\s+-\s+"(?P<method>[A-Z]+)\s+(?P<path>\S+)\s+(?P<proto>[^"]+)"\s+(?P<status>\d+)$'
+)
+
+
+def _parse_uvicorn_access(
+    logger: logging.Logger, method_name: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """If this record came from uvicorn.access, parse the flat line into fields."""
+    record: logging.LogRecord | None = event_dict.get("_record")
+    if record is None or getattr(record, "name", "") != "uvicorn.access":
+        return event_dict
+
+    msg = event_dict.get("event", "")
+    m = _ACCESS_RE.match(msg)
+    if m:
+        event_dict["event"] = "http_access"
+        event_dict["client_addr"] = m.group("client_addr")
+        event_dict["method"] = m.group("method")
+        event_dict["path"] = m.group("path")
+        event_dict["proto"] = m.group("proto")
+        event_dict["status_code"] = int(m.group("status"))
+        event_dict["component"] = "http"
+    return event_dict
+
+
+# ---------------------------------------------------------------------------
+# Single shared structlog / stdlib formatter — every logger in the process
+# (structlog, stdlib, uvicorn) writes through this.
+# ---------------------------------------------------------------------------
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
@@ -28,10 +67,13 @@ structlog.configure(
 )
 
 _formatter = structlog.stdlib.ProcessorFormatter(
+    # Applied to records that did NOT originate from structlog (stdlib / uvicorn).
     foreign_pre_chain=[
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
+        # Must come after TimeStamper so _record is still on the dict.
+        _parse_uvicorn_access,
     ],
     processors=[
         structlog.stdlib.ProcessorFormatter.remove_processors_meta,
@@ -46,6 +88,20 @@ _root_logger = logging.getLogger()
 _root_logger.handlers.clear()
 _root_logger.addHandler(_stream_handler)
 _root_logger.setLevel(logging.INFO)
+
+
+def configure_uvicorn_logging() -> None:
+    """Route all uvicorn loggers through the shared JSON handler.
+
+    Call this BEFORE uvicorn.run().  Passing log_config=None to uvicorn.run()
+    prevents uvicorn from reinstalling its default plaintext formatters, so
+    whatever we set here survives the full server startup.
+    """
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+        logger = logging.getLogger(name)
+        logger.handlers = [_stream_handler]
+        logger.propagate = False
+        logger.setLevel(logging.INFO)
 
 # Get logger
 log = structlog.get_logger()

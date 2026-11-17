@@ -99,10 +99,17 @@ def test_lifespan_initializes_and_shuts_down(config):
 def test_main_runs_uvicorn_with_config(config):
     with (
         patch("main.InvestigationConfig.from_env", return_value=config),
+        patch("main.configure_uvicorn_logging"),
         patch("uvicorn.run") as run,
     ):
         main.main()
-    run.assert_called_once_with("main:app", host="0.0.0.0", port=config.port, log_level="info")
+    run.assert_called_once_with(
+        "main:app",
+        host="0.0.0.0",
+        port=config.port,
+        log_config=None,
+        access_log=True,
+    )
 
 
 def test_create_investigation_requires_service_token():

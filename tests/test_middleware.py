@@ -8,7 +8,12 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags
 
 import logging_middleware
-from logging_middleware import LoggingMiddleware, get_logger, get_trace_context
+from logging_middleware import (
+    LoggingMiddleware,
+    configure_uvicorn_logging,
+    get_logger,
+    get_trace_context,
+)
 
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
@@ -123,3 +128,69 @@ def test_standard_library_logging_routes_to_structlog(capsys):
     assert data["level"] == "warning"
     assert "Repeated tool call served from cache: tool_x" in data["event"]
     assert "timestamp" in data
+
+
+def test_configure_uvicorn_logging_routes_to_json_handler():
+    """configure_uvicorn_logging must replace uvicorn handlers with the JSON handler."""
+    import logging
+
+    configure_uvicorn_logging()
+
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+        logger = logging.getLogger(name)
+        assert logger.handlers == [logging_middleware._stream_handler], (
+            f"{name} still has non-JSON handlers: {logger.handlers}"
+        )
+        assert logger.propagate is False, f"{name} should not propagate"
+
+
+def test_access_log_parser_extracts_structured_fields():
+    """_parse_uvicorn_access must turn the flat uvicorn line into discrete fields."""
+    import logging
+
+    from logging_middleware import _parse_uvicorn_access
+
+    record = logging.LogRecord(
+        name="uvicorn.access",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg='10.41.79.149:56322 - "GET /metrics/ HTTP/1.1" 200',
+        args=(),
+        exc_info=None,
+    )
+    event_dict = {
+        "_record": record,
+        "event": '10.41.79.149:56322 - "GET /metrics/ HTTP/1.1" 200',
+        "level": "info",
+    }
+    result = _parse_uvicorn_access(None, "info", event_dict)
+
+    assert result["event"] == "http_access"
+    assert result["method"] == "GET"
+    assert result["path"] == "/metrics/"
+    assert result["status_code"] == 200
+    assert result["client_addr"] == "10.41.79.149:56322"
+    assert result["component"] == "http"
+
+
+def test_access_log_parser_ignores_non_access_loggers():
+    """_parse_uvicorn_access must leave non-access log records untouched."""
+    import logging
+
+    from logging_middleware import _parse_uvicorn_access
+
+    record = logging.LogRecord(
+        name="uvicorn",
+        level=logging.INFO,
+        pathname="",
+        lineno=0,
+        msg="Started server process [1]",
+        args=(),
+        exc_info=None,
+    )
+    event_dict = {"_record": record, "event": "Started server process [1]", "level": "info"}
+    result = _parse_uvicorn_access(None, "info", event_dict)
+
+    assert result["event"] == "Started server process [1]"
+    assert "method" not in result
