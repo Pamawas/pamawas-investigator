@@ -1,5 +1,6 @@
 """Structured logging middleware for FastAPI with OpenTelemetry integration."""
 
+import logging
 import time
 from collections.abc import Callable
 
@@ -11,21 +12,40 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
 
-# Configure structlog
+# Configure structlog and route standard library logging through the same JSON formatter.
 structlog.configure(
     processors=[
         structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
+        structlog.stdlib.add_log_level,
         structlog.processors.TimeStamper(fmt="iso", utc=True),
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
-        structlog.processors.JSONRenderer(),
+        structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
     ],
-    wrapper_class=structlog.make_filtering_bound_logger(20),  # INFO level
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    logger_factory=structlog.stdlib.LoggerFactory(),
     cache_logger_on_first_use=True,
 )
+
+_formatter = structlog.stdlib.ProcessorFormatter(
+    foreign_pre_chain=[
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso", utc=True),
+    ],
+    processors=[
+        structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+        structlog.processors.JSONRenderer(),
+    ],
+)
+
+_stream_handler = logging.StreamHandler()
+_stream_handler.setFormatter(_formatter)
+
+_root_logger = logging.getLogger()
+_root_logger.handlers.clear()
+_root_logger.addHandler(_stream_handler)
+_root_logger.setLevel(logging.INFO)
 
 # Get logger
 log = structlog.get_logger()

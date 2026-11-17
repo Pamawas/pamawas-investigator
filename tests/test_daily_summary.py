@@ -131,3 +131,52 @@ def test_looks_like_prompt_echo_requires_two_markers():
     assert not looks_like_prompt_echo("The node ran out of memory at 02:14.")
     assert not looks_like_prompt_echo("")
     assert looks_like_prompt_echo("No bullets, no headings. Write the summary in the past tense.")
+
+
+def test_strip_thinking_handles_think_tags():
+    from service.daily_summary import strip_thinking
+
+    assert (
+        strip_thinking("<think>Internal reasoning here.</think>Everything is healthy.")
+        == "Everything is healthy."
+    )
+    # Unterminated think tag returns empty string
+    assert strip_thinking("<think>Unfinished thoughts") == ""
+
+
+def test_strip_thinking_handles_thinking_process_preamble():
+    from service.daily_summary import strip_thinking
+
+    raw = (
+        "Here's a thinking process: 1. Analyze the Request: - Role: Summarize... "
+        "2. Evaluate facts.\n\n"
+        "Summary: All 127 incidents recovered overnight and production is 100% available."
+    )
+    assert (
+        strip_thinking(raw)
+        == "All 127 incidents recovered overnight and production is 100% available."
+    )
+
+
+def test_strip_thinking_returns_empty_when_only_thinking_present():
+    from service.daily_summary import strip_thinking
+
+    raw = (
+        "Here's a thinking process: 1. Analyze the Request: - Role: Summarize an "
+        "overnight infrastructure incident report for an on-call engineer reading "
+        "it first thing in the morning. - Rules: - At most three sentences."
+    )
+    assert strip_thinking(raw) == ""
+
+
+def test_write_day_summary_extracts_from_reasoning_model_output():
+    raw = (
+        "Here's a thinking process: 1. Analyze the Request: - Role: Summarize...\n\n"
+        "All 127 incidents recovered overnight, with zero still open. Availability was 100%."
+    )
+    llm = MagicMock()
+    llm.chat_completion.return_value = SimpleNamespace(content=raw)
+
+    summary = write_day_summary(llm, FACTS)
+    assert "All 127 incidents recovered overnight" in summary
+    assert "thinking process" not in summary

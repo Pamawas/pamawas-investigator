@@ -24,6 +24,8 @@ SYSTEM_PROMPT = (
     "You summarise an overnight infrastructure incident report for an on-call "
     "engineer reading it first thing in the morning.\n\n"
     "Rules:\n"
+    "- Output only the final summary directly. Do not include your internal "
+    "thinking, chain of thought, or reasoning process.\n"
     "- At most three sentences. No bullet points, no headings, no preamble.\n"
     "- Lead with whether anything is still broken and needs action today.\n"
     "- Then say what broke and recovered overnight, in plain language.\n"
@@ -78,6 +80,51 @@ def build_user_prompt(facts: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def strip_thinking(text: str) -> str:
+    """Remove reasoning model chain-of-thought blocks or preambles.
+
+    Reasoning models (e.g. DeepSeek-R1) often output <think>...</think> or lead
+    with 'Here\'s a thinking process: 1. Analyze the Request...'. Leaving that in
+    causes sentence clamping to capture the analysis rather than the actual summary.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    # Strip <think>...</think> tags.
+    if "<think>" in text:
+        if "</think>" in text:
+            text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+        else:
+            return ""
+
+    # Strip conversational reasoning prefixes like "Here's a thinking process:"
+    think_match = re.match(
+        r"^(?:Here(?:'s| is) a thinking process|Thinking Process|Thought process):?\s*",
+        text,
+        re.IGNORECASE,
+    )
+    if think_match:
+        remaining = text[think_match.end() :]
+        marker_match = re.search(
+            r"(?:(?:Final )?Summary|Conclusion|Answer):\s*", remaining, re.IGNORECASE
+        )
+        if marker_match:
+            return remaining[marker_match.end() :].strip()
+        paragraphs = [p.strip() for p in remaining.split("\n\n") if p.strip()]
+        for p in reversed(paragraphs):
+            p_lower = p.lower()
+            if (
+                not p.startswith(("1.", "2.", "3.", "4.", "5.", "-", "*", "#"))
+                and "analyze" not in p_lower
+                and "rules" not in p_lower
+            ):
+                return p
+        return ""
+
+    return text
+
+
 def clamp_sentences(text: str, n: int = MAX_SENTENCES) -> str:
     """Trim a reply to n sentences.
 
@@ -110,16 +157,18 @@ def write_day_summary(llm, facts: dict[str, Any]) -> str:
             ],
             # No tools: this is a writing task, not an investigation.
             tools=None,
-            max_tokens=300,
+            max_tokens=800,
         )
     except Exception as e:  # noqa: BLE001 - the digest must never fail for this
         logger.warning("Daily summary generation failed: %s", e)
         return ""
 
     content = getattr(response, "content", "") or ""
-    summary = plain_typography(clamp_sentences(content))
-    if looks_like_prompt_echo(summary):
-        logger.warning("Daily summary echoed the prompt; dropping it: %s", summary[:200])
+    cleaned = strip_thinking(content)
+    summary = plain_typography(clamp_sentences(cleaned))
+    if not summary or looks_like_prompt_echo(summary):
+        if summary:
+            logger.warning("Daily summary echoed the prompt; dropping it: %s", summary[:200])
         return ""
     return summary
 
@@ -145,6 +194,22 @@ _PROMPT_ECHO_MARKERS = (
     "do not speculate",
     "in the past tense",
     "system prompt",
+    "thinking process",
+    "analyze the request",
+    "analyzing the request",
+    "role: summarize",
+    "here's a thinking",
+    "here is a thinking",
+)
+
+_THINKING_MARKERS = (
+    "thinking process",
+    "analyze the request",
+    "analyzing the request",
+    "role: summarize",
+    "here's a thinking",
+    "here is a thinking",
+    "thought process",
 )
 
 
@@ -158,5 +223,7 @@ def looks_like_prompt_echo(text: str) -> bool:
     lowered = " ".join((text or "").lower().split())
     if not lowered:
         return False
+    if any(m in lowered for m in _THINKING_MARKERS):
+        return True
     hits = sum(1 for marker in _PROMPT_ECHO_MARKERS if marker in lowered)
     return hits >= 2

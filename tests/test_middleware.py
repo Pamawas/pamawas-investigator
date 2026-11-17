@@ -101,3 +101,25 @@ def test_get_logger_named_and_default():
         assert get_logger("component") is named
         factory.assert_called_once_with("component")
     assert get_logger() is logging_middleware.log
+
+
+def test_standard_library_logging_routes_to_structlog(capsys):
+    import io
+    import json
+    import logging
+
+    # Stream to buffer
+    buf = io.StringIO()
+    handler = logging.StreamHandler(buf)
+    handler.setFormatter(logging_middleware._formatter)
+    test_logger = logging.getLogger("test.stdlib")
+    test_logger.addHandler(handler)
+    test_logger.setLevel(logging.INFO)
+
+    test_logger.warning("Repeated tool call served from cache: %s (args=%s)", "tool_x", {"a": 1})
+
+    output = buf.getvalue().strip()
+    data = json.loads(output)
+    assert data["level"] == "warning"
+    assert "Repeated tool call served from cache: tool_x" in data["event"]
+    assert "timestamp" in data
