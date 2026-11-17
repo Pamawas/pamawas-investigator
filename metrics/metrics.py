@@ -73,6 +73,27 @@ investigation_retry_errors_total = Counter(
     "Total number of retry scheduler loop errors",
 )
 
+stale_verification_claimed_total = Counter(
+    "pamawas_investigator_stale_verification_claimed_total",
+    "Total number of stale_verifications rows claimed by the worker",
+)
+
+stale_verification_completed_total = Counter(
+    "pamawas_investigator_stale_verification_completed_total",
+    "Total number of stale_verifications rows completed with a verdict",
+    ["verdict"],
+)
+
+stale_verification_failed_total = Counter(
+    "pamawas_investigator_stale_verification_failed_total",
+    "Total number of stale_verifications rows that failed during verification",
+)
+
+stale_verification_requeued_total = Counter(
+    "pamawas_investigator_stale_verification_requeued_total",
+    "Total number of expired stale_verifications rows requeued by the lease sweeper",
+)
+
 # Histograms
 loop_duration = Histogram(
     "pamawas_investigator_loop_duration_seconds",
@@ -160,3 +181,20 @@ def set_running(running: bool):
 
 def set_uptime(seconds: float):
     investigator_uptime.set(seconds)
+
+
+def increment_stale_verification_claimed():
+    stale_verification_claimed_total.inc()
+
+
+def increment_stale_verification_completed(verdict: str):
+    stale_verification_completed_total.labels(verdict=verdict).inc()
+
+
+def increment_stale_verification_failed():
+    stale_verification_failed_total.inc()
+
+
+def increment_stale_verification_requeued(count: int):
+    if count > 0:
+        stale_verification_requeued_total.inc(count)

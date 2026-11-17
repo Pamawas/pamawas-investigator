@@ -18,6 +18,10 @@ from config import Config as InvestigationConfig
 from config import rate_limit_from_env
 from logging_middleware import LoggingMiddleware, get_logger
 from metrics import (
+    increment_stale_verification_claimed,
+    increment_stale_verification_completed,
+    increment_stale_verification_failed,
+    increment_stale_verification_requeued,
     increment_verify,
     investigation_retry_errors_total,
     investigation_retry_exhausted_total,
@@ -117,6 +121,7 @@ async def lifespan(app: FastAPI):
     # than lack of evidence.
     workers = []
     retry_scheduler_task = None
+    stale_verification_worker_task = None
     if investigator is not None and investigator.persistence:
         for worker_id in range(max(1, config.max_concurrent_investigations)):
             workers.append(asyncio.create_task(_investigation_worker(worker_id, config)))
@@ -125,12 +130,17 @@ async def lifespan(app: FastAPI):
         retry_scheduler_task = asyncio.create_task(
             _investigation_retry_scheduler(config.retry_scheduler_tick_seconds)
         )
+        # Async worker for stale-incident verification jobs enqueued by the
+        # Scheduler into stale_verifications.  A single worker is sufficient
+        # for the typical verification load; it shares the same LLM concurrency
+        # pool via verify_incident().
+        stale_verification_worker_task = asyncio.create_task(_stale_verification_worker())
         log.info("investigation_workers_started", count=len(workers))
 
     yield
 
     # Shutdown
-    for task in [*workers, retry_scheduler_task]:
+    for task in [*workers, retry_scheduler_task, stale_verification_worker_task]:
         if task is None:
             continue
         task.cancel()
@@ -173,6 +183,7 @@ app.add_middleware(
     service_name="pamawas-investigator",
     limits={
         "/api/v1/investigations": (_rate_rps, _rate_burst),
+        "/api/v1/verifications": (_rate_rps, _rate_burst),
         "/api/v1/status": (_rate_rps, _rate_burst),
         # The daily summary calls the LLM, so it carries a budget like the
         # investigation endpoints rather than being unmetered.
@@ -328,13 +339,13 @@ class DailySummaryRequest(BaseModel):
     incidents: list[dict[str, Any]]
 
 
-class VerifyRequest(BaseModel):
-    """Request body for POST /api/v1/verify (a stale-incident verification).
+class VerificationRequest(BaseModel):
+    """Request body for POST /api/v1/verifications (asynchronous verification run).
 
-    Matches the contract in stale-incident-verification.md §4a.
+    Matches the contract in stale-incident-verification.md §6.1.
     """
 
-    contract_version: int
+    contract_version: int = 1
     incident_id: str
 
 
@@ -529,47 +540,31 @@ async def summarize_day(
     return {"summary": investigator.write_day_summary(body.model_dump())}
 
 
-@app.post("/api/v1/verify")
-async def verify_incident(
-    body: VerifyRequest,
+@app.post("/api/v1/verifications", status_code=202)
+async def request_verification(
+    body: VerificationRequest,
     x_service_token: str | None = Header(None),
 ):
-    """Verify whether an incident is still actually down (stale check).
+    """Queue an asynchronous stale-incident verification run.
 
-    Contract: stale-incident-verification.md §4a. The correlator calls this when
-    an open incident has gone silent past INCIDENT_STALE_AFTER, and acts on the
-    verdict: close the incident only on "recovered", otherwise keep it open and
-    alert why.
-
-    Unlike POST /api/v1/investigations this runs synchronously (not queued): the
-    caller needs the verdict now to decide. It is service-token protected like
-    every other mutation endpoint.
+    Contract: stale-incident-verification.md §6.1.
+    Allows the scheduler or operator CLI to explicitly request an asynchronous verification run.
     """
     await _verify_service_token(x_service_token)
 
-    if investigator is None:
+    if investigator is None or not investigator.persistence:
         return JSONResponse(status_code=503, content={"error": "Investigator not initialized"})
 
-    start = time.time()
-    try:
-        result = await investigator.verify_incident(body.incident_id)
-    except Exception as e:  # noqa: BLE001
-        log.error("verify_incident_failed", incident_id=body.incident_id, error=str(e))
-        # A verification that fails must not close the incident: treat it as
-        # still_down so the correlator keeps it open.
-        return {
-            "request_id": f"req_{body.incident_id[:16]}",
-            "data": {
-                "verdict": "still_down",
-                "reason": f"Verification failed: {e}",
-                "findings": [],
-            },
-        }
+    record = await asyncio.to_thread(
+        investigator.persistence.enqueue_stale_verification,
+        body.incident_id,
+    )
+    if not record:
+        raise HTTPException(status_code=500, detail="Failed to enqueue verification")
 
-    increment_verify(result.get("verdict", "still_down"), time.time() - start)
     return {
-        "request_id": f"req_{body.incident_id[:16]}",
-        "data": result,
+        "request_id": f"req_verify_{body.incident_id[:16]}",
+        "data": record,
     }
 
 
@@ -741,10 +736,95 @@ async def _investigation_retry_scheduler(tick_seconds: float):
                         # The reclaim put it back in the queue; a worker picks
                         # it up on its next poll. Nothing is spawned here.
                         log.info("investigation_retry_requeued", run_id=run_id)
+
+                # Reclaim stale_verifications rows whose worker died mid-verify
+                # (pod restart, OOM kill).  Without this they stay 'running'
+                # forever and the scheduler never sees a verdict.
+                requeued = investigator.persistence.requeue_expired_stale_running()
+                if requeued:
+                    increment_stale_verification_requeued(requeued)
+                    log.info("stale_verifications_requeued", count=requeued)
         except Exception as e:  # noqa: BLE001
             investigation_retry_errors_total.inc()
             log.error("investigation_retry_scheduler_error", error=str(e))
         await asyncio.sleep(tick_seconds)
+
+
+async def _stale_verification_worker():
+    """Claim queued stale_verifications rows, run verify_incident(), write verdict back.
+
+    A single background worker is sufficient for the typical stale-verification
+    load: the Scheduler enqueues at most one row per open incident, gated by
+    the anti-flood back-off, so the queue is never deep.  The worker shares the
+    investigator's LLM concurrency implicitly through verify_incident().
+
+    Design invariants:
+    - Claims exactly one row per iteration (FOR UPDATE SKIP LOCKED) — no race
+      with the investigation workers or a second stale-verification worker.
+    - On success  → complete_stale_verification(verdict, reason) + metric.
+    - On failure  → fail_stale_verification(error) + metric.  Conservative:
+      the Scheduler treats 'failed' as 'still_down' and schedules a re-verify.
+    - On CancelledError → re-raise so the lifespan shutdown loop can await it.
+    - Any other exception → log and sleep; a worker must never die silently.
+    """
+    poll_seconds = 5.0
+    while True:
+        if investigator is None or not investigator.persistence:
+            await asyncio.sleep(poll_seconds)
+            continue
+
+        try:
+            incident_id = await asyncio.to_thread(
+                investigator.persistence.claim_next_stale_verification
+            )
+            if incident_id is None:
+                await asyncio.sleep(poll_seconds)
+                continue
+
+            increment_stale_verification_claimed()
+            log.info("stale_verification_claimed", incident_id=incident_id)
+
+            import time as _time
+
+            start = _time.monotonic()
+            try:
+                result = await investigator.verify_incident(incident_id)
+                verdict = result.get("verdict", "still_down") if result else "still_down"
+                reason = result.get("reason", "") if result else "verify_incident returned None"
+                duration = _time.monotonic() - start
+                await asyncio.to_thread(
+                    investigator.persistence.complete_stale_verification,
+                    incident_id,
+                    verdict,
+                    reason,
+                )
+                increment_stale_verification_completed(verdict)
+                increment_verify(verdict, duration)
+                log.info(
+                    "stale_verification_completed",
+                    incident_id=incident_id,
+                    verdict=verdict,
+                    duration_seconds=round(duration, 2),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.error(
+                    "stale_verification_failed",
+                    incident_id=incident_id,
+                    error=str(e),
+                )
+                await asyncio.to_thread(
+                    investigator.persistence.fail_stale_verification,
+                    incident_id,
+                    str(e)[:256],
+                )
+                increment_stale_verification_failed()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.error("stale_verification_worker_error", error=str(e))
+            await asyncio.sleep(poll_seconds)
 
 
 def main():

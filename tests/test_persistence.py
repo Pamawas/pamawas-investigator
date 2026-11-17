@@ -546,3 +546,190 @@ class TestPoolInitializationIsThreadSafe:
                 t.join()
 
         assert len(created) == 1, f"created {len(created)} pools, want exactly 1"
+
+
+# ---------------------------------------------------------------------------
+# stale_verifications persistence methods
+# ---------------------------------------------------------------------------
+
+INCIDENT_ID_SV = "inc-sv-001"
+
+
+class TestClaimNextStaleVerification:
+    """Tests for InvestigationPersistence.claim_next_stale_verification."""
+
+    def test_returns_none_when_no_eligible_row(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.fetchone.return_value = None  # no queued row
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.claim_next_stale_verification()
+
+        assert result is None
+
+    def test_returns_incident_id_when_row_claimed(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.fetchone.return_value = (INCIDENT_ID_SV,)
+        mock_cursor.rowcount = 1
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.claim_next_stale_verification()
+
+        assert result == INCIDENT_ID_SV
+        mock_conn.commit.assert_called()
+
+    def test_returns_none_on_db_error(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.execute.side_effect = psycopg2.OperationalError("gone")
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.claim_next_stale_verification()
+
+        assert result is None
+
+
+class TestCompleteStaleVerification:
+    """Tests for InvestigationPersistence.complete_stale_verification."""
+
+    def test_returns_true_when_row_updated(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 1
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.complete_stale_verification(
+                    INCIDENT_ID_SV, "recovered", "service back up"
+                )
+
+        assert result is True
+        mock_conn.commit.assert_called()
+
+    def test_returns_false_when_no_row_updated(self, mock_pool):
+        """Row may already be requeued by lease-expiry sweeper."""
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 0
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.complete_stale_verification(
+                    INCIDENT_ID_SV, "still_down", "metrics still elevated"
+                )
+
+        assert result is False
+
+    def test_returns_false_on_db_error(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.execute.side_effect = psycopg2.OperationalError("gone")
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.complete_stale_verification(INCIDENT_ID_SV, "still_down", "")
+
+        assert result is False
+
+
+class TestFailStaleVerification:
+    """Tests for InvestigationPersistence.fail_stale_verification."""
+
+    def test_returns_true_when_row_updated(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 1
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.fail_stale_verification(INCIDENT_ID_SV, "LLM timeout")
+
+        assert result is True
+        mock_conn.commit.assert_called()
+
+    def test_returns_false_on_db_error(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.execute.side_effect = psycopg2.OperationalError("gone")
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.fail_stale_verification(INCIDENT_ID_SV, "timeout")
+
+        assert result is False
+
+    def test_accepts_none_error(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 1
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.fail_stale_verification(INCIDENT_ID_SV, None)
+
+        assert result is True
+
+
+class TestRequeueExpiredStaleRunning:
+    """Tests for InvestigationPersistence.requeue_expired_stale_running."""
+
+    def test_returns_count_of_requeued_rows(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 3
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.requeue_expired_stale_running()
+
+        assert result == 3
+        mock_conn.commit.assert_called()
+
+    def test_returns_zero_when_nothing_to_requeue(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.rowcount = 0
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.requeue_expired_stale_running()
+
+        assert result == 0
+
+
+class TestEnqueueStaleVerification:
+    """Tests for InvestigationPersistence.enqueue_stale_verification."""
+
+    def test_enqueues_and_returns_dict(self, mock_pool):
+        from datetime import datetime, timezone
+
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        now = datetime.now(timezone.utc)
+        mock_cursor.fetchone.return_value = (INCIDENT_ID_SV, "queued", now)
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.enqueue_stale_verification(INCIDENT_ID_SV)
+
+        assert result is not None
+        assert result["incident_id"] == INCIDENT_ID_SV
+        assert result["status"] == "queued"
+        assert result["next_verify_at"] == now.isoformat()
+        mock_conn.commit.assert_called()
+
+    def test_returns_none_on_db_error(self, mock_pool):
+        mock_pool, mock_conn, mock_cursor = mock_pool
+        mock_cursor.execute.side_effect = psycopg2.OperationalError("gone")
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                result = pers.enqueue_stale_verification(INCIDENT_ID_SV)
+
+        assert result is None

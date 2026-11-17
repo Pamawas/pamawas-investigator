@@ -1400,14 +1400,13 @@ class PamawasInvestigator:
     async def verify_incident(self, incident_id: str) -> dict[str, Any]:
         """Return a verdict on whether an incident is still actually down.
 
-        This answers a stale-open incident: the correlator found one that has
-        gone silent past INCIDENT_STALE_AFTER, and asks whether the condition is
-        real before deciding to close it. It runs synchronously here (not queued)
-        because the caller needs the verdict now to act on it.
+        This audits a stale-open incident: the Scheduler discovered an incident
+        silent past INCIDENT_STALE_AFTER, enqueued it in stale_verifications,
+        and the async stale-verification worker executes this bounded check.
 
         The verdict is evidence-backed. Only a positive claim that the target
         recovered closes the incident; anything else — still down, uncertain, or
-        an empty result — keeps it open. Returns a dict with verdict, a one-line
+        an error — keeps it open. Returns a dict with verdict, a one-line
         reason drawn from the highest-confidence finding, and the findings.
         """
         context = self._get_incident_context(incident_id)

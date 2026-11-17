@@ -498,3 +498,68 @@ async def test_worker_runs_one_claimed_run_then_polls_again(monkeypatch):
         await main._investigation_worker(0, MagicMock(investigation_timeout_seconds=600))
 
     assert executed == ["irun_1"]
+
+
+def test_post_verifications_queues_async_run():
+    """POST /api/v1/verifications enqueues into stale_verifications and returns 202."""
+    import os
+
+    os.environ["PAMAWAS_SERVICE_TOKEN"] = "test-token"
+
+    mock_persistence = MagicMock()
+    mock_persistence.enqueue_stale_verification.return_value = {
+        "incident_id": "inc-sv-test",
+        "status": "queued",
+        "next_verify_at": "2026-11-17T20:00:00Z",
+    }
+
+    service = MagicMock()
+    service.persistence = mock_persistence
+    service.db_conn = MagicMock()
+
+    with client_with(service) as client:
+        response = client.post(
+            "/api/v1/verifications",
+            json={
+                "contract_version": 1,
+                "incident_id": "inc-sv-test",
+            },
+            headers={"x-service-token": "test-token"},
+        )
+
+    assert response.status_code == 202
+    data = response.json()
+    assert data["request_id"] == "req_verify_inc-sv-test"
+    assert data["data"]["status"] == "queued"
+    assert data["data"]["incident_id"] == "inc-sv-test"
+    mock_persistence.enqueue_stale_verification.assert_called_once_with("inc-sv-test")
+
+
+@pytest.mark.asyncio
+async def test_stale_verification_worker_claims_and_completes(monkeypatch):
+    """The async worker claims a queued verification, calls verify_incident, and completes."""
+    claimed = ["inc-stale-1"]
+    completed = []
+
+    class FakePersistence:
+        def claim_next_stale_verification(self):
+            return claimed.pop(0) if claimed else None
+
+        def complete_stale_verification(self, incident_id, verdict, reason):
+            completed.append((incident_id, verdict, reason))
+            # Raise CancelledError to stop worker
+            raise asyncio.CancelledError
+
+    fake_investigator = MagicMock()
+    fake_investigator.persistence = FakePersistence()
+    fake_investigator.verify_incident = AsyncMock(
+        return_value={"verdict": "recovered", "reason": "probe HTTP 200"}
+    )
+
+    monkeypatch.setattr(main, "investigator", fake_investigator)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._stale_verification_worker()
+
+    assert completed == [("inc-stale-1", "recovered", "probe HTTP 200")]
+    fake_investigator.verify_incident.assert_awaited_once_with("inc-stale-1")

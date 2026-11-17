@@ -5,7 +5,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg2
@@ -293,6 +293,253 @@ class InvestigationPersistence:
             return None
         finally:
             self._put_connection(conn)
+
+    # -------------------------------------------------------------------------
+    # stale_verifications — async verification worker methods
+    # -------------------------------------------------------------------------
+
+    def enqueue_stale_verification(self, incident_id: str) -> dict[str, Any] | None:
+        """Enqueue an incident into stale_verifications; returns record dict or None.
+
+        If already queued or running, preserves the current status and back-off.
+        If previously completed or failed, resets status to 'queued' and next_verify_at to now().
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO stale_verifications (
+                        incident_id, status, attempts, next_verify_at, created_at, updated_at
+                    ) VALUES (%s, 'queued', 0, %s, %s, %s)
+                    ON CONFLICT (incident_id) DO UPDATE SET
+                        status = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN 'queued'
+                            ELSE stale_verifications.status
+                        END,
+                        next_verify_at = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed')
+                                THEN EXCLUDED.next_verify_at
+                            ELSE stale_verifications.next_verify_at
+                        END,
+                        updated_at = EXCLUDED.updated_at
+                    RETURNING incident_id, status, next_verify_at
+                    """,
+                    (incident_id, now, now, now),
+                )
+                row = cursor.fetchone()
+            conn.commit()
+            if row:
+                return {
+                    "incident_id": row[0],
+                    "status": row[1],
+                    "next_verify_at": row[2].isoformat() if row[2] else None,
+                }
+            return None
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to enqueue stale verification for incident %s: %s", incident_id, e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return None
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def claim_next_stale_verification(self) -> str | None:
+        """Atomically claim one queued stale_verifications row; return incident_id or None.
+
+        Uses FOR UPDATE SKIP LOCKED so multiple async workers can poll
+        simultaneously without racing for the same row.  Returns None if no
+        eligible row exists (status='queued' AND next_verify_at <= now()).
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            lease_expires = now + timedelta(minutes=10)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE stale_verifications
+                    SET status = 'running',
+                        lease_expires_at = %s,
+                        updated_at = %s
+                    WHERE incident_id = (
+                        SELECT incident_id
+                        FROM stale_verifications
+                        WHERE status = 'queued'
+                          AND next_verify_at <= %s
+                        ORDER BY next_verify_at ASC
+                        FOR UPDATE SKIP LOCKED
+                        LIMIT 1
+                    )
+                    RETURNING incident_id
+                    """,
+                    (lease_expires, now, now),
+                )
+                row = cursor.fetchone()
+            if not row:
+                conn.commit()
+                return None
+            conn.commit()
+            incident_id = row[0]
+            logger.info("Claimed stale_verifications row for incident %s", incident_id)
+            return incident_id
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to claim stale_verifications row: %s", e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return None
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def complete_stale_verification(self, incident_id: str, verdict: str, reason: str) -> bool:
+        """Mark a stale_verifications row completed with verdict + reason.
+
+        Only transitions from 'running' to prevent overwriting a row that was
+        already requeued by the lease-expiry sweeper.  Returns True if a row
+        was updated.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE stale_verifications
+                    SET status = 'completed',
+                        verdict = %s,
+                        reason = %s,
+                        verified_at = %s,
+                        updated_at = %s
+                    WHERE incident_id = %s
+                      AND status = 'running'
+                    """,
+                    (verdict, reason, now, now, incident_id),
+                )
+                updated = cursor.rowcount > 0
+            conn.commit()
+            logger.info(
+                "Completed stale_verifications for incident %s verdict=%s updated=%s",
+                incident_id,
+                verdict,
+                updated,
+            )
+            return updated
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error(
+                "Failed to complete stale_verifications for incident %s: %s",
+                incident_id,
+                e,
+            )
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return False
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def fail_stale_verification(self, incident_id: str, error: str | None) -> bool:
+        """Mark a stale_verifications row as failed.
+
+        Conservative: a failed or inconclusive verification is treated as
+        'still_down' by the scheduler.  Only transitions from 'running'.
+        Returns True if a row was updated.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE stale_verifications
+                    SET status = 'failed',
+                        safe_error_code = %s,
+                        updated_at = %s
+                    WHERE incident_id = %s
+                      AND status = 'running'
+                    """,
+                    (error, now, incident_id),
+                )
+                updated = cursor.rowcount > 0
+            conn.commit()
+            logger.info(
+                "Failed stale_verifications for incident %s updated=%s",
+                incident_id,
+                updated,
+            )
+            return updated
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error(
+                "Failed to record stale_verifications failure for incident %s: %s",
+                incident_id,
+                e,
+            )
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return False
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def requeue_expired_stale_running(self) -> int:
+        """Requeue stale_verifications rows stuck in 'running' past lease_expires_at.
+
+        Self-heals rows whose worker died mid-verification.  Resets
+        next_verify_at to now() so the worker pool picks them up immediately on
+        the next poll rather than waiting for the original back-off window.
+        Returns the number of rows requeued.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE stale_verifications
+                    SET status = 'queued',
+                        next_verify_at = %s,
+                        lease_expires_at = NULL,
+                        updated_at = %s
+                    WHERE status = 'running'
+                      AND lease_expires_at <= %s
+                    """,
+                    (now, now, now),
+                )
+                count = cursor.rowcount
+            conn.commit()
+            if count:
+                logger.info("Requeued %d expired stale_verifications rows", count)
+            return count
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to requeue expired stale_verifications rows: %s", e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return 0
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
 
     def mark_run_failed(
         self,
