@@ -368,6 +368,12 @@ class InvestigatorLLM:
     INITIAL_BACKOFF_SECONDS = 0.5
     MAX_BACKOFF_SECONDS = 4.0
 
+    # How long to back off when the LLM endpoint rate-limits us (HTTP 429).
+    # Rate limits reset on a wall-clock schedule, so we wait longer than the
+    # tiny cap used for transient errors, and we respect Retry-After when the
+    # endpoint advertises one.
+    RATE_LIMIT_BACKOFF_SECONDS = 30.0
+
     def __init__(self, config: Config):
         # Floor for a single request, from LLM_REQUEST_TIMEOUT_SECONDS. It is a
         # floor rather than a cap: `_call_timeout` gives each attempt a share of
@@ -420,8 +426,16 @@ class InvestigatorLLM:
             return True
         if isinstance(error, openai.APIConnectionError):
             return True
-        if isinstance(error, openai.APIStatusError) and error.status_code >= 500:
-            return True
+        if isinstance(error, openai.APIStatusError):
+            # 429 Too Many Requests: the LLM endpoint is rate-limiting us.
+            # Back off (respecting Retry-After when advertised) instead of
+            # failing fast so an investigation can complete once the quota
+            # resets.
+            if error.status_code == 429:
+                return True
+            # 5xx server errors are transient; retry them too.
+            if error.status_code >= 500:
+                return True
         return False
 
     def _should_fail_over(
@@ -542,10 +556,15 @@ class InvestigatorLLM:
                         e, idx, attempt, call_timeout, endpoint_label, session
                     ):
                         break
-                    backoff = min(
-                        self.INITIAL_BACKOFF_SECONDS * (2**attempt),
-                        self.MAX_BACKOFF_SECONDS,
-                    )
+                    # Rate limits reset on a wall-clock schedule: wait long
+                    # enough for the quota to recover before retrying.
+                    if isinstance(e, openai.APIStatusError) and e.status_code == 429:
+                        backoff = self.RATE_LIMIT_BACKOFF_SECONDS
+                    else:
+                        backoff = min(
+                            self.INITIAL_BACKOFF_SECONDS * (2**attempt),
+                            self.MAX_BACKOFF_SECONDS,
+                        )
                     logger.warning(
                         "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs (session=%s): %s",
                         attempt + 1,
