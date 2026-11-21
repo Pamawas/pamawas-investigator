@@ -259,7 +259,7 @@ def _resolved_tool_name(tool_call) -> str:
         return name
     try:
         args = json.loads(tool_call.function.arguments)
-    except json.JSONDecodeError, TypeError:
+    except (json.JSONDecodeError, TypeError):
         return name
     inner = args.get("name") if isinstance(args, dict) else None
     return inner if isinstance(inner, str) and inner else name
@@ -1169,7 +1169,7 @@ class PamawasInvestigator:
         """
         try:
             rendered = json.dumps(function_args or {}, sort_keys=True, default=str)
-        except TypeError, ValueError:
+        except (TypeError, ValueError):
             rendered = str(function_args)
         return f"{function_name}:{rendered}"
 
@@ -2056,7 +2056,7 @@ class PamawasInvestigator:
             if "run_id" in locals():
                 try:
                     self.persistence.update_run_status(run_id, "failed_terminal")
-                except psycopg2.Error, RuntimeError:
+                except (psycopg2.Error, RuntimeError):
                     pass
 
     async def _persist_incremental(
@@ -2134,11 +2134,11 @@ class PamawasInvestigator:
                 row = cursor.fetchone()
             conn.commit()
             return row[0] if row else -1
-        except psycopg2.Error, RuntimeError:
+        except (psycopg2.Error, RuntimeError):
             if conn is not None:
                 try:
                     conn.rollback()
-                except psycopg2.Error, AttributeError:
+                except (psycopg2.Error, AttributeError):
                     pass
             return -1
         finally:
