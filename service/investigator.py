@@ -784,6 +784,12 @@ class PamawasInvestigator:
     # only burns wall-clock budget that a paged engineer is waiting on.
     MAX_CONSECUTIVE_TEXT_TURNS = 3
 
+    # How many turns in a row may produce only repeated tool calls (served from
+    # cache) before the loop forces findings submission. A model that repeats
+    # identical queries three times running is stuck in a loop; letting it spin
+    # burns turn budget (up to 50/100 turns) and ends with no findings.
+    MAX_CONSECUTIVE_REPEATED_TURNS = 3
+
     # Wall-clock budget reserved at the end of an investigation for the model to
     # write its findings and for them to be persisted.
     #
@@ -1497,21 +1503,35 @@ class PamawasInvestigator:
         if previous is None:
             return False
 
+        repeat_count = state.seen_call_counts.get(signature, 0) + 1
+        state.seen_call_counts[signature] = repeat_count
+
         logger.warning(
-            "Repeated tool call served from cache: %s (args=%s)",
+            "Repeated tool call served from cache (repeat #%d): %s (args=%s)",
+            repeat_count,
             function_name,
             function_args,
         )
+        if repeat_count >= 2:
+            note = (
+                f"You have already made this exact call {repeat_count + 1} times. "
+                "Its result is unchanged. STOP REPEATING THIS QUERY. "
+                "Either query a completely different metric/log stream or "
+                "submit your findings now with submit_findings.\n\n" + previous
+            )
+        else:
+            note = (
+                "You already made this exact call earlier in this "
+                "investigation. Its result is unchanged and repeated below. "
+                "Do not call it again. Either query something different or "
+                "submit your findings with submit_findings.\n\n" + previous
+            )
+
         messages.append(
             {
                 "role": "tool",
                 "tool_call_id": tool_call.id,
-                "content": (
-                    "You already made this exact call earlier in this "
-                    "investigation. Its result is unchanged and repeated below. "
-                    "Do not call it again. Either query something different or "
-                    "submit your findings with submit_findings.\n\n" + previous
-                ),
+                "content": note,
             }
         )
         return True
@@ -1832,7 +1852,42 @@ class PamawasInvestigator:
         )
         if force_submit or forced_already:
             return force_submit, warned
-        return self._escalate_text_patience(incident_id, state, messages), warned
+        if self._escalate_text_patience(incident_id, state, messages):
+            return True, warned
+        return self._escalate_repeat_patience(incident_id, state, messages), warned
+
+    def _escalate_repeat_patience(
+        self, incident_id: str, state: InvestigationState, messages: list[dict]
+    ) -> bool:
+        """Force a structured submission once the model repeatedly queries cached data.
+
+        A model that issues identical tool calls across consecutive turns has
+        stopped discovering new information and entered an exploratory loop.
+        Forcing submit_findings prevents spinning through the entire turn budget
+        and ensures the evidence already collected is reported.
+
+        Returns True when this turn must be a forced submission.
+        """
+        if state.consecutive_repeated_turns < self.MAX_CONSECUTIVE_REPEATED_TURNS:
+            return False
+        logger.warning(
+            "Incident %s issued %d consecutive turns of repeated tool calls; "
+            "forcing findings submission",
+            incident_id,
+            state.consecutive_repeated_turns,
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "You are repeatedly issuing the same queries without gathering new data. "
+                    "Stop querying and call submit_findings now to record your conclusions "
+                    "based on the evidence you already gathered."
+                ),
+            }
+        )
+        increment_forced_submission()
+        return True
 
     def _escalate_text_patience(
         self, incident_id: str, state: InvestigationState, messages: list[dict]
@@ -2088,7 +2143,7 @@ class PamawasInvestigator:
 
         return state.findings
 
-    async def _handle_investigation_turn(
+    async def _handle_investigation_turn(  # noqa: C901
         self,
         incident_id: str,
         request_key_hash: str,
@@ -2106,10 +2161,24 @@ class PamawasInvestigator:
         # told to call submit_findings and the API refuses anything else, so the
         # turn cannot be spent on another query with no time left to report it.
         must_submit = is_final_turn or force_submit
-        tool_choice = (
-            {"type": "function", "function": {"name": "submit_findings"}} if must_submit else "auto"
-        )
-        tools = ToolRegistry.get_tools(verification=verification)
+        if force_submit:
+            submit_tool = [
+                t
+                for t in ToolRegistry.get_tools(verification=verification)
+                if t.get("function", {}).get("name") == "submit_findings"
+            ]
+            tools = (
+                submit_tool
+                if submit_tool
+                else ToolRegistry.get_tools(verification=verification)
+            )
+            tool_choice = {"type": "function", "function": {"name": "submit_findings"}}
+        elif is_final_turn:
+            tools = ToolRegistry.get_tools(verification=verification)
+            tool_choice = {"type": "function", "function": {"name": "submit_findings"}}
+        else:
+            tools = ToolRegistry.get_tools(verification=verification)
+            tool_choice = "auto"
 
         # Call the LLM off the asyncio event loop: chat_completion is a
         # synchronous SDK call (retries with backoff) that would block health
@@ -2157,6 +2226,7 @@ class PamawasInvestigator:
             # Real progress: the model is still investigating, so the
             # no-tool patience budget starts over.
             state.consecutive_text_turns = 0
+            has_fresh_tool_call = False
             for tool_call in tool_calls:
                 function_name, function_args = _resolve_tool_call(tool_call)
 
@@ -2191,6 +2261,7 @@ class PamawasInvestigator:
                 ):
                     continue
 
+                has_fresh_tool_call = True
                 tool_start = time.time()
                 result, findings, is_final = await self._execute_tool(
                     function_name, function_args, verification=verification
@@ -2226,8 +2297,14 @@ class PamawasInvestigator:
                 )
 
                 self._check_max_tools_reached(state, must_submit, messages)
+
+            if has_fresh_tool_call:
+                state.consecutive_repeated_turns = 0
+            else:
+                state.consecutive_repeated_turns += 1
             return None
 
+        state.consecutive_repeated_turns = 0
         self._handle_text_response(response, state, must_submit, messages)
         if state.completed:
             increment_findings_by_type(state.findings)

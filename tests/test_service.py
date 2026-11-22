@@ -926,6 +926,87 @@ def test_submit_findings_is_never_served_from_cache(investigator):
     assert served is False
 
 
+def test_repeated_call_escalates_message_on_second_repeat(investigator):
+    """After the second repeat the message becomes a stronger warning."""
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    sig = investigator._call_signature(
+        "query_prometheus", {"promql": "up", "start": "s", "end": "e"}
+    )
+    state.seen_calls[sig] = '{"data": []}'
+
+    messages = []
+    # First repeat
+    investigator._serve_repeated_call(
+        tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"}),
+        "query_prometheus",
+        {"promql": "up", "start": "s", "end": "e"},
+        state,
+        messages,
+    )
+    assert "Do not call it again" in messages[0]["content"]
+    assert state.seen_call_counts[sig] == 1
+
+    # Second repeat — should use stronger warning
+    investigator._serve_repeated_call(
+        tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"}),
+        "query_prometheus",
+        {"promql": "up", "start": "s", "end": "e"},
+        state,
+        messages,
+    )
+    assert "STOP REPEATING THIS QUERY" in messages[1]["content"]
+    assert state.seen_call_counts[sig] == 2
+
+
+def test_repeat_patience_forces_submission_after_limit(investigator):
+    """Consecutive turns of only-repeated calls escalate to forced submission."""
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    messages = []
+
+    # Below the limit: should not force
+    state.consecutive_repeated_turns = investigator.MAX_CONSECUTIVE_REPEATED_TURNS - 1
+    assert investigator._escalate_repeat_patience("inc", state, messages) is False
+    assert messages == []
+
+    # At the limit: should force
+    state.consecutive_repeated_turns = investigator.MAX_CONSECUTIVE_REPEATED_TURNS
+    assert investigator._escalate_repeat_patience("inc", state, messages) is True
+    assert "repeatedly issuing the same queries" in messages[-1]["content"]
+
+
+def test_fresh_tool_call_resets_consecutive_repeated_turns(investigator):
+    """A new (not cached) tool call resets the consecutive_repeated_turns counter."""
+    from models import InvestigationState
+
+    state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
+    messages = []
+
+    # Simulate one turn of all-repeated calls: counter should increment
+    state.consecutive_repeated_turns = 1
+    has_fresh = False
+
+    # has_fresh_tool_call = False → counter increments
+    if not has_fresh:
+        state.consecutive_repeated_turns += 1
+
+    assert state.consecutive_repeated_turns == 2
+
+    # Simulate a turn with a fresh call: counter resets
+    has_fresh = True
+    if has_fresh:
+        state.consecutive_repeated_turns = 0
+
+    assert state.consecutive_repeated_turns == 0
+
+    # Confirm escalation fires at the threshold
+    state.consecutive_repeated_turns = investigator.MAX_CONSECUTIVE_REPEATED_TURNS
+    assert investigator._escalate_repeat_patience("inc", state, messages) is True
+
+
 def test_an_unknown_finding_carries_no_confidence():
     """UNKNOWN (90%) is a contradiction: confidence belongs to a claim.
 

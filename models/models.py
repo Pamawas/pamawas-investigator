@@ -142,6 +142,9 @@ class InvestigationState:
     # burns its whole turn budget (up to 100 LLM calls) and then the wall-clock
     # deadline, ending with a null result a human could have had in one turn.
     consecutive_text_turns: int = 0
+    # Consecutive turns where all tool calls were repeats served from cache.
+    # A model that repeats the same query over and over is stuck in a loop.
+    consecutive_repeated_turns: int = 0
     completed: bool = False
     # Results already produced in this run, keyed by (tool, arguments). A model
     # that asks the same question again is answered from here instead of paying
@@ -154,6 +157,7 @@ class InvestigationState:
     # the model not to repeat itself, but a prompt is a preference and this is
     # a guarantee.
     seen_calls: dict[str, str] = field(default_factory=dict)
+    seen_call_counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     request_key_hash: str | None = None
     # Affected service for this incident; selects the Loki stream during
