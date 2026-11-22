@@ -373,7 +373,7 @@ class InvestigatorLLM:
     #
     # Previously this was 30 s regardless of the Retry-After header value
     # the endpoint sends.  With two concurrent investigations + a daily-
-    # summary call each sleeping 30–90 s, all three threads held their full
+    # summary call each sleeping 30-90 s, all three threads held their full
     # messages[] history in RAM simultaneously and pushed the pod past its
     # 1 Gi limit (observed: exit code 137, restart #39/#40, 2026-11-22).
     #
@@ -381,7 +381,7 @@ class InvestigatorLLM:
     #   1. Honour Retry-After when the response carries one, capped at this
     #      constant so a misconfigured endpoint cannot park a thread forever.
     #   2. Fail over to the next endpoint immediately on 429 when one exists
-    #      instead of sleeping — the other endpoint is not rate-limited yet.
+    #      instead of sleeping - the other endpoint is not rate-limited yet.
     #   3. Only sleep (up to this cap) when we are truly out of endpoints.
     RATE_LIMIT_BACKOFF_SECONDS = 30.0
 
@@ -515,6 +515,109 @@ class InvestigatorLLM:
             logger.error("LLM call failed (non-retryable, session=%s): %s", session, error)
         return True
 
+    def _compute_backoff(
+        self,
+        error: Exception,
+        attempt: int,
+        started: float,
+        budget_seconds: float | None,
+    ) -> float:
+        """Calculate backoff duration for a failed LLM call."""
+        if isinstance(error, openai.APIStatusError) and error.status_code == 429:
+            retry_after: float | None = None
+            try:
+                ra = error.response.headers.get("Retry-After")
+                if ra is not None:
+                    retry_after = float(ra)
+            except (AttributeError, ValueError):
+                pass
+            fallback = self.RATE_LIMIT_BACKOFF_SECONDS
+            backoff = min(
+                retry_after if retry_after is not None else fallback,
+                fallback,
+            )
+            # Never sleep past the remaining budget - there is no point waiting
+            # 30 s for a rate limit to clear if the investigation deadline is in 10 s.
+            remaining_now = _remaining_budget(started, budget_seconds)
+            if remaining_now is not None:
+                floor_reserve = remaining_now - _MIN_CALL_TIMEOUT_SECONDS
+                backoff = min(backoff, max(0.0, floor_reserve))
+            return backoff
+
+        return min(
+            self.INITIAL_BACKOFF_SECONDS * (2**attempt),
+            self.MAX_BACKOFF_SECONDS,
+        )
+
+    def _call_endpoint(
+        self,
+        client: OpenAI,
+        model: str,
+        endpoint_index: int,
+        endpoint_label: str,
+        messages: list[dict],
+        optional: dict,
+        max_tokens: int,
+        session: str,
+        started: float,
+        budget_seconds: float | None,
+    ) -> tuple[Any | None, Exception | None]:
+        """Try calling an endpoint up to MAX_RETRIES times."""
+        import time as _time
+
+        last_error: Exception | None = None
+        for attempt in range(self.MAX_RETRIES):
+            remaining = _remaining_budget(started, budget_seconds)
+            if _out_of_time(remaining, attempt):
+                break
+            call_timeout = _call_timeout(
+                self.request_timeout, remaining, self.MAX_RETRIES - attempt
+            )
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=0.1,  # Low temperature for deterministic output
+                    max_tokens=max_tokens,
+                    timeout=call_timeout,
+                    **optional,
+                )
+                if endpoint_index > 0:
+                    logger.warning(
+                        "LLM failover succeeded on %s (session=%s)",
+                        endpoint_label,
+                        session,
+                    )
+                return response.choices[0].message, None
+            except (
+                openai.OpenAIError,
+                RuntimeError,
+                ValueError,
+                KeyError,
+                TypeError,
+                TimeoutError,
+            ) as e:
+                last_error = e
+                if self._should_fail_over(
+                    e, endpoint_index, attempt, call_timeout, endpoint_label, session
+                ):
+                    break
+                backoff = self._compute_backoff(e, attempt, started, budget_seconds)
+                if backoff <= 0:
+                    break
+                logger.warning(
+                    "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs (session=%s): %s",
+                    attempt + 1,
+                    self.MAX_RETRIES,
+                    endpoint_label,
+                    backoff,
+                    session,
+                    e,
+                )
+                _time.sleep(backoff)
+
+        return None, last_error
+
     def chat_completion(
         self,
         messages: list[dict],
@@ -551,82 +654,22 @@ class InvestigatorLLM:
         last_error: Exception | None = None
         for idx, (client, model) in enumerate(zip(self.clients, self.models)):
             endpoint_label = f"endpoint {idx + 1}/{len(self.endpoints)}"
-            for attempt in range(self.MAX_RETRIES):
-                remaining = _remaining_budget(started, budget_seconds)
-                if _out_of_time(remaining, attempt):
-                    break
-                call_timeout = _call_timeout(
-                    self.request_timeout, remaining, self.MAX_RETRIES - attempt
-                )
-                try:
-                    response = client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=0.1,  # Low temperature for deterministic output
-                        max_tokens=max_tokens,
-                        timeout=call_timeout,
-                        **optional,
-                    )
-                    if idx > 0:
-                        logger.warning(
-                            "LLM failover succeeded on %s (session=%s)",
-                            endpoint_label,
-                            session,
-                        )
-                    return response.choices[0].message
-                except (
-                    openai.OpenAIError,
-                    RuntimeError,
-                    ValueError,
-                    KeyError,
-                    TypeError,
-                    TimeoutError,
-                ) as e:
-                    last_error = e
-                    if self._should_fail_over(
-                        e, idx, attempt, call_timeout, endpoint_label, session
-                    ):
-                        break
-                    # 429 with no other endpoint: honour Retry-After when
-                    # present, capped at RATE_LIMIT_BACKOFF_SECONDS so a
-                    # misconfigured endpoint cannot park this thread forever.
-                    # For all other retryable errors use exponential backoff.
-                    if isinstance(e, openai.APIStatusError) and e.status_code == 429:
-                        retry_after: float | None = None
-                        try:
-                            ra = e.response.headers.get("Retry-After")
-                            if ra is not None:
-                                retry_after = float(ra)
-                        except (AttributeError, ValueError):
-                            pass
-                        backoff = min(
-                            retry_after if retry_after is not None else self.RATE_LIMIT_BACKOFF_SECONDS,
-                            self.RATE_LIMIT_BACKOFF_SECONDS,
-                        )
-                        # Never sleep past the remaining budget — there is no
-                        # point waiting 30 s for a rate limit to clear if the
-                        # investigation deadline is in 10 s.
-                        remaining_now = _remaining_budget(started, budget_seconds)
-                        if remaining_now is not None:
-                            backoff = min(backoff, max(0.0, remaining_now - _MIN_CALL_TIMEOUT_SECONDS))
-                    else:
-                        backoff = min(
-                            self.INITIAL_BACKOFF_SECONDS * (2**attempt),
-                            self.MAX_BACKOFF_SECONDS,
-                        )
-                    if backoff <= 0:
-                        # Budget is essentially gone; stop retrying this endpoint.
-                        break
-                    logger.warning(
-                        "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs (session=%s): %s",
-                        attempt + 1,
-                        self.MAX_RETRIES,
-                        endpoint_label,
-                        backoff,
-                        session,
-                        e,
-                    )
-                    _time.sleep(backoff)
+            message, err = self._call_endpoint(
+                client=client,
+                model=model,
+                endpoint_index=idx,
+                endpoint_label=endpoint_label,
+                messages=messages,
+                optional=optional,
+                max_tokens=max_tokens,
+                session=session,
+                started=started,
+                budget_seconds=budget_seconds,
+            )
+            if message is not None:
+                return message
+            if err is not None:
+                last_error = err
 
         # All endpoints exhausted.
         if last_error is not None:
