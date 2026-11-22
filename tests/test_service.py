@@ -665,6 +665,16 @@ def test_working_notes_submitted_through_the_tool_are_rejected(investigator):
     assert "working notes" in cleaned[0].content
     assert cleaned[1].content == "An OOM kill in the wazuh container."
 
+    dummy = Finding(
+        type=EvidenceType.FACT,
+        content="placeholder",
+        source=EvidenceSource.LLM,
+        confidence=0.5,
+    )
+    cleaned_dummy = _sanitize_finding(dummy)
+    assert cleaned_dummy.type is EvidenceType.UNKNOWN
+    assert "placeholder text" in cleaned_dummy.content
+
 
 def test_em_dashes_are_normalized_in_findings():
     """Em dashes are the clearest generated-prose tell, and they reach the card.

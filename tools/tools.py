@@ -446,7 +446,16 @@ class ToolRegistry:
                                                 "recommendation",
                                             ],
                                         },
-                                        "content": {"type": "string"},
+                                        "content": {
+                                            "type": "string",
+                                            "description": (
+                                                "Concrete factual finding or conclusion "
+                                                "observed during investigation. Must be "
+                                                "substantive text based on real evidence; "
+                                                "never use placeholder text like "
+                                                "'placeholder', 'TBD', 'TODO', or 'none'."
+                                            ),
+                                        },
                                         "source": {
                                             "type": "string",
                                             "enum": [

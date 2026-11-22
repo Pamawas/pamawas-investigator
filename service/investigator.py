@@ -173,8 +173,36 @@ def _normalize_finding(finding: Finding) -> Finding:
     return replace(finding, content=content, confidence=confidence)
 
 
+def _is_placeholder_or_dummy(text: str) -> bool:
+    """True when text is a placeholder, dummy value, or lacks substantive content."""
+    cleaned = text.strip().lower()
+    dummy_exact = {
+        "placeholder",
+        "todo",
+        "tbd",
+        "none",
+        "null",
+        "n/a",
+        "na",
+        "test",
+        "asdf",
+        "unknown",
+        "...",
+        "-",
+    }
+    if cleaned in dummy_exact:
+        return True
+    if (
+        cleaned.startswith("placeholder")
+        or cleaned.startswith("todo:")
+        or cleaned.startswith("tbd:")
+    ):
+        return True
+    return False
+
+
 def _sanitize_finding(finding: Finding) -> Finding:
-    """Keep working notes out of a finding, whichever path produced it.
+    """Keep working notes and placeholder text out of a finding, whichever path produced it.
 
     A model that narrates its reasoning does so through both exits of the loop:
     as a plain text reply, and as a `submit_findings` call whose content is the
@@ -182,10 +210,26 @@ def _sanitize_finding(finding: Finding) -> Finding:
     the tool path, so an essay cannot reach the report by being submitted
     instead of typed.
 
-    The finding is replaced, not truncated. Half an essay is still an essay, and
-    the honest record is that this claim was never made.
+    Additionally, lazy placeholder submissions like 'placeholder', 'TBD', or 'TODO'
+    are rejected and replaced with honest terminal claims.
     """
     content = _plain_typography(finding.content)
+    if _is_placeholder_or_dummy(content):
+        logger.warning(
+            "Discarding a %s finding with placeholder content: %s",
+            finding.type,
+            content[:120],
+        )
+        return Finding(
+            type=EvidenceType.UNKNOWN,
+            content=(
+                "Investigation ended without a substantive conclusion; the model "
+                "submitted placeholder text."
+            ),
+            source=EvidenceSource.SYSTEM,
+            confidence=0.0,
+        )
+
     if not _is_reasoning_preamble(content):
         if content != finding.content:
             return replace(finding, content=content)
@@ -1567,10 +1611,13 @@ class PamawasInvestigator:
                 break
         else:
             for f in ranked:
-                if f.type in (
-                    EvidenceType.FACT,
-                    EvidenceType.LIKELY_CAUSE,
-                    EvidenceType.HYPOTHESIS,
+                if (
+                    f.type in (
+                        EvidenceType.FACT,
+                        EvidenceType.LIKELY_CAUSE,
+                        EvidenceType.HYPOTHESIS,
+                    )
+                    and not _is_placeholder_or_dummy(f.content)
                 ):
                     reason = f.content
                     break
