@@ -207,13 +207,35 @@ class InvestigationPersistence:
             conn = self._get_connection()
             now = datetime.now(UTC)
             with conn.cursor() as cursor:
+                # Mark abandoned runs that have exhausted attempts as failed_terminal
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs
+                    SET status = 'failed_terminal',
+                        updated_at = %s
+                    WHERE status = 'running'
+                      AND updated_at < now() - (%s * interval '1 second')
+                      AND attempts >= max_attempts
+                    """,
+                    (now, stale_after_seconds),
+                )
+                failed_terminal = cursor.rowcount
+                if failed_terminal:
+                    logger.warning(
+                        "Marked %d stale investigation run(s) as failed (exhausted max attempts)",
+                        failed_terminal,
+                    )
+
+                # Requeue abandoned runs that still have retry attempts remaining
                 cursor.execute(
                     """
                     UPDATE investigation_runs
                     SET status = 'queued',
+                        attempts = attempts + 1,
                         updated_at = %s
                     WHERE status = 'running'
                       AND updated_at < now() - (%s * interval '1 second')
+                      AND attempts < max_attempts
                     """,
                     (now, stale_after_seconds),
                 )
@@ -512,15 +534,38 @@ class InvestigationPersistence:
             conn = self._get_connection()
             now = datetime.now(UTC)
             with conn.cursor() as cursor:
+                # Mark expired stale verifications that exhausted max_attempts as failed
+                cursor.execute(
+                    """
+                    UPDATE stale_verifications
+                    SET status = 'failed',
+                        lease_expires_at = NULL,
+                        updated_at = %s
+                    WHERE status = 'running'
+                      AND lease_expires_at <= %s
+                      AND attempts >= max_attempts
+                    """,
+                    (now, now),
+                )
+                failed = cursor.rowcount
+                if failed:
+                    logger.warning(
+                        "Marked %d expired stale_verifications as failed (max attempts exhausted)",
+                        failed,
+                    )
+
+                # Requeue expired stale verifications with remaining attempts
                 cursor.execute(
                     """
                     UPDATE stale_verifications
                     SET status = 'queued',
+                        attempts = attempts + 1,
                         next_verify_at = %s,
                         lease_expires_at = NULL,
                         updated_at = %s
                     WHERE status = 'running'
                       AND lease_expires_at <= %s
+                      AND attempts < max_attempts
                     """,
                     (now, now, now),
                 )
