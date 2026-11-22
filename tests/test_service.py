@@ -551,6 +551,42 @@ def test_resolve_tool_call_null_arguments():
     assert args == {}
 
 
+def test_resolve_tool_call_malformed_json_arguments():
+    """_resolve_tool_call must not crash with JSONDecodeError when arguments is malformed.
+
+    When an LLM response is truncated (e.g. token limits), the arguments string can be
+    cut off mid-JSON ('Unterminated string starting at: line 1 column 43 (char 42)').
+    Instead of raising JSONDecodeError (which aborts the entire investigation),
+    it must return a structured _parse_error dict.
+    """
+    from service.investigator import _resolve_tool_call
+
+    malformed = SimpleNamespace(
+        id="call-malformed",
+        function=SimpleNamespace(
+            name="query_prometheus",
+            arguments='{"promql": "up{job=\\"docker_cadvisor\\", instance=\\"last',
+        ),
+    )
+    name, args = _resolve_tool_call(malformed)
+    assert name == "query_prometheus"
+    assert "_parse_error" in args
+    assert "Unterminated string" in args["_parse_error"]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_handles_parse_error(investigator):
+    """_execute_tool returns a structured error when tool arguments failed JSON parsing."""
+    result, findings, is_final = await investigator._execute_tool(
+        "query_prometheus",
+        {"_parse_error": "Unterminated string starting at: line 1 column 43 (char 42)"},
+    )
+    assert result["status"] == "error"
+    assert "invalid arguments JSON" in result["error"]
+    assert findings is None
+    assert is_final is False
+
+
 def test_system_prompt_names_the_incident_it_serves(investigator):
     """Each investigation's system prompt states which incident it covers.
 

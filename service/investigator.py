@@ -280,8 +280,9 @@ def unwrap_tool_call_envelope(name: str, args: dict) -> tuple[str, dict]:
     if isinstance(inner_args, str):
         try:
             inner_args = json.loads(inner_args)
-        except json.JSONDecodeError:
-            return name, args
+        except json.JSONDecodeError as e:
+            logger.warning("Malformed inner arguments in tool envelope: %s", e)
+            return inner_name, {"_parse_error": str(e), "_raw": inner_args}
     if not isinstance(inner_args, dict):
         return name, args
 
@@ -298,14 +299,24 @@ def _resolve_tool_call(tool_call) -> tuple[str, dict]:
     ``args.get(...)``) raises ``'NoneType' object is not subscriptable``.
     Normalise to an empty dict so every downstream handler can safely call
     ``function_args.get("key")``.
+
+    If the LLM output was truncated or contains malformed JSON, catch the
+    JSONDecodeError and pass a structured error payload so the loop can feed
+    the error back to the model instead of aborting the whole investigation.
     """
     name = tool_call.function.name
     raw = tool_call.function.arguments
     if raw is None:
         args = {}
+    elif not isinstance(raw, str):
+        args = raw if isinstance(raw, dict) else {}
     else:
-        parsed = json.loads(raw)
-        args = parsed if isinstance(parsed, dict) else {}
+        try:
+            parsed = json.loads(raw)
+            args = parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError) as e:
+            logger.warning("Malformed tool call arguments for %s: %s (raw=%r)", name, e, raw)
+            args = {"_parse_error": str(e), "_raw": raw}
     return unwrap_tool_call_envelope(name, args)
 
 
@@ -1179,6 +1190,21 @@ class PamawasInvestigator:
         does not terminate the whole investigation run.
         """
         try:
+            if not isinstance(function_args, dict) or "_parse_error" in function_args:
+                err_msg = (
+                    function_args.get("_parse_error", "tool arguments must be an object")
+                    if isinstance(function_args, dict)
+                    else "tool arguments must be an object"
+                )
+                return (
+                    {
+                        "status": "error",
+                        "error": f"{function_name}: invalid arguments JSON ({err_msg})",
+                    },
+                    None,
+                    False,
+                )
+
             if function_name == "query_prometheus":
                 # Guard against a missing start/end/promql argument. A tool call
                 # from the LLM may omit required keys; a direct [] lookup would
