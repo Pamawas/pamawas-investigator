@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from datetime import timezone as tz
 from typing import Any
 
@@ -1117,6 +1117,10 @@ class PamawasInvestigator:
         to determine the current state of the affected target and stop, not to
         chase a root cause.
         """
+        now_dt = datetime.now(tz.utc)
+        now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        fifteen_min_ago = (now_dt - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         affected = "unspecified"
         if context is not None:
             affected = ", ".join(context.affected_services or []) or "unspecified"
@@ -1128,24 +1132,54 @@ class PamawasInvestigator:
             f"This session verifies one incident: {incident}.\n"
             f"Title: {title}\n"
             f"Affected service(s): {affected}\n"
+            f"CURRENT LIVE TIME (NOW UTC): {now_iso}\n\n"
             "Answer ONE question: is this condition actually still down right now?\n"
-            "- Query Prometheus and Uptime Kuma first (monitor_status, up, "
-            "scrape_duration_seconds) to establish the current state. Call "
-            "get_prometheus_labels / get_loki_labels first if the label schema is "
+            "- Check ONLY the current/live state right now.\n"
+            f"- Query Prometheus for the live window (e.g. start='{fifteen_min_ago}', "
+            f"end='{now_iso}').\n"
+            "- Call get_prometheus_labels / get_loki_labels first if the label schema is "
             "unknown.\n"
-            "- Then check logs in Loki and incident history (get_related_incidents) "
-            "only if the metrics are ambiguous.\n"
-            "- Submit a FACT: 'The target is still down' or 'The target has "
-            "recovered'. An UNKNOWN must not claim recovery.\n"
+            "- DO NOT query historical time ranges from hours ago.\n"
+            "- DO NOT investigate past incident history or root causes.\n"
+            "- Submit a FACT: 'The target has recovered' if current metrics are healthy, "
+            "or 'The target is still down' if currently failing.\n"
+            "- An UNKNOWN must not claim recovery.\n"
             "=== END SESSION SCOPE ===\n"
         )
 
-    def _build_initial_message(self, context: IncidentContext) -> dict:
+    def _build_initial_message(
+        self, context: IncidentContext, verification: bool = False
+    ) -> dict:
         """Build the initial user message with incident context."""
+        now_dt = datetime.now(tz.utc)
+        now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        fifteen_min_ago = (now_dt - timedelta(minutes=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        if verification:
+            return {
+                "role": "user",
+                "content": (
+                    f"Verify whether this condition has recovered as of right now.\n\n"
+                    f"Current evaluation time: {now_iso}\n"
+                    f"Incident ID: {context.incident_id}\n"
+                    f"Title: {context.title}\n"
+                    f"Status: {context.status}\n"
+                    f"Originally started at: {context.started_at}\n"
+                    f"Severity: {context.severity}\n"
+                    f"Affected services: {', '.join(context.affected_services or [])}\n\n"
+                    f"Original triggering events:\n"
+                    f"{json.dumps(context.events, indent=2)[: self.config.truncation_limit]}\n\n"
+                    f"Query Prometheus metrics for the live window (e.g. {fifteen_min_ago} "
+                    f"to {now_iso}) to determine if the target is healthy right now. "
+                    "Submit your findings immediately."
+                ),
+            }
+
         return {
             "role": "user",
             "content": (
                 f"Investigate this incident:\n\n"
+                f"Current time: {now_iso}\n"
                 f"Incident ID: {context.incident_id}\n"
                 f"Title: {context.title}\n"
                 f"Status: {context.status}\n"
@@ -1179,7 +1213,34 @@ class PamawasInvestigator:
             )
         ]
 
-    async def _execute_tool(self, function_name: str, function_args: dict):  # noqa: C901
+    @staticmethod
+    def _check_verification_time_range(end: Any) -> str | None:
+        """Check whether a verification query end timestamp is too old."""
+        try:
+            end_clean = str(end).strip()
+            end_dt = datetime.fromisoformat(end_clean.replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=tz.utc)
+            now_dt = datetime.now(tz.utc)
+            age_seconds = (now_dt - end_dt).total_seconds()
+            if age_seconds > 1800:
+                now_str = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+                age_min = int(age_seconds / 60)
+                return (
+                    f"Verification checks current live health, but your query end timestamp "
+                    f"({end}) is {age_min} minutes old. "
+                    f"Please query the live window ending at current time: {now_str}."
+                )
+        except (ValueError, TypeError, AttributeError):
+            pass
+        return None
+
+    async def _execute_tool(  # noqa: C901
+        self,
+        function_name: str,
+        function_args: dict,
+        verification: bool = False,
+    ):
         """Execute a tool call and return the result.
 
         Runs in the asyncio event loop, so it awaits the async adapter
@@ -1222,6 +1283,14 @@ class PamawasInvestigator:
                         None,
                         False,
                     )
+                if verification:
+                    stale_error = self._check_verification_time_range(end)
+                    if stale_error is not None:
+                        return (
+                            {"status": "error", "error": stale_error},
+                            None,
+                            False,
+                        )
                 result = await self.tools._prometheus_adapter.query_range(promql, start, end)
                 return result, None, False
 
@@ -1254,6 +1323,14 @@ class PamawasInvestigator:
                         None,
                         False,
                     )
+                if verification:
+                    stale_error = self._check_verification_time_range(end)
+                    if stale_error is not None:
+                        return (
+                            {"status": "error", "error": stale_error},
+                            None,
+                            False,
+                        )
                 result = await self.tools._loki_adapter.query_range(
                     logql,
                     start,
@@ -1263,6 +1340,18 @@ class PamawasInvestigator:
                 return result, None, False
 
             elif function_name == "get_related_incidents":
+                if verification:
+                    return (
+                        {
+                            "status": "error",
+                            "error": (
+                                "get_related_incidents is disabled during verification. "
+                                "Query Prometheus for current live metrics."
+                            ),
+                        },
+                        None,
+                        False,
+                    )
                 service = function_args.get("service")
                 keywords = function_args.get("symptom_keywords") or []
                 if service is None:
@@ -1849,7 +1938,9 @@ class PamawasInvestigator:
             if verification
             else self._build_system_prompt(context)
         )
-        initial_message = self._build_initial_message(context)
+        initial_message = self._build_initial_message(
+            context, verification=verification
+        )
 
         messages = [{"role": "system", "content": system_prompt}, initial_message]
 
@@ -1908,6 +1999,7 @@ class PamawasInvestigator:
                     force_submit=force_submit,
                     deadline=deadline,
                     explore_deadline=explore_deadline,
+                    verification=verification,
                 )
                 if result is not None:
                     return result
@@ -2005,6 +2097,7 @@ class PamawasInvestigator:
         force_submit: bool = False,
         deadline: float | None = None,
         explore_deadline: float | None = None,
+        verification: bool = False,
     ) -> list[Finding] | None:
         """Run a single investigation turn (LLM call + tool handling);
         returns findings if complete."""
@@ -2016,7 +2109,7 @@ class PamawasInvestigator:
         tool_choice = (
             {"type": "function", "function": {"name": "submit_findings"}} if must_submit else "auto"
         )
-        tools = ToolRegistry.get_tools()
+        tools = ToolRegistry.get_tools(verification=verification)
 
         # Call the LLM off the asyncio event loop: chat_completion is a
         # synchronous SDK call (retries with backoff) that would block health
@@ -2099,7 +2192,9 @@ class PamawasInvestigator:
                     continue
 
                 tool_start = time.time()
-                result, findings, is_final = await self._execute_tool(function_name, function_args)
+                result, findings, is_final = await self._execute_tool(
+                    function_name, function_args, verification=verification
+                )
 
                 if is_final:
                     await self._handle_submit_findings(

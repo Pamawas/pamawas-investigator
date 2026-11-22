@@ -75,6 +75,20 @@ def test_tool_registry_names_match_definitions():
     assert submit_schema["required"] == ["findings"]
 
 
+def test_tool_registry_verification_excludes_related_incidents():
+    definitions = ToolRegistry.get_tools(verification=True)
+    names = ToolRegistry.get_tool_names(verification=True)
+    assert "get_related_incidents" not in names
+    assert names == [
+        "query_prometheus",
+        "get_prometheus_labels",
+        "get_loki_labels",
+        "query_loki",
+        "submit_findings",
+    ]
+    assert len(definitions) == 5
+
+
 def test_fake_transports_track_calls(config, tools):
     """Test that fake transports track calls for verification."""
     # Prometheus

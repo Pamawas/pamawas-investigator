@@ -1037,3 +1037,77 @@ async def test_verify_incident_defaults_to_still_down_when_inconclusive(investig
 
     result = await investigator.verify_incident("inc")
     assert result["verdict"] == "still_down"
+
+
+def test_verification_prompt_and_message_anchors_current_time(investigator):
+    from models import IncidentContext
+
+    context = IncidentContext(
+        incident_id="inc_sv_1",
+        title="Ceph OSD High Latency",
+        status="open",
+        severity="warning",
+        started_at="2026-11-22T18:42:00Z",
+        affected_services=["10.1.1.4:9283"],
+    )
+
+    prompt = investigator._build_verification_prompt(context)
+    assert "CURRENT LIVE TIME" in prompt
+    assert "inc_sv_1" in prompt
+    assert "10.1.1.4:9283" in prompt
+    assert "get_related_incidents" not in prompt
+
+    msg = investigator._build_initial_message(context, verification=True)
+    assert "Verify whether this condition has recovered as of right now" in msg["content"]
+    assert "Current evaluation time" in msg["content"]
+    assert "Originally started at: 2026-11-22T18:42:00Z" in msg["content"]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_verification_disables_related_incidents(investigator):
+    result, findings, is_final = await investigator._execute_tool(
+        "get_related_incidents",
+        {"service": "10.1.1.4:9283", "symptom_keywords": ["latency"]},
+        verification=True,
+    )
+    assert result["status"] == "error"
+    assert "disabled during verification" in result["error"]
+    assert findings is None
+    assert is_final is False
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_verification_rejects_stale_time_range(investigator):
+    # Stale end timestamp far in the past
+    stale_end = "2026-11-22T18:50:00Z"
+    stale_start = "2026-11-22T18:45:00Z"
+
+    result, findings, is_final = await investigator._execute_tool(
+        "query_prometheus",
+        {"promql": "up", "start": stale_start, "end": stale_end},
+        verification=True,
+    )
+    assert result["status"] == "error"
+    assert "Verification checks current live health" in result["error"]
+    assert "minutes old" in result["error"]
+    assert findings is None
+    assert is_final is False
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_verification_accepts_live_time_range(investigator):
+    from datetime import datetime, timedelta
+    from datetime import timezone as tz
+
+    now = datetime.now(tz.utc)
+    live_start = (now - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    live_end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    result, findings, is_final = await investigator._execute_tool(
+        "query_prometheus",
+        {"promql": "up", "start": live_start, "end": live_end},
+        verification=True,
+    )
+    assert result["status"] == "success"
+    assert findings is None
+    assert is_final is False

@@ -498,9 +498,16 @@ class ToolRegistry:
         ]
 
     @classmethod
-    def get_tools(cls):
-        return cls().TOOLS
+    def get_tools(cls, verification: bool = False):
+        tools = cls().TOOLS
+        if verification:
+            return [
+                t
+                for t in tools
+                if t.get("function", {}).get("name") != "get_related_incidents"
+            ]
+        return tools
 
     @classmethod
-    def get_tool_names(cls):
-        return [t["function"]["name"] for t in cls().TOOLS]
+    def get_tool_names(cls, verification: bool = False):
+        return [t["function"]["name"] for t in cls.get_tools(verification=verification)]
