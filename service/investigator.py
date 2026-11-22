@@ -368,10 +368,21 @@ class InvestigatorLLM:
     INITIAL_BACKOFF_SECONDS = 0.5
     MAX_BACKOFF_SECONDS = 4.0
 
-    # How long to back off when the LLM endpoint rate-limits us (HTTP 429).
-    # Rate limits reset on a wall-clock schedule, so we wait longer than the
-    # tiny cap used for transient errors, and we respect Retry-After when the
-    # endpoint advertises one.
+    # How long to back off when the LLM endpoint rate-limits us (HTTP 429)
+    # and no other endpoint is available to fail over to.
+    #
+    # Previously this was 30 s regardless of the Retry-After header value
+    # the endpoint sends.  With two concurrent investigations + a daily-
+    # summary call each sleeping 30–90 s, all three threads held their full
+    # messages[] history in RAM simultaneously and pushed the pod past its
+    # 1 Gi limit (observed: exit code 137, restart #39/#40, 2026-11-22).
+    #
+    # The new policy:
+    #   1. Honour Retry-After when the response carries one, capped at this
+    #      constant so a misconfigured endpoint cannot park a thread forever.
+    #   2. Fail over to the next endpoint immediately on 429 when one exists
+    #      instead of sleeping — the other endpoint is not rate-limited yet.
+    #   3. Only sleep (up to this cap) when we are truly out of endpoints.
     RATE_LIMIT_BACKOFF_SECONDS = 30.0
 
     def __init__(self, config: Config):
@@ -455,6 +466,12 @@ class InvestigatorLLM:
         next endpoint is tried instead. Retries stay for connection errors and
         5xx responses, which really are transient.
 
+        A 429 from a free aggregator (freellmapi) means every model on that
+        endpoint is exhausted right now.  Sleeping 30 s and retrying the same
+        endpoint wastes the budget and keeps the messages[] list in RAM the
+        whole time.  When another endpoint is available, fail over immediately;
+        only sleep when we have no other choice.
+
         With only one endpoint configured there is nothing to fail over to, so
         the normal retry policy applies and the endpoint gets another attempt.
         """
@@ -467,6 +484,20 @@ class InvestigatorLLM:
                 "retrying the same endpoint (session=%s)",
                 endpoint_label,
                 call_timeout,
+                session,
+            )
+            return True
+
+        # 429 with another endpoint available: fail over immediately instead of
+        # sleeping.  Sleeping 30 s per attempt while holding the full message
+        # history caused the pod to OOM when several investigations ran at once.
+        is_rate_limited = (
+            isinstance(error, openai.APIStatusError) and error.status_code == 429
+        )
+        if is_rate_limited and has_another_endpoint:
+            logger.warning(
+                "LLM endpoint %s returned 429; failing over immediately (session=%s)",
+                endpoint_label,
                 session,
             )
             return True
@@ -556,15 +587,36 @@ class InvestigatorLLM:
                         e, idx, attempt, call_timeout, endpoint_label, session
                     ):
                         break
-                    # Rate limits reset on a wall-clock schedule: wait long
-                    # enough for the quota to recover before retrying.
+                    # 429 with no other endpoint: honour Retry-After when
+                    # present, capped at RATE_LIMIT_BACKOFF_SECONDS so a
+                    # misconfigured endpoint cannot park this thread forever.
+                    # For all other retryable errors use exponential backoff.
                     if isinstance(e, openai.APIStatusError) and e.status_code == 429:
-                        backoff = self.RATE_LIMIT_BACKOFF_SECONDS
+                        retry_after: float | None = None
+                        try:
+                            ra = e.response.headers.get("Retry-After")
+                            if ra is not None:
+                                retry_after = float(ra)
+                        except (AttributeError, ValueError):
+                            pass
+                        backoff = min(
+                            retry_after if retry_after is not None else self.RATE_LIMIT_BACKOFF_SECONDS,
+                            self.RATE_LIMIT_BACKOFF_SECONDS,
+                        )
+                        # Never sleep past the remaining budget — there is no
+                        # point waiting 30 s for a rate limit to clear if the
+                        # investigation deadline is in 10 s.
+                        remaining_now = _remaining_budget(started, budget_seconds)
+                        if remaining_now is not None:
+                            backoff = min(backoff, max(0.0, remaining_now - _MIN_CALL_TIMEOUT_SECONDS))
                     else:
                         backoff = min(
                             self.INITIAL_BACKOFF_SECONDS * (2**attempt),
                             self.MAX_BACKOFF_SECONDS,
                         )
+                    if backoff <= 0:
+                        # Budget is essentially gone; stop retrying this endpoint.
+                        break
                     logger.warning(
                         "LLM call failed (attempt %d/%d) on %s, retrying in %.1fs (session=%s): %s",
                         attempt + 1,

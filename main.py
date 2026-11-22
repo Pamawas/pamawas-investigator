@@ -542,7 +542,12 @@ async def summarize_day(
         return {"summary": "", "reason": "investigator_not_initialized"}
     if not body.incidents:
         return {"summary": "", "reason": "no_incidents"}
-    return {"summary": investigator.write_day_summary(body.model_dump())}
+    # write_day_summary calls chat_completion synchronously (blocking retries
+    # with up to 30 s of time.sleep on 429).  Running it in a thread keeps
+    # the event loop free to serve health probes and other requests while the
+    # LLM call is in flight.
+    summary = await asyncio.to_thread(investigator.write_day_summary, body.model_dump())
+    return {"summary": summary}
 
 
 @app.post("/api/v1/verifications", status_code=202)
