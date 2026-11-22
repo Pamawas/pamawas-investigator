@@ -371,25 +371,55 @@ def _claim_recovered(text: str) -> bool:
     """True when a finding states the condition is no longer failing.
 
     A verification only closes an incident on a positive claim of recovery.
-    Anything phrased as a negative ("no longer down", "recovered", "back up",
-    "reachable") counts; anything phrased as uncertainty or a status does not.
+    Anything phrased as failure, ongoing alert, negative, or uncertainty must not count.
     """
-    lowered = " ".join((text or "").lower().split())
-    positive_recovery = (
-        "recovered",
-        "back up",
-        "backup",
-        "is up",
-        "is back",
-        "no longer down",
-        "no longer failing",
-        "returned",
-        "reachable",
-        "is alive",
-        "restored",
-        "self-resolved",
+    if not text:
+        return False
+    lowered = " ".join(text.lower().split())
+
+    disqualifiers = (
+        "unreachable",
+        "not reachable",
+        "still down",
+        "still firing",
+        "still failing",
+        "remains down",
+        "remains unreachable",
+        "no recovery",
+        "not recovered",
+        "has not recovered",
+        "did not recover",
+        "did not confirm",
+        "cannot reach",
+        "unable to reach",
+        "cannot conclude",
+        "could not verify",
+        "unconfirmed",
+        "not confirmed",
+        "may still be down",
+        "up is 0",
+        "up=0",
+        "up == 0",
     )
-    return any(marker in lowered for marker in positive_recovery)
+    if any(d in lowered for d in disqualifiers):
+        return False
+
+    positive_recovery_patterns = (
+        r"\brecovered\b",
+        r"\brecovery\b",
+        r"\bback up\b",
+        r"\bbackup\b",
+        r"\bis up\b",
+        r"\bis back\b",
+        r"\bno longer down\b",
+        r"\bno longer failing\b",
+        r"\breturned\b",
+        r"\breachable\b",
+        r"\bis alive\b",
+        r"\brestored\b",
+        r"\bself-resolved\b",
+    )
+    return any(re.search(pat, lowered) for pat in positive_recovery_patterns)
 
 
 def _out_of_time(remaining: float | None, attempt: int) -> bool:

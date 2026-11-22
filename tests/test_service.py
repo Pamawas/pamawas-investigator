@@ -893,9 +893,15 @@ def test_claim_recovered_recognizes_positive_recovery():
     assert _claim_recovered("The target has recovered; up is 1 again.")
     assert _claim_recovered("up{job='x'} is back up since 14:32.")
     assert _claim_recovered("no longer down; the host is reachable.")
-    # Uncertainty or a status is not recovery.
+    # Uncertainty, failure, or still firing/unreachable is not recovery.
     assert not _claim_recovered("The target may still be down.")
     assert not _claim_recovered("up is 0; still failing.")
+    assert not _claim_recovered(
+        "The alert is still firing as of the last evaluation at 07:02:00, "
+        "confirming the target remains unreachable."
+    )
+    assert not _claim_recovered("The target remains unreachable.")
+    assert not _claim_recovered("no recovery observed in the metrics.")
 
 
 @pytest.mark.asyncio
