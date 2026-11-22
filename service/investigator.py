@@ -290,9 +290,22 @@ def unwrap_tool_call_envelope(name: str, args: dict) -> tuple[str, dict]:
 
 
 def _resolve_tool_call(tool_call) -> tuple[str, dict]:
-    """Return the real tool name and arguments for a tool call."""
+    """Return the real tool name and arguments for a tool call.
+
+    Some endpoints send ``arguments`` as the JSON string ``"null"`` or as a
+    bare ``None`` for no-argument tool calls.  ``json.loads("null")`` returns
+    ``None``, and passing that into ``unwrap_tool_call_envelope`` (which does
+    ``args.get(...)``) raises ``'NoneType' object is not subscriptable``.
+    Normalise to an empty dict so every downstream handler can safely call
+    ``function_args.get("key")``.
+    """
     name = tool_call.function.name
-    args = json.loads(tool_call.function.arguments)
+    raw = tool_call.function.arguments
+    if raw is None:
+        args = {}
+    else:
+        parsed = json.loads(raw)
+        args = parsed if isinstance(parsed, dict) else {}
     return unwrap_tool_call_envelope(name, args)
 
 

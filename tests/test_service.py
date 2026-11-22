@@ -513,6 +513,44 @@ def test_nested_envelope_is_recognised_as_submit_findings():
     assert _resolve_tool_call(plain) == ("submit_findings", {"findings": []})
 
 
+def test_resolve_tool_call_null_arguments():
+    """_resolve_tool_call must not crash when arguments is ``None`` or ``"null"``.
+
+    Some OI-compatible endpoints omit arguments entirely for no-arg tool calls,
+    sending ``None`` as the raw value.  Others JSON-encode it as the string
+    ``"null"``.  Either way ``json.loads("null")`` returns ``None``, and the old
+    code passed that into ``unwrap_tool_call_envelope`` which did ``args.get(…)``
+    on a ``None`` and raised ``'NoneType' object is not subscriptable``.
+    """
+    from service.investigator import _resolve_tool_call
+
+    # Raw None on the function object (endpoint omitted the field entirely)
+    null_raw = SimpleNamespace(
+        id="call-null",
+        function=SimpleNamespace(name="get_loki_labels", arguments=None),
+    )
+    assert _resolve_tool_call(null_raw) == ("get_loki_labels", {})
+
+    # JSON-encoded null ("null" string)
+    null_json = SimpleNamespace(
+        id="call-null-json",
+        function=SimpleNamespace(name="get_loki_labels", arguments="null"),
+    )
+    assert _resolve_tool_call(null_json) == ("get_loki_labels", {})
+
+    # Nested envelope with null inner arguments
+    null_nested = SimpleNamespace(
+        id="call-null-nested",
+        function=SimpleNamespace(
+            name="functions",
+            arguments=json.dumps({"name": "get_loki_labels", "arguments": None}),
+        ),
+    )
+    name, args = _resolve_tool_call(null_nested)
+    assert name == "get_loki_labels"
+    assert args == {}
+
+
 def test_system_prompt_names_the_incident_it_serves(investigator):
     """Each investigation's system prompt states which incident it covers.
 
