@@ -45,14 +45,19 @@ from models import (
     ToolResult,
 )
 from service.daily_summary import write_day_summary as _write_day_summary
-from service.evidence_summary import log_observations, metric_observations, numeric_points
+from service.evidence_summary import (
+    log_observations,
+    metric_observations,
+    numeric_points,
+    select_metric_queries,
+)
 from service.persistence import InvestigationPersistence
 from service.query_recovery import QueryRecovery
 from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v13"
+PROMPT_VERSION = "pamawas-investigator-v14"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -622,78 +627,24 @@ def _query_source_detail(call: ToolResult, argument_name: str) -> str:
     return f"{call.tool_name}: {query} [{_query_window(call)}]"
 
 
-def _series_numeric_samples(series: Any) -> list[float]:
-    """Return parseable values from one Prometheus vector or matrix series."""
-    if not isinstance(series, dict):
-        return []
-    points = series.get("values")
-    if not isinstance(points, list):
-        point = series.get("value")
-        points = [point] if isinstance(point, list) else []
-
-    values: list[float] = []
-    for point in points:
-        if not isinstance(point, list) or len(point) < 2:
-            continue
-        try:
-            values.append(float(point[1]))
-        except (TypeError, ValueError):
-            continue
-    return values
 
 
-def _format_observed_number(value: float) -> str:
-    """Render provider values consistently without inventing precision."""
-    return format(value, ".6g")
-
-
-def _prometheus_query_finding(call: ToolResult) -> Finding:
-    """Build a deterministic finding from one successful Prometheus response."""
+def _prometheus_query_finding(
+    call: ToolResult, context: IncidentContext | None = None
+) -> Finding:
+    """Build reader-ready evidence from the executed metric samples."""
     detail = _query_source_detail(call, "promql")
-    data = call.result.get("data") if isinstance(call.result, dict) else None
-    series = data.get("result") if isinstance(data, dict) else None
-    if not isinstance(series, list) or not series:
-        return Finding(
-            type=EvidenceType.UNKNOWN,
-            content=(
-                "Prometheus returned no result series for the executed query "
-                f"from {_query_window(call)}."
-            ),
-            source=EvidenceSource.PROMETHEUS,
-            source_detail=detail,
-            confidence=0.0,
-        )
-
-    per_series = [_series_numeric_samples(item) for item in series]
-    all_samples = [sample for samples in per_series for sample in samples]
-    latest_samples = [samples[-1] for samples in per_series if samples]
-    if not all_samples:
-        return Finding(
-            type=EvidenceType.UNKNOWN,
-            content=(
-                f"Prometheus returned {len(series)} result series, but none contained "
-                "parseable numeric samples."
-            ),
-            source=EvidenceSource.PROMETHEUS,
-            source_detail=detail,
-            confidence=0.0,
-        )
-
-    content = (
-        f"From {_query_window(call)}, Prometheus returned {len(series)} result "
-        f"series with {len(all_samples)} numeric samples. The observed range was "
-        f"{_format_observed_number(min(all_samples))} to "
-        f"{_format_observed_number(max(all_samples))}."
+    content = metric_observations(
+        call.result, _format_query_timestamp, str(call.arguments.get("promql", "")), context
     )
-    if latest_samples:
-        content += (
-            " The latest sample range was "
-            f"{_format_observed_number(min(latest_samples))} to "
-            f"{_format_observed_number(max(latest_samples))}."
+    if not content:
+        return Finding(
+            type=EvidenceType.UNKNOWN,
+            content="The metric query returned no usable observations for the incident window.",
+            source=EvidenceSource.PROMETHEUS,
+            source_detail=detail,
+            confidence=0.0,
         )
-    observations = metric_observations(call.result, _format_query_timestamp)
-    if observations:
-        content = f"From {_query_window(call)}, {observations}"
     return Finding(
         type=EvidenceType.FACT,
         content=content,
@@ -703,36 +654,28 @@ def _prometheus_query_finding(call: ToolResult) -> Finding:
     )
 
 
-def _loki_query_finding(call: ToolResult) -> Finding:
-    """Build a deterministic finding from one successful Loki response."""
+def _loki_query_finding(
+    call: ToolResult, context: IncidentContext | None = None
+) -> Finding:
+    """Describe actual log events without dumping stream labels and source paths."""
     detail = _query_source_detail(call, "logql")
     data = call.result.get("data") if isinstance(call.result, dict) else None
     streams = data.get("result") if isinstance(data, dict) else None
-    if not isinstance(streams, list):
-        streams = []
-    line_count = sum(
-        len(stream.get("values", []))
-        for stream in streams
-        if isinstance(stream, dict) and isinstance(stream.get("values"), list)
+    content = log_observations(
+        streams if isinstance(streams, list) else [], _format_query_timestamp,
+        context, str(call.arguments.get("logql", "")),
     )
-    if line_count == 0:
+    if not content:
         return Finding(
             type=EvidenceType.UNKNOWN,
-            content=(
-                "Loki returned no log entries for the executed query from "
-                f"{_query_window(call)}."
-            ),
+            content="No matching log events were retrieved for the incident window.",
             source=EvidenceSource.LOKI,
             source_detail=detail,
             confidence=0.0,
         )
     return Finding(
         type=EvidenceType.FACT,
-        content=(
-            f"From {_query_window(call)}, Loki returned {line_count} log entries "
-            f"across {len(streams)} result streams. "
-            + log_observations(streams, _format_query_timestamp)
-        ),
+        content=content,
         source=EvidenceSource.LOKI,
         source_detail=detail,
         confidence=1.0,
@@ -854,7 +797,7 @@ def _ensure_causal_verdict_for_mode(
 
 
 def _ground_findings_in_data_queries(
-    findings: list[Finding], tool_calls: list[ToolResult]
+    findings: list[Finding], tool_calls: list[ToolResult], context: IncidentContext | None = None
 ) -> list[Finding]:
     """Replace model-authored telemetry claims with exact executed-query summaries.
 
@@ -880,11 +823,13 @@ def _ground_findings_in_data_queries(
     ]
     loki_calls = _successful_tool_calls(tool_calls, "query_loki")
     grounded.extend(
-        _prometheus_query_finding(call)
-        for call in prometheus_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
+        _prometheus_query_finding(call, context)
+        for call in select_metric_queries(
+            prometheus_calls, context, _MAX_GROUNDED_FINDINGS_PER_SOURCE
+        )
     )
     grounded.extend(
-        _loki_query_finding(call)
+        _loki_query_finding(call, context)
         for call in loki_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
     )
     if causal_synthesis is not None:
@@ -893,12 +838,12 @@ def _ground_findings_in_data_queries(
 
 
 def _ground_partial_data_queries(
-    tool_calls: list[ToolResult], verification: bool
+    tool_calls: list[ToolResult], verification: bool, context: IncidentContext | None = None
 ) -> list[Finding]:
     """Return deterministic full-investigation evidence gathered before termination."""
     if verification:
         return []
-    return _ground_findings_in_data_queries([], tool_calls)
+    return _ground_findings_in_data_queries([], tool_calls, context)
 
 
 def _decode_cached_tool_result(cached: Any) -> dict[str, Any] | None:
@@ -1854,6 +1799,11 @@ class PamawasInvestigator:
             "raw number as a percentage without an evidence-backed transformation.\n"
             "- Each turn must add evidence, test a different hypothesis, or submit.\n\n"
             "EVIDENCE CONTRACT:\n"
+            "- Evidence content must be ready for a human incident report before submission. "
+            "State what changed, readable values with known units, and local observation times. "
+            "Describe important log events in plain sentences. Keep exact queries and "
+            "identifiers in source_detail; do not put query syntax, sample counts, complete "
+            "label maps, source-code paths, or scientific notation in content.\n"
             "- FACT: a new observation from a successful data query, a post-trigger lifecycle "
             "event, or related history. Restating the triggering alert is not a finding.\n"
             "- LIKELY_CAUSE: supported by multiple consistent observations and a plausible "
@@ -2598,7 +2548,7 @@ class PamawasInvestigator:
         findings = [_sanitize_finding(f) for f in findings]
         findings = _drop_trigger_restatements(findings, incident_id)
         if not verification:
-            findings = _ground_findings_in_data_queries(findings, state.tool_calls)
+            findings = _ground_findings_in_data_queries(findings, state.tool_calls, state.context)
             findings = _ensure_causal_verdict_for_mode(findings, state.tool_calls, verification)
         state.findings = findings
         state.completed = True
@@ -3138,7 +3088,7 @@ class PamawasInvestigator:
                     )
                 )
                 state.findings = _ground_partial_data_queries(
-                    state.tool_calls, verification
+                    state.tool_calls, verification, state.context
                 ) + state.findings
                 state.findings = _ensure_causal_verdict_for_mode(
                     state.findings, state.tool_calls, verification
@@ -3165,7 +3115,7 @@ class PamawasInvestigator:
                 exhausted_by, state.tool_calls, verification
             )
             state.findings.extend(
-                _ground_partial_data_queries(state.tool_calls, verification)
+                _ground_partial_data_queries(state.tool_calls, verification, state.context)
             )
             if state.tool_calls:
                 successful_data_queries = len(_required_data_tools(verification)) - len(
@@ -3305,7 +3255,7 @@ class PamawasInvestigator:
         # by another source. Causal synthesis remains explicitly labeled and
         # confidence-capped rather than being promoted to provider fact.
         state.findings = _ground_partial_data_queries(
-            state.tool_calls, verification
+            state.tool_calls, verification, state.context
         )
         state.findings.append(
             Finding(
@@ -3366,7 +3316,7 @@ class PamawasInvestigator:
             )
             logger.info("Harness recovery tool %s with args %s", call.tool_name, call.arguments)
         if recovery.calls:
-            summaries = _ground_findings_in_data_queries([], recovery.calls)
+            summaries = _ground_findings_in_data_queries([], recovery.calls, state.context)
             messages.append({"role": "user", "content": (
                 "The harness executed schema-discovered recovery queries. Use these "
                 "observations and exact queries for the cause assessment and suggested actions:\n"
@@ -3689,7 +3639,9 @@ class PamawasInvestigator:
         self._handle_text_response(response, state, must_submit, messages)
         if state.completed:
             if not verification:
-                state.findings = _ground_findings_in_data_queries(state.findings, state.tool_calls)
+                state.findings = _ground_findings_in_data_queries(
+                    state.findings, state.tool_calls, state.context
+                )
             state.findings = _ensure_causal_verdict_for_mode(
                 state.findings, state.tool_calls, verification
             )

@@ -219,7 +219,8 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     findings = investigator.investigate("inc")
 
     assert findings[0].type is EvidenceType.FACT
-    assert "observed range was 0 to 1" in findings[0].content
+    assert "peaked at 1" in findings[0].content
+    assert "last queried value was 0" in findings[0].content
     assert findings[0].source_detail == "query_prometheus: up [s to e]"
     assert all(finding.content != "down" for finding in findings)
     investigator.tools._prometheus_adapter.query_range.assert_called_once_with("up", "s", "e")
@@ -760,7 +761,8 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
     ]
     assert forced, "the loop must force submit_findings once the reserve is reached"
     assert findings[0].type is EvidenceType.FACT
-    assert "observed range was 10 to 25" in findings[0].content
+    assert "peaked at 25" in findings[0].content
+    assert "last queried value was 10" in findings[0].content
     assert all("load1" not in finding.content for finding in findings)
     assert investigator.tools._prometheus_adapter.query_range.await_count < 50, (
         "the reserve must stop exploration before the turn budget runs out"
@@ -1268,7 +1270,11 @@ def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
                     "result": [
                         {
                             "metric": {"tenant_dimension": "alpha-target"},
-                            "values": [[1, "68.0"], [2, "86.5"], [3, "71.0"]],
+                            "values": [
+                                [1795433400, "68.0"],
+                                [1795433700, "86.5"],
+                                [1795434000, "71.0"],
+                            ],
                         }
                     ]
                 },
@@ -1317,15 +1323,14 @@ def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
         EvidenceSource.LOKI,
         EvidenceSource.LLM,
     ]
-    assert "observed range was 68 to 86.5" in grounded[0].content
-    assert "2026-11-23 18:30:00 WIB" in grounded[0].content
+    assert "peaked at 86.5 at 18:35:00 WIB" in grounded[0].content
+    assert "last queried value was 71 at 18:40:00 WIB" in grounded[0].content
     assert grounded[0].source_detail == (
         "query_prometheus: custom_utilization_expression "
         "[2026-11-23 18:30:00 WIB to 2026-11-23 18:45:00 WIB]"
     )
     assert grounded[1].content == (
-        "Loki returned no log entries for the executed query from "
-        "2026-11-23 18:30:00 WIB to 2026-11-23 18:45:00 WIB."
+        "No matching log events were retrieved for the incident window."
     )
     assert grounded[1].source_detail == (
         'query_loki: {scope_dimension="alpha-target"} '

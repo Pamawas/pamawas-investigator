@@ -61,9 +61,9 @@ async def test_counter_recovery_preserves_rate_query_and_meaningful_observations
     executed = recovery.calls[-1]
     assert executed.arguments["promql"] == f"rate({original}[5m])"
     grounded = _ground_findings_in_data_queries([], recovery.calls)
-    assert "0.85 seconds/s" in grounded[0].content
+    assert "0.85 seconds per second" in grounded[0].content
     assert "18:35:00 WIB" in grounded[0].content
-    assert '"phase":"busy"' in grounded[0].content
+    assert "{" not in grounded[0].content
 
 
 def test_partial_evidence_always_has_actions_and_a_causal_verdict():
@@ -129,7 +129,7 @@ def test_weak_model_run_recovers_queries_and_keeps_actions(investigator):
 
     assert any(finding.type == EvidenceType.HYPOTHESIS for finding in findings)
     assert any(finding.type == EvidenceType.RECOMMENDATION for finding in findings)
-    assert any("0.85 seconds/s" in finding.content for finding in findings)
+    assert any("0.85 seconds per second" in finding.content for finding in findings)
     assert any("worker restarted after timeout" in finding.content for finding in findings)
     assert not any("40500" in finding.content for finding in findings)
 
