@@ -1,5 +1,6 @@
 """Readable observations built from telemetry, before evidence is persisted."""
 
+import json
 import math
 import re
 from collections import Counter
@@ -158,13 +159,28 @@ def log_identity(stream: dict, excluded: set[str]) -> str:
 
 
 def readable_log_line(line: str) -> str:
+    try:
+        structured = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        structured = None
+    if isinstance(structured, dict):
+        # Locate prose by its value, without assuming a message/body field name.
+        prose = [value for value in structured.values()
+                 if isinstance(value, str) and len(value.split()) >= 3]
+        if prose:
+            line = max(prose, key=lambda value: len(value.split()))
+        else:
+            return ""
     message = _TIMESTAMP_PREFIX.sub("", line)
     message = _LEVEL_PREFIX.sub("", message)
     message = _CODE_PREFIX.sub("", message)
+    message = re.sub(
+        r"rpc error:\s*code\s*=\s*(\w+)\s+desc\s*=\s*", r"\1: ", message
+    )
     message = " ".join(message.split())
     if len(message) > 180:
         message = message[:120].rsplit(" ", 1)[0] + " … " + message[-50:]
-    return message
+    return message[:1].upper() + message[1:]
 
 
 def log_observations(
@@ -191,13 +207,15 @@ def log_observations(
             if bounds and not bounds[0] <= seconds <= bounds[1]:
                 continue
             message = readable_log_line(str(point[1]))
+            if not message:
+                continue
             severity = sum(word in message.lower() for word in ("error", "failed", "disconnect"))
             identity = log_identity(stream.get("stream", {}), excluded)
             events.append((severity, seconds, identity, message))
     selected = sorted(events, reverse=True)[:2]
     selected.sort(key=lambda event: event[1])
     return " ".join(
-        f"{identity} at {short_time(seconds, format_timestamp)}: {message}"
+        f"{identity} at {short_time(seconds, format_timestamp)}: {message.rstrip('.')}."
         for _, seconds, identity, message in selected
     )
 

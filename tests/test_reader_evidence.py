@@ -56,7 +56,7 @@ def test_report_evidence_preserves_primary_signal_and_reads_as_observations(monk
         "CPU peaked at 86.5% at 18:35:00 WIB; the last queried value was 71% at 18:40:00 WIB."
     )
     assert findings[1].content == (
-        "mesh-agent at 18:36:45 WIB: Disconnected from Signal service: EOF"
+        "mesh-agent at 18:36:45 WIB: Disconnected from Signal service: EOF."
     )
     content = " ".join(finding.content for finding in findings)
     for audit_text in ("{", "query_prometheus", "numeric samples", ".go:", "99.9", "170599000"):
@@ -89,3 +89,36 @@ def test_numbers_are_readable_without_changing_units_or_tiny_values():
     assert human_number(1048576, "bytes") == "1.00 MiB"
     assert human_number(1048576, "bytes per second") == "1.00 MiB per second"
     assert human_number(0.00000001) == "0.00000001"
+
+
+def test_evidence_rules_apply_to_another_signal_and_arbitrary_schemas(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    context = IncidentContext(
+        "inc_latency", "Latency", started_at="2026-11-23T11:35:10Z",
+        resolved_at="2026-11-23T11:40:10Z", affected_services=["beta-app"],
+    )
+    calls = [ToolResult(
+        "query_prometheus", {"promql": 'vendor_latency{customer_key="beta-app"}'},
+        {"status": "success", "metric_metadata": {"unit": "ms"},
+         "data": {"result": [{"metric": {"customer_key": "beta-app"},
+                              "values": [[1795433700, "1234.56"], [1795434000, "200"]]}]}}, 1,
+    ), ToolResult(
+        "query_loki", {"logql": '{application_key="beta-app"}'},
+        {"status": "success", "data": {"result": [{
+            "stream": {"vendor_component": "gateway-worker"},
+            "values": [["1795433805296000000",
+                        '{"unusual_body_key":"Upstream request failed after timeout",'
+                        '"verbosity":"error"}']],
+        }]}}, 1,
+    )]
+    first = _ground_findings_in_data_queries([], calls, context)
+    second = _ground_findings_in_data_queries([], calls, context)
+    assert first == second
+    assert first[0].content == (
+        "Latency peaked at 1,234.56 ms at 18:35:00 WIB; "
+        "the last queried value was 200 ms at 18:40:00 WIB."
+    )
+    assert first[1].content == (
+        "gateway-worker at 18:36:45 WIB: Upstream request failed after timeout."
+    )
+    assert not any("CPU" in finding.content or "{" in finding.content for finding in first)
