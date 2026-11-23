@@ -843,6 +843,39 @@ async def test_execute_tool_handles_parse_error(investigator):
     assert is_final is False
 
 
+@pytest.mark.asyncio
+async def test_execute_tool_repairs_weak_model_logql_syntax_and_limit(investigator):
+    """Generic syntax repair should make cheap-model LogQL executable."""
+    investigator.config.loki_max_log_lines = 100
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
+    arguments = {
+        "logql": "{instance='koba-labs', job='system_node'} |~ 'CPU|load'",
+        "start": "2026-11-23T11:30:00Z",
+        "end": "2026-11-23T11:45:00Z",
+        "limit": 200,
+    }
+
+    result, findings, is_final = await investigator._execute_tool(
+        "query_loki", arguments
+    )
+
+    assert result["status"] == "success"
+    assert findings is None
+    assert is_final is False
+    assert arguments["logql"] == (
+        '{instance="koba-labs", job="system_node"} |~ "CPU|load"'
+    )
+    assert arguments["limit"] == 100
+    investigator.tools._loki_adapter.query_range.assert_awaited_once_with(
+        '{instance="koba-labs", job="system_node"} |~ "CPU|load"',
+        "2026-11-23T11:30:00Z",
+        "2026-11-23T11:45:00Z",
+        100,
+    )
+
+
 def test_system_prompt_names_the_incident_it_serves(investigator):
     """Each investigation's system prompt states which incident it covers.
 

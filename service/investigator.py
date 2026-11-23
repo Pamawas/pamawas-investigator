@@ -47,7 +47,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v9"
+PROMPT_VERSION = "pamawas-investigator-v10"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -56,6 +56,7 @@ _DISCOVERY_TO_DATA_TOOL = {
     "get_loki_labels": "query_loki",
 }
 _MAX_GROUNDED_FINDINGS_PER_SOURCE = 3
+_SINGLE_QUOTED_LOGQL_LITERAL = re.compile(r"'((?:\\.|[^'\\])*)'")
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
@@ -448,6 +449,14 @@ def _format_query_timestamp(value: Any) -> str:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(_pod_timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _normalize_logql_literals(logql: str) -> str:
+    """Convert unsupported single-quoted LogQL literals without changing selectors."""
+    return _SINGLE_QUOTED_LOGQL_LITERAL.sub(
+        lambda match: json.dumps(match.group(1), ensure_ascii=False),
+        logql,
+    )
 
 
 def _query_window(call: ToolResult) -> str:
@@ -1797,6 +1806,26 @@ class PamawasInvestigator:
                         None,
                         False,
                     )
+                normalized_logql = _normalize_logql_literals(str(logql))
+                if normalized_logql != logql:
+                    logger.warning(
+                        "Normalized single-quoted LogQL literals before execution"
+                    )
+                    logql = normalized_logql
+                    function_args["logql"] = normalized_logql
+                raw_limit = function_args.get("limit", 100)
+                try:
+                    limit = int(raw_limit)
+                except (TypeError, ValueError):
+                    limit = 100
+                bounded_limit = min(max(limit, 1), self.config.loki_max_log_lines)
+                if bounded_limit != raw_limit:
+                    logger.warning(
+                        "Bounded Loki query limit from %r to %d",
+                        raw_limit,
+                        bounded_limit,
+                    )
+                function_args["limit"] = bounded_limit
                 if verification:
                     stale_error = self._check_verification_time_range(end)
                     if stale_error is not None:
@@ -1809,7 +1838,7 @@ class PamawasInvestigator:
                     logql,
                     start,
                     end,
-                    function_args.get("limit", 100),
+                    bounded_limit,
                 )
                 return result, None, False
 
