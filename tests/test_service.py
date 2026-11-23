@@ -1227,6 +1227,57 @@ def test_claim_recovered_recognizes_positive_recovery():
     assert not _claim_recovered("no recovery observed in the metrics.")
 
 
+def test_cached_verification_evidence_does_not_assume_schema_or_recovery():
+    from service.investigator import (
+        _cached_verification_results,
+        _claim_recovered,
+        _loki_verification_finding,
+        _prometheus_verification_finding,
+    )
+
+    prometheus_signature = "query_prometheus:" + json.dumps(
+        {"promql": "tenant_latency_ratio", "start": "s", "end": "e"},
+        sort_keys=True,
+    )
+    loki_signature = "query_loki:" + json.dumps(
+        {"logql": '{tenant="blue"}', "start": "s", "end": "e"},
+        sort_keys=True,
+    )
+    seen_calls = {
+        prometheus_signature: json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [{"metric": {"scope": "edge"}, "values": [[1, "0.2"]]}],
+                },
+            }
+        ),
+        loki_signature: json.dumps(
+            {
+                "status": "success",
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {"stream": {"scope": "edge"}, "values": [["1", "slow request"]]}
+                    ],
+                },
+            }
+        ),
+    }
+
+    prometheus_result, loki_result = _cached_verification_results(seen_calls)
+    findings = (
+        _prometheus_verification_finding(prometheus_result),
+        _loki_verification_finding(loki_result),
+    )
+
+    assert all(finding is not None for finding in findings)
+    assert "1 result series" in findings[0].content
+    assert "1 log lines across 1 result streams" in findings[1].content
+    assert all(not _claim_recovered(finding.content) for finding in findings)
+
+
 @pytest.mark.asyncio
 async def test_verify_incident_closes_only_on_recovery(investigator):
     """A stale incident closes only when the evidence says it recovered.

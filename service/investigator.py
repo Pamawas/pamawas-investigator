@@ -376,6 +376,89 @@ def _logs_from_tool_calls(
     return entries
 
 
+def _decode_cached_tool_result(cached: Any) -> dict[str, Any] | None:
+    """Decode one cached tool result, ignoring malformed cache entries."""
+    try:
+        parsed = json.loads(cached) if isinstance(cached, str) else cached
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _cached_verification_results(
+    seen_calls: dict[str, str],
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return usable Prometheus and Loki results from the repeated-call cache."""
+    prometheus_result = None
+    loki_result = None
+
+    for signature, cached in seen_calls.items():
+        parsed = _decode_cached_tool_result(cached)
+        if parsed is None:
+            continue
+
+        if signature.startswith("query_prometheus:"):
+            prometheus_result = parsed
+        elif signature.startswith("query_loki:"):
+            loki_result = parsed
+
+    return prometheus_result, loki_result
+
+
+def _cached_result_items(result: dict[str, Any] | None) -> list[Any]:
+    """Read result items from either the adapter or direct API response shape."""
+    if result is None or result.get("status") not in (None, "success"):
+        return []
+    data = result.get("data")
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    items = data.get("result")
+    return items if isinstance(items, list) else []
+
+
+def _prometheus_verification_finding(
+    result: dict[str, Any] | None,
+) -> Finding | None:
+    """Record cached Prometheus evidence without assuming metric semantics."""
+    series = _cached_result_items(result)
+    if not series:
+        return None
+    return Finding(
+        type=EvidenceType.FACT,
+        content=(
+            f"Prometheus response contained {len(series)} result series for the "
+            "repeated live query."
+        ),
+        source=EvidenceSource.PROMETHEUS,
+        source_detail="cached query_prometheus response after repeated call",
+        confidence=1.0,
+    )
+
+
+def _loki_verification_finding(result: dict[str, Any] | None) -> Finding | None:
+    """Record cached Loki evidence without interpreting log content as recovery."""
+    streams = _cached_result_items(result)
+    if not streams:
+        return None
+    line_count = sum(
+        len(stream.get("values", []))
+        for stream in streams
+        if isinstance(stream, dict) and isinstance(stream.get("values"), list)
+    )
+    return Finding(
+        type=EvidenceType.FACT,
+        content=(
+            f"Loki response contained {line_count} log lines across "
+            f"{len(streams)} result streams."
+        ),
+        source=EvidenceSource.LOKI,
+        source_detail="cached query_loki response after repeated call",
+        confidence=0.8,
+    )
+
+
 def _is_placeholder_or_dummy(text: str) -> bool:
     """True when text is a placeholder, dummy value, or lacks substantive content."""
     cleaned = text.strip().lower()
@@ -1837,9 +1920,9 @@ class PamawasInvestigator:
     ) -> None:
         """After 2 repeated tool calls in verification, synthesize findings from cached results.
 
-        The model had two chances to query the live metric; repeating further adds no new
-        information. We must derive a verdict from the already-fetched data rather than
-        falling back to UNKNOWN and defaulting to "still_down".
+        The model had two chances to query live data; repeating further adds no new
+        information. Preserve the cached Prometheus and Loki evidence without inferring
+        recovery from any provider-specific metric name, label, or value threshold.
         """
         logger.warning(
             "Verification for incident %s exceeded repeat budget on %s; "
@@ -1848,62 +1931,12 @@ class PamawasInvestigator:
             function_name,
         )
 
-        # Look across all cached tool results for data we can use
-        prometheus_result = None
-        loki_result = None
-        for sig, cached in state.seen_calls.items():
-            if "query_prometheus" in sig and "up{s" in sig.lower():
-                try:
-                    parsed = json.loads(cached) if isinstance(cached, str) else cached
-                    if isinstance(parsed.get("data"), list) and parsed["data"]:
-                        prometheus_result = parsed
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            if "query_loki" in sig:
-                try:
-                    parsed = json.loads(cached) if isinstance(cached, str) else cached
-                    if isinstance(parsed.get("data", {}).get("result"), list) and parsed["data"]["result"]:
-                        loki_result = parsed
-                except (json.JSONDecodeError, TypeError):
-                    pass
-
-        # Build a finding from what we observed
-        if prometheus_result:
-            data_points = prometheus_result.get("data", [])
-            if isinstance(data_points, list):
-                values = [p.get("value", [None, None])[1] for p in data_points if isinstance(p.get("value"), list)]
-                if values:
-                    # Extract the last value
-                    last_val = values[-1]
-                    try:
-                        val = float(last_val) if last_val is not None else 0
-                        if val >= 1.0:
-                            finding_content = f"The target is up; up metric value is {val}"
-                        else:
-                            # For non-up values, state explicitly that it's down
-                            finding_content = f"The target is still down; up metric value is {val}"
-                        state.findings.append(
-                            Finding(
-                                type=EvidenceType.FACT,
-                                content=finding_content,
-                                source=EvidenceSource.PROMETHEUS,
-                                confidence=1.0,
-                            )
-                        )
-                    except (ValueError, TypeError):
-                        pass
-
-        if loki_result:
-            result_counts = loki_result.get("data", {}).get("result", [])
-            if result_counts:
-                state.findings.append(
-                    Finding(
-                        type=EvidenceType.FACT,
-                        content=f"Loki returned {len(result_counts)} log entries",
-                        source=EvidenceSource.LOKI,
-                        confidence=0.8,
-                    )
-                )
+        prometheus_result, loki_result = _cached_verification_results(state.seen_calls)
+        cached_findings = (
+            _prometheus_verification_finding(prometheus_result),
+            _loki_verification_finding(loki_result),
+        )
+        state.findings.extend(finding for finding in cached_findings if finding is not None)
 
         # Fallback if we still have no findings
         if not state.findings:
