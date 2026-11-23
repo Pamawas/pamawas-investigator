@@ -431,7 +431,12 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "submit_findings",
-                    "description": "Submit final findings and end the investigation",
+                    "description": (
+                        "Submit final findings and end the investigation. A full "
+                        "investigation must include exactly one causal verdict: "
+                        "likely_cause, hypothesis, or an unknown that explicitly "
+                        "states the root cause was not established."
+                    ),
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -449,6 +454,12 @@ class ToolRegistry:
                                                 "unknown",
                                                 "recommendation",
                                             ],
+                                            "description": (
+                                                "Use likely_cause for a strongly supported "
+                                                "mechanism, hypothesis for a plausible but "
+                                                "unconfirmed explanation, and unknown when "
+                                                "the root cause was not established."
+                                            ),
                                         },
                                         "content": {
                                             "type": "string",

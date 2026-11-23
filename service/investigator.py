@@ -1,14 +1,17 @@
 """Main Investigator Service."""
 
 import asyncio
+import itertools
 import json
 import logging
 import os
 import re
 import time
+from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import timezone as tz
+from difflib import SequenceMatcher
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -47,7 +50,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v11"
+PROMPT_VERSION = "pamawas-investigator-v12"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -57,6 +60,8 @@ _DISCOVERY_TO_DATA_TOOL = {
 }
 _MAX_GROUNDED_FINDINGS_PER_SOURCE = 3
 _SINGLE_QUOTED_LOGQL_LITERAL = re.compile(r"'((?:\\.|[^'\\])*)'")
+_PROMETHEUS_TERM = re.compile(r"[a-z0-9]+")
+_CAUSAL_FINDING_TYPES = (EvidenceType.LIKELY_CAUSE, EvidenceType.HYPOTHESIS)
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
@@ -245,6 +250,60 @@ def _drop_trigger_restatements(
     return kept
 
 
+def _prometheus_has_numeric_samples(result: Any) -> bool:
+    """Return whether a Prometheus response contains usable numeric evidence."""
+    if not isinstance(result, dict) or result.get("status") != "success":
+        return False
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return False
+    series = data.get("result")
+    if not isinstance(series, list):
+        return False
+
+    for item in series:
+        if not isinstance(item, dict):
+            continue
+        points = item.get("values")
+        if not isinstance(points, list):
+            point = item.get("value")
+            points = [point] if isinstance(point, list) else []
+        for point in points:
+            if not isinstance(point, list) or len(point) < 2:
+                continue
+            try:
+                float(point[1])
+            except (TypeError, ValueError):
+                continue
+            return True
+    return False
+
+
+def _prometheus_metric_candidates(
+    promql: str, metric_names: Any, limit: int = 12
+) -> list[str]:
+    """Rank real metric names against the failed query without assuming a schema."""
+    if not isinstance(metric_names, list):
+        return []
+
+    query_terms = _PROMETHEUS_TERM.findall(str(promql).lower().replace("_", " "))
+    query_counts = Counter(query_terms)
+    query_bigrams = set(itertools.pairwise(query_terms))
+    normalized_query = "_".join(query_terms)
+
+    def score(name: str) -> tuple[int, int, float]:
+        terms = _PROMETHEUS_TERM.findall(name.lower().replace("_", " "))
+        weighted_overlap = sum(query_counts[term] for term in set(terms))
+        bigram_overlap = len(query_bigrams.intersection(itertools.pairwise(terms)))
+        similarity = SequenceMatcher(None, normalized_query, name.lower()).ratio()
+        return weighted_overlap, bigram_overlap, similarity
+
+    candidates = {str(name) for name in metric_names if str(name).strip()}
+    ranked = sorted(candidates, key=lambda name: (score(name), name), reverse=True)
+    relevant = [name for name in ranked if score(name)[0] > 0]
+    return (relevant or ranked)[:limit]
+
+
 def _successful_tool_calls(
     tool_calls: list[ToolResult], tool_name: str
 ) -> list[ToolResult]:
@@ -255,6 +314,10 @@ def _successful_tool_calls(
         if call.tool_name == tool_name
         and isinstance(call.result, dict)
         and call.result.get("status") == "success"
+        and (
+            tool_name != "query_prometheus"
+            or _prometheus_has_numeric_samples(call.result)
+        )
     ]
 
 
@@ -273,6 +336,10 @@ def _missing_required_data_tools(
         if call.tool_name in _required_data_tools(verification)
         and isinstance(call.result, dict)
         and call.result.get("status") == "success"
+        and (
+            call.tool_name != "query_prometheus"
+            or _prometheus_has_numeric_samples(call.result)
+        )
     }
     return tuple(
         tool_name
@@ -587,6 +654,129 @@ def _loki_query_finding(call: ToolResult) -> Finding:
     )
 
 
+def _causal_query_details(tool_calls: list[ToolResult]) -> str:
+    """Identify the successful provider queries available to a causal synthesis."""
+    details: list[str] = []
+    for tool_name, argument_name in (
+        ("query_prometheus", "promql"),
+        ("query_loki", "logql"),
+    ):
+        calls = _successful_tool_calls(tool_calls, tool_name)
+        if calls:
+            details.append(_query_source_detail(calls[-1], argument_name))
+    return "; ".join(details)
+
+
+def _normalized_causal_synthesis(
+    findings: list[Finding], tool_calls: list[ToolResult]
+) -> Finding | None:
+    """Keep one model causal verdict, clearly labeled and tied to real queries."""
+    candidates = [finding for finding in findings if finding.type in _CAUSAL_FINDING_TYPES]
+    if not candidates:
+        return None
+    best = max(
+        candidates,
+        key=lambda finding: (
+            finding.type == EvidenceType.LIKELY_CAUSE,
+            finding.confidence,
+        ),
+    )
+    confidence_cap = 0.75 if best.type == EvidenceType.LIKELY_CAUSE else 0.6
+    detail = _causal_query_details(tool_calls) or "model synthesis without provider evidence"
+    return replace(
+        best,
+        source=EvidenceSource.LLM,
+        source_detail=f"synthesis from {detail}",
+        confidence=min(float(best.confidence), confidence_cap),
+    )
+
+
+def _has_causal_verdict(findings: list[Finding]) -> bool:
+    """Return whether findings explicitly answer the root-cause question."""
+    for finding in findings:
+        if finding.type in _CAUSAL_FINDING_TYPES:
+            return True
+        if finding.type == EvidenceType.UNKNOWN:
+            content = finding.content.lower()
+            if any(marker in content for marker in ("root cause", "causal", "cause")):
+                return True
+    return False
+
+
+def _loki_fallback_hypothesis(tool_calls: list[ToolResult]) -> Finding | None:
+    """Create a cautious hypothesis from the busiest returned Loki stream."""
+    for call in reversed(_successful_tool_calls(tool_calls, "query_loki")):
+        data = call.result.get("data")
+        streams = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(streams, list):
+            continue
+        usable = [
+            stream
+            for stream in streams
+            if isinstance(stream, dict)
+            and isinstance(stream.get("values"), list)
+            and stream["values"]
+        ]
+        if not usable:
+            continue
+        busiest = max(usable, key=lambda stream: len(stream["values"]))
+        stream_labels = busiest.get("stream")
+        rendered_stream = json.dumps(
+            stream_labels if isinstance(stream_labels, dict) else {},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        line_count = len(busiest["values"])
+        return Finding(
+            type=EvidenceType.HYPOTHESIS,
+            content=(
+                f"Activity in Loki stream {rendered_stream} is a possible contributor: "
+                f"the stream produced {line_count} matching entries during the incident "
+                "window. This is a low-confidence hypothesis because temporal overlap "
+                "alone does not establish causation."
+            ),
+            source=EvidenceSource.LLM,
+            source_detail=f"synthesis from {_query_source_detail(call, 'logql')}",
+            confidence=0.4,
+        )
+    return None
+
+
+def _ensure_causal_verdict(
+    findings: list[Finding], tool_calls: list[ToolResult]
+) -> list[Finding]:
+    """Guarantee one explicit causal verdict without fabricating a confirmed cause."""
+    if _has_causal_verdict(findings):
+        return findings
+    if not any(
+        _successful_tool_calls(tool_calls, tool_name)
+        for tool_name in _FULL_INVESTIGATION_DATA_TOOLS
+    ):
+        return findings
+    fallback = _loki_fallback_hypothesis(tool_calls)
+    if fallback is None:
+        fallback = Finding(
+            type=EvidenceType.UNKNOWN,
+            content=(
+                "The successful data queries did not establish a root cause for this "
+                "incident."
+            ),
+            source=EvidenceSource.SYSTEM,
+            source_detail="causal-verdict enforcement",
+            confidence=0.0,
+        )
+    return [*findings, fallback]
+
+
+def _ensure_causal_verdict_for_mode(
+    findings: list[Finding], tool_calls: list[ToolResult], verification: bool
+) -> list[Finding]:
+    """Apply causal-verdict enforcement only to full investigations."""
+    if verification:
+        return findings
+    return _ensure_causal_verdict(findings, tool_calls)
+
+
 def _ground_findings_in_data_queries(
     findings: list[Finding], tool_calls: list[ToolResult]
 ) -> list[Finding]:
@@ -601,7 +791,9 @@ def _ground_findings_in_data_queries(
         finding
         for finding in findings
         if finding.source not in (EvidenceSource.PROMETHEUS, EvidenceSource.LOKI)
+        and finding.type not in _CAUSAL_FINDING_TYPES
     ]
+    causal_synthesis = _normalized_causal_synthesis(findings, tool_calls)
     grounded: list[Finding] = []
     prometheus_calls = _successful_tool_calls(tool_calls, "query_prometheus")
     loki_calls = _successful_tool_calls(tool_calls, "query_loki")
@@ -613,6 +805,8 @@ def _ground_findings_in_data_queries(
         _loki_query_finding(call)
         for call in loki_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
     )
+    if causal_synthesis is not None:
+        grounded.append(causal_synthesis)
     return grounded + kept
 
 
@@ -1536,6 +1730,9 @@ class PamawasInvestigator:
             "one successful query_loki call before submission. Catalog and label-discovery calls "
             "do not satisfy this requirement. The harness enforces this rule and rejects early "
             "submissions.\n"
+            "- Prometheus HTTP success with zero numeric series is not evidence and does not "
+            "satisfy the gate. When the harness returns metric_candidates, retry with an exact "
+            "returned metric name and an evidence-appropriate PromQL transformation.\n"
             "- If a data query fails, correct it using only discovered schema and make a bounded, "
             "materially different attempt. If a source remains unavailable, do not fabricate "
             "evidence; the harness will terminate with an honest UNKNOWN.\n"
@@ -1589,8 +1786,13 @@ class PamawasInvestigator:
             "- Use submit_findings; prose alone does not complete the investigation.\n"
             "- submit_findings is accepted only after successful Prometheus and Loki data "
             "queries. Do not submit after catalog discovery alone.\n"
-            "- Report only substantive findings: the key observed facts, at most one best "
-            "cause or hypothesis, important unknowns, and at least one specific recommendation.\n"
+            "- Every full investigation MUST contain exactly one causal verdict: LIKELY_CAUSE "
+            "when the mechanism is strongly supported, HYPOTHESIS when it is plausible but "
+            "unconfirmed, or UNKNOWN explicitly stating that the root cause was not established. "
+            "A recommendation without a causal verdict is incomplete. Use source=llm for a "
+            "causal synthesis across provider results.\n"
+            "- Report only substantive findings: the key observed facts, that one causal "
+            "verdict, important unknowns, and at least one specific recommendation.\n"
             "- Never submit a FACT whose only content is that this incident exists, fired, "
             "has a severity, targets a service, or started at the supplied time.\n"
             "- Keep each finding to one or two plain sentences. State the conclusion and its "
@@ -1784,6 +1986,44 @@ class PamawasInvestigator:
                             False,
                         )
                 result = await self.tools._prometheus_adapter.query_range(promql, start, end)
+                if (
+                    isinstance(result, dict)
+                    and result.get("status") == "success"
+                    and not _prometheus_has_numeric_samples(result)
+                ):
+                    metric_names: Any = []
+                    try:
+                        catalog = await self.tools._prometheus_adapter.query_label_values(
+                            "__name__"
+                        )
+                        metric_names = catalog.get("data", [])
+                    except (AttributeError, PrometheusError) as exc:
+                        logger.warning(
+                            "Prometheus metric-name discovery failed after empty query: %s",
+                            exc,
+                        )
+                    candidates = _prometheus_metric_candidates(promql, metric_names)
+                    logger.warning(
+                        "Prometheus query returned no numeric series; retry candidates: %s",
+                        candidates,
+                    )
+                    return (
+                        {
+                            "status": "empty",
+                            "error": (
+                                "Prometheus returned no usable numeric series. This "
+                                "does not satisfy the evidence gate. Retry with a "
+                                "materially different expression using an exact metric "
+                                "name from metric_candidates. Preserve only selectors "
+                                "validated by the incident or discovered schema; use "
+                                "rate/increase for counter metrics when appropriate."
+                            ),
+                            "data": result.get("data", {}),
+                            "metric_candidates": candidates,
+                        },
+                        None,
+                        False,
+                    )
                 return result, None, False
 
             elif function_name == "get_prometheus_labels":
@@ -2180,6 +2420,7 @@ class PamawasInvestigator:
         findings = _drop_trigger_restatements(findings, incident_id)
         if not verification:
             findings = _ground_findings_in_data_queries(findings, state.tool_calls)
+            findings = _ensure_causal_verdict(findings, state.tool_calls)
         state.findings = findings
         state.completed = True
 
@@ -2762,6 +3003,9 @@ class PamawasInvestigator:
                 )
             )
 
+        state.findings = _ensure_causal_verdict_for_mode(
+            state.findings, state.tool_calls, verification
+        )
         increment_findings_by_type(state.findings)
         if exhausted_by in ("deadline", "required_data"):
             increment_deadline_exceeded()
@@ -2868,6 +3112,9 @@ class PamawasInvestigator:
                 source_detail="required data-query enforcement",
                 confidence=0.0,
             )
+        )
+        state.findings = _ensure_causal_verdict_for_mode(
+            state.findings, state.tool_calls, verification
         )
         state.completed = True
         return True

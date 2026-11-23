@@ -155,7 +155,7 @@ def test_investigate_returns_context_error(investigator):
         return_value=IncidentContext("x", "x", error="db failed")
     )
     findings = investigator.investigate("x")
-    assert findings[0].type is EvidenceType.UNKNOWN
+    assert any(finding.type is EvidenceType.UNKNOWN for finding in findings)
     assert "db failed" in findings[0].content
 
 
@@ -236,7 +236,14 @@ def test_early_submission_is_rejected_until_both_data_queries_succeed(investigat
         return_value=IncidentContext("inc", "Outage")
     )
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
-        return_value={"status": "success", "data": []}
+        return_value={
+            "status": "success",
+            "data": {
+                "result": [
+                    {"metric": {"scope": "test"}, "values": [[1, "1"]]}
+                ]
+            },
+        }
     )
     investigator.tools._prometheus_adapter.query_labels = AsyncMock(
         return_value={"status": "success", "data": ["schema_key"]}
@@ -305,7 +312,7 @@ def test_early_submission_is_rejected_until_both_data_queries_succeed(investigat
 
     findings = investigator.investigate("inc")
 
-    assert findings[0].type is EvidenceType.UNKNOWN
+    assert any(finding.type is EvidenceType.UNKNOWN for finding in findings)
     forced_names = [
         choice["function"]["name"]
         for choice in choices
@@ -323,7 +330,14 @@ def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
         return_value=IncidentContext("inc", "Outage")
     )
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
-        return_value={"status": "success", "data": []}
+        return_value={
+            "status": "success",
+            "data": {
+                "result": [
+                    {"metric": {"scope": "test"}, "values": [[1, "1"]]}
+                ]
+            },
+        }
     )
     investigator.tools._prometheus_adapter.query_labels = AsyncMock(
         return_value={"status": "success", "data": ["validated"]}
@@ -401,7 +415,7 @@ def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
 
     findings = investigator.investigate("inc")
 
-    assert findings[0].type is EvidenceType.UNKNOWN
+    assert any(finding.type is EvidenceType.UNKNOWN for finding in findings)
     assert investigator.tools._prometheus_adapter.query_range.await_count == 1
     assert investigator.tools._loki_adapter.query_range.await_count == 1
 
@@ -441,7 +455,7 @@ def test_investigate_handles_large_tool_result_without_invalid_json(investigator
     assert findings[0].source is EvidenceSource.PROMETHEUS
     assert findings[0].type is EvidenceType.FACT
     assert findings[-1].type is EvidenceType.UNKNOWN
-    assert "turn budget" in findings[-1].content
+    assert any("turn budget" in finding.content for finding in findings)
 
 
 def test_text_only_turns_are_bounded_by_turn_budget(investigator):
@@ -773,7 +787,14 @@ def test_forced_turn_that_ignores_tool_choice_does_not_spend_the_reserve(investi
 
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
-        return_value={"status": "success", "data": [1]}
+        return_value={
+            "status": "success",
+            "data": {
+                "result": [
+                    {"metric": {"scope": "test"}, "values": [[1, "1"]]}
+                ]
+            },
+        }
     )
 
     def fake_completion(
@@ -923,6 +944,46 @@ async def test_execute_tool_repairs_weak_model_logql_syntax_and_limit(investigat
     )
 
 
+@pytest.mark.asyncio
+async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(investigator):
+    """HTTP 200 with zero series must trigger schema-neutral metric discovery."""
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={
+            "status": "success",
+            "data": {"resultType": "matrix", "result": []},
+        }
+    )
+    investigator.tools._prometheus_adapter.query_label_values = AsyncMock(
+        return_value={
+            "status": "success",
+            "data": [
+                "container_cpu_usage_seconds_total",
+                "mktxp_system_cpu_load",
+                "node_cpu_seconds_total",
+                "process_cpu_seconds_total",
+            ],
+        }
+    )
+
+    result, findings, is_final = await investigator._execute_tool(
+        "query_prometheus",
+        {
+            "promql": 'system_node_cpu_usage_percent{job="system_node"}',
+            "start": "2026-11-23T11:30:00Z",
+            "end": "2026-11-23T11:45:00Z",
+        },
+    )
+
+    assert result["status"] == "empty"
+    assert result["metric_candidates"][0] == "node_cpu_seconds_total"
+    assert "does not satisfy the evidence gate" in result["error"]
+    assert findings is None
+    assert is_final is False
+    investigator.tools._prometheus_adapter.query_label_values.assert_awaited_once_with(
+        "__name__"
+    )
+
+
 def test_system_prompt_names_the_incident_it_serves(investigator):
     """Each investigation's system prompt states which incident it covers.
 
@@ -985,6 +1046,9 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "never treat catalog output as evidence" in prompt
     assert "MUST execute at least one successful query_prometheus" in prompt
     assert "The harness enforces this rule and rejects early submissions" in prompt
+    assert "zero numeric series is not evidence" in prompt
+    assert "MUST contain exactly one causal verdict" in prompt
+    assert "A recommendation without a causal verdict is incomplete" in prompt
     assert "The current incident is the investigation premise, not a finding" in prompt
     assert "Restating the triggering alert is not a finding" in prompt
     assert "DECISION PROCEDURE" in prompt
@@ -1198,6 +1262,93 @@ def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
     assert grounded[2].type is EvidenceType.RECOMMENDATION
 
 
+def test_missing_model_cause_gets_cautious_schema_neutral_loki_hypothesis():
+    """A weak model cannot finish with only facts and a recommendation."""
+    from service.investigator import _ensure_causal_verdict
+
+    tool_calls = [
+        ToolResult(
+            tool_name="query_loki",
+            arguments={
+                "logql": '{vendor_scope="alpha-target"} |~ "warn|error"',
+                "start": "2026-11-23T11:30:00Z",
+                "end": "2026-11-23T11:45:00Z",
+            },
+            result={
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "stream": {
+                                "vendor_component": "network-agent",
+                                "vendor_scope": "alpha-target",
+                            },
+                            "values": [["1", "warning one"], ["2", "warning two"]],
+                        }
+                    ]
+                },
+            },
+            duration_ms=1,
+        )
+    ]
+    findings = [
+        Finding(
+            type=EvidenceType.RECOMMENDATION,
+            content="Inspect the matching component.",
+            source=EvidenceSource.LLM,
+            confidence=0.5,
+        )
+    ]
+
+    completed = _ensure_causal_verdict(findings, tool_calls)
+
+    assert completed[-1].type is EvidenceType.HYPOTHESIS
+    assert completed[-1].source is EvidenceSource.LLM
+    assert completed[-1].confidence == 0.4
+    assert '"vendor_component":"network-agent"' in completed[-1].content
+    assert "temporal overlap alone does not establish causation" in completed[-1].content
+
+
+def test_model_causal_verdict_is_preserved_as_capped_synthesis():
+    tool_calls = [
+        ToolResult(
+            tool_name="query_loki",
+            arguments={"logql": '{scope="target"}', "start": "s", "end": "e"},
+            result={
+                "status": "success",
+                "data": {
+                    "result": [
+                        {"stream": {"scope": "target"}, "values": [["1", "restart"]]}
+                    ]
+                },
+            },
+            duration_ms=1,
+        )
+    ]
+    model_findings = [
+        Finding(
+            type=EvidenceType.HYPOTHESIS,
+            content="A restart may have caused the transient condition.",
+            source=EvidenceSource.LOKI,
+            source_detail="invented selector",
+            confidence=0.95,
+        )
+    ]
+
+    grounded = _ground_findings_in_data_queries(model_findings, tool_calls)
+
+    hypotheses = [
+        finding for finding in grounded if finding.type is EvidenceType.HYPOTHESIS
+    ]
+    assert len(hypotheses) == 1
+    assert hypotheses[0].source is EvidenceSource.LLM
+    assert hypotheses[0].confidence == 0.6
+    assert hypotheses[0].source_detail == (
+        'synthesis from query_loki: {scope="target"} [s to e]'
+    )
+    assert "invented" not in hypotheses[0].source_detail
+
+
 def test_each_investigation_gets_its_own_conversation(investigator):
     """Two investigations must not share a message list.
 
@@ -1370,7 +1521,14 @@ def test_no_tool_calls_start_once_the_reserve_opens(investigator, monkeypatch):
     from models import InvestigationState
 
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
-        return_value={"status": "success", "data": [1]}
+        return_value={
+            "status": "success",
+            "data": {
+                "result": [
+                    {"metric": {"scope": "test"}, "values": [[1, "1"]]}
+                ]
+            },
+        }
     )
     investigator.llm.chat_completion = MagicMock(
         side_effect=lambda *a, **kw: response(
