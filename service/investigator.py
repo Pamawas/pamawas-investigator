@@ -1993,9 +1993,7 @@ class PamawasInvestigator:
                 ):
                     metric_names: Any = []
                     try:
-                        catalog = await self.tools._prometheus_adapter.query_label_values(
-                            "__name__"
-                        )
+                        catalog = await self.tools._prometheus_adapter.query_metric_names()
                         metric_names = catalog.get("data", [])
                     except (AttributeError, PrometheusError) as exc:
                         logger.warning(

@@ -953,7 +953,7 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
             "data": {"resultType": "matrix", "result": []},
         }
     )
-    investigator.tools._prometheus_adapter.query_label_values = AsyncMock(
+    investigator.tools._prometheus_adapter.query_metric_names = AsyncMock(
         return_value={
             "status": "success",
             "data": [
@@ -979,9 +979,7 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
     assert "does not satisfy the evidence gate" in result["error"]
     assert findings is None
     assert is_final is False
-    investigator.tools._prometheus_adapter.query_label_values.assert_awaited_once_with(
-        "__name__"
-    )
+    investigator.tools._prometheus_adapter.query_metric_names.assert_awaited_once_with()
 
 
 def test_system_prompt_names_the_incident_it_serves(investigator):

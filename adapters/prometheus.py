@@ -450,3 +450,77 @@ class PrometheusAdapter:
             increment_tool_calls("prometheus", "error")
             logger.error("Prometheus labels query failed: %s", e)
             raise PrometheusError(f"Prometheus labels query failed: {e}")
+
+    async def query_metric_catalog(self) -> dict[str, Any]:
+        """Get the standard metric metadata catalog without label assumptions."""
+        start_time = time.time()
+        client = await self._get_client()
+
+        if not self._circuit_breaker.allow_call():
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "circuit_open")
+            logger.warning("Prometheus circuit breaker open, rejecting metadata query")
+            return self._unavailable_response("circuit_breaker_open")
+
+        try:
+            response = await client.get("/api/v1/metadata")
+            response.raise_for_status()
+            self._validate_response_size(len(response.content))
+            payload = response.json()
+
+            if payload.get("status") != "success":
+                error_msg = payload.get("error", "Unknown Prometheus error")
+                self._circuit_breaker.record_failure()
+                raise PrometheusError(f"Prometheus error: {error_msg}")
+
+            metadata = payload.get("data", {})
+            if not isinstance(metadata, dict):
+                raise PrometheusError("Prometheus metadata response must be an object")
+
+            self._circuit_breaker.record_success()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "success")
+            catalog = []
+            for name in sorted(metadata):
+                descriptors = metadata.get(name)
+                descriptor = (
+                    descriptors[0]
+                    if isinstance(descriptors, list)
+                    and descriptors
+                    and isinstance(descriptors[0], dict)
+                    else {}
+                )
+                catalog.append(
+                    {
+                        "name": name,
+                        "type": str(descriptor.get("type") or "unknown"),
+                        "help": str(descriptor.get("help") or ""),
+                        "unit": str(descriptor.get("unit") or ""),
+                    }
+                )
+            return {"status": "success", "data": catalog}
+
+        except httpx.TimeoutException:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "timeout")
+            raise PrometheusTimeoutError(
+                f"Prometheus metadata query timed out after {self.config.timeout_seconds}s"
+            )
+        except httpx.HTTPStatusError as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            raise PrometheusError(
+                f"Prometheus HTTP error {e.response.status_code}: {e.response.text}"
+            )
+        except PrometheusError:
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            raise
+        except (httpx.HTTPError, ValueError, KeyError, UnicodeDecodeError) as e:
+            self._circuit_breaker.record_failure()
+            observe_tool_call_duration("prometheus", time.time() - start_time)
+            increment_tool_calls("prometheus", "error")
+            logger.error("Prometheus metadata query failed: %s", e)
+            raise PrometheusError(f"Prometheus metadata query failed: {e}")
