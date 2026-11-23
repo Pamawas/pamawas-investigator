@@ -953,14 +953,40 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
             "data": {"resultType": "matrix", "result": []},
         }
     )
-    investigator.tools._prometheus_adapter.query_metric_names = AsyncMock(
+    investigator.tools._prometheus_adapter.query_metric_catalog = AsyncMock(
         return_value={
             "status": "success",
             "data": [
-                "container_cpu_usage_seconds_total",
-                "mktxp_system_cpu_load",
-                "node_cpu_seconds_total",
-                "process_cpu_seconds_total",
+                {
+                    "name": "container_cpu_usage_seconds_total",
+                    "type": "counter",
+                    "help": "Cumulative CPU time consumed",
+                    "unit": "seconds",
+                },
+                {
+                    "name": "mktxp_system_cpu_load",
+                    "type": "gauge",
+                    "help": "Current system load",
+                    "unit": "percent",
+                },
+                {
+                    "name": "node_cpu_scaling_governor",
+                    "type": "gauge",
+                    "help": "Current enabled CPU frequency governor",
+                    "unit": "",
+                },
+                {
+                    "name": "node_cpu_seconds_total",
+                    "type": "counter",
+                    "help": "Seconds the CPUs spent in each mode",
+                    "unit": "seconds",
+                },
+                {
+                    "name": "process_cpu_seconds_total",
+                    "type": "counter",
+                    "help": "Total user and system CPU time",
+                    "unit": "seconds",
+                },
             ],
         }
     )
@@ -975,11 +1001,63 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
     )
 
     assert result["status"] == "empty"
-    assert result["metric_candidates"][0] == "node_cpu_seconds_total"
+    assert result["metric_candidates"][0]["name"] == "node_cpu_seconds_total"
     assert "does not satisfy the evidence gate" in result["error"]
     assert findings is None
     assert is_final is False
-    investigator.tools._prometheus_adapter.query_metric_names.assert_awaited_once_with()
+    investigator.tools._prometheus_adapter.query_metric_catalog.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_empty_loki_query_rejects_undiscovered_selector(investigator):
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
+    investigator.tools._loki_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["vendor_scope"]}
+    )
+    investigator.tools._loki_adapter.query_label_values = AsyncMock()
+
+    result, _, _ = await investigator._execute_tool(
+        "query_loki",
+        {
+            "logql": '{invented_key="alpha"}',
+            "start": "2026-11-23T11:30:00Z",
+            "end": "2026-11-23T11:45:00Z",
+        },
+    )
+
+    assert result["status"] == "empty"
+    assert result["available_labels"] == ["vendor_scope"]
+    assert "invented_key" in result["error"]
+    investigator.tools._loki_adapter.query_label_values.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_empty_loki_query_is_meaningful_after_selector_validation(investigator):
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
+    investigator.tools._loki_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["vendor_scope"]}
+    )
+    investigator.tools._loki_adapter.query_label_values = AsyncMock(
+        return_value={"status": "success", "data": ["alpha", "beta"]}
+    )
+
+    result, _, _ = await investigator._execute_tool(
+        "query_loki",
+        {
+            "logql": '{vendor_scope="alpha"}',
+            "start": "2026-11-23T11:30:00Z",
+            "end": "2026-11-23T11:45:00Z",
+        },
+    )
+
+    assert result["status"] == "success"
+    investigator.tools._loki_adapter.query_label_values.assert_awaited_once_with(
+        "vendor_scope"
+    )
 
 
 def test_system_prompt_names_the_incident_it_serves(investigator):
@@ -1045,6 +1123,7 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "MUST execute at least one successful query_prometheus" in prompt
     assert "The harness enforces this rule and rejects early submissions" in prompt
     assert "zero numeric series is not evidence" in prompt
+    assert "zero-entry Loki result is accepted only after" in prompt
     assert "MUST contain exactly one causal verdict" in prompt
     assert "A recommendation without a causal verdict is incomplete" in prompt
     assert "The current incident is the investigation premise, not a finding" in prompt

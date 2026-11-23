@@ -60,7 +60,12 @@ _DISCOVERY_TO_DATA_TOOL = {
 }
 _MAX_GROUNDED_FINDINGS_PER_SOURCE = 3
 _SINGLE_QUOTED_LOGQL_LITERAL = re.compile(r"'((?:\\.|[^'\\])*)'")
+_LOGQL_SELECTOR = re.compile(r"\{([^{}]*)\}")
+_LOGQL_MATCHER = re.compile(
+    r'([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|=|!=)\s*"((?:\\.|[^"\\])*)"'
+)
 _PROMETHEUS_TERM = re.compile(r"[a-z0-9]+")
+_RATE_LIKE_TERMS = {"load", "percent", "ratio", "rate", "usage", "utilization"}
 _CAUSAL_FINDING_TYPES = (EvidenceType.LIKELY_CAUSE, EvidenceType.HYPOTHESIS)
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
@@ -280,27 +285,54 @@ def _prometheus_has_numeric_samples(result: Any) -> bool:
 
 
 def _prometheus_metric_candidates(
-    promql: str, metric_names: Any, limit: int = 12
-) -> list[str]:
-    """Rank real metric names against the failed query without assuming a schema."""
-    if not isinstance(metric_names, list):
+    promql: str, metric_catalog: Any, limit: int = 12
+) -> list[dict[str, str]]:
+    """Rank real metric metadata against the failed query without assuming a schema."""
+    if not isinstance(metric_catalog, list):
         return []
 
     query_terms = _PROMETHEUS_TERM.findall(str(promql).lower().replace("_", " "))
     query_counts = Counter(query_terms)
     query_bigrams = set(itertools.pairwise(query_terms))
     normalized_query = "_".join(query_terms)
+    rate_like_intent = bool(set(query_terms).intersection(_RATE_LIKE_TERMS))
 
-    def score(name: str) -> tuple[int, int, float]:
+    def normalize(item: Any) -> dict[str, str] | None:
+        if isinstance(item, str) and item.strip():
+            return {"name": item, "type": "unknown", "help": "", "unit": ""}
+        if not isinstance(item, dict) or not str(item.get("name") or "").strip():
+            return None
+        return {
+            "name": str(item["name"]),
+            "type": str(item.get("type") or "unknown"),
+            "help": str(item.get("help") or ""),
+            "unit": str(item.get("unit") or ""),
+        }
+
+    def score(item: dict[str, str]) -> tuple[int, int, int, float]:
+        name = item["name"]
         terms = _PROMETHEUS_TERM.findall(name.lower().replace("_", " "))
         weighted_overlap = sum(query_counts[term] for term in set(terms))
         bigram_overlap = len(query_bigrams.intersection(itertools.pairwise(terms)))
+        metadata_terms = set(
+            _PROMETHEUS_TERM.findall(
+                f"{item['help']} {item['unit']}".lower().replace("_", " ")
+            )
+        )
+        metadata_overlap = sum(query_counts[term] for term in metadata_terms)
+        if rate_like_intent and item["type"].lower() == "counter":
+            weighted_overlap += 2
         similarity = SequenceMatcher(None, normalized_query, name.lower()).ratio()
-        return weighted_overlap, bigram_overlap, similarity
+        return weighted_overlap, bigram_overlap, metadata_overlap, similarity
 
-    candidates = {str(name) for name in metric_names if str(name).strip()}
-    ranked = sorted(candidates, key=lambda name: (score(name), name), reverse=True)
-    relevant = [name for name in ranked if score(name)[0] > 0]
+    normalized = [normalize(item) for item in metric_catalog]
+    candidates = {item["name"]: item for item in normalized if item is not None}
+    ranked = sorted(
+        candidates.values(),
+        key=lambda item: (score(item), item["name"]),
+        reverse=True,
+    )
+    relevant = [item for item in ranked if score(item)[0] > 0]
     return (relevant or ranked)[:limit]
 
 
@@ -524,6 +556,51 @@ def _normalize_logql_literals(logql: str) -> str:
         lambda match: json.dumps(match.group(1), ensure_ascii=False),
         logql,
     )
+
+
+def _logql_matchers(logql: str) -> list[tuple[str, str, str]]:
+    """Extract bounded selector matchers from normalized LogQL."""
+    selector = _LOGQL_SELECTOR.search(logql)
+    if selector is None:
+        return []
+    matchers: list[tuple[str, str, str]] = []
+    for match in _LOGQL_MATCHER.finditer(selector.group(1)):
+        raw_value = match.group(3)
+        try:
+            value = json.loads(f'"{raw_value}"')
+        except json.JSONDecodeError:
+            value = raw_value
+        matchers.append((match.group(1), match.group(2), str(value)))
+    return matchers[:8]
+
+
+def _loki_has_entries(result: Any) -> bool:
+    """Return whether a Loki response contains at least one log entry."""
+    if not isinstance(result, dict) or result.get("status") != "success":
+        return False
+    data = result.get("data")
+    streams = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(streams, list):
+        return False
+    return any(
+        isinstance(stream, dict)
+        and isinstance(stream.get("values"), list)
+        and bool(stream["values"])
+        for stream in streams
+    )
+
+
+def _loki_value_matches(operator: str, expected: str, values: list[str]) -> bool:
+    """Validate one positive LogQL matcher against discovered label values."""
+    if operator == "=":
+        return expected in values
+    if operator == "=~":
+        try:
+            pattern = re.compile(expected)
+        except re.error:
+            return False
+        return any(pattern.search(value) is not None for value in values)
+    return True
 
 
 def _query_window(call: ToolResult) -> str:
@@ -1733,6 +1810,9 @@ class PamawasInvestigator:
             "- Prometheus HTTP success with zero numeric series is not evidence and does not "
             "satisfy the gate. When the harness returns metric_candidates, retry with an exact "
             "returned metric name and an evidence-appropriate PromQL transformation.\n"
+            "- A zero-entry Loki result is accepted only after the harness validates every "
+            "selector label and positive value against Loki's discovered schema. If validation "
+            "fails, retry using the labels and values returned by the harness.\n"
             "- If a data query fails, correct it using only discovered schema and make a bounded, "
             "materially different attempt. If a source remains unavailable, do not fabricate "
             "evidence; the harness will terminate with an honest UNKNOWN.\n"
@@ -1929,6 +2009,90 @@ class PamawasInvestigator:
             pass
         return None
 
+    async def _invalid_loki_selector_values(
+        self, matchers: list[tuple[str, str, str]]
+    ) -> dict[str, dict[str, Any]] | None:
+        """Return invalid positive selector values, or None for a legacy adapter."""
+        invalid_values: dict[str, dict[str, Any]] = {}
+        for label, operator, expected in matchers:
+            if operator not in ("=", "=~"):
+                continue
+            try:
+                response = await self.tools._loki_adapter.query_label_values(label)
+            except AttributeError:
+                logger.warning(
+                    "Loki adapter has no label-value method; skipping validation"
+                )
+                return None
+            except LokiError as exc:
+                invalid_values[label] = {"error": str(exc)}
+                continue
+            raw_values = response.get("data", []) if isinstance(response, dict) else []
+            values = [str(value) for value in raw_values]
+            if not _loki_value_matches(operator, expected, values):
+                invalid_values[label] = {
+                    "operator": operator,
+                    "requested": expected,
+                    "available_values": values[:20],
+                }
+        return invalid_values
+
+    async def _validate_empty_loki_result(
+        self, logql: str, result: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Treat empty Loki data as evidence only after validating its selector."""
+        matchers = _logql_matchers(logql)
+        if not matchers:
+            return {
+                "status": "empty",
+                "error": (
+                    "Loki returned no entries and the selector could not be parsed for "
+                    "schema validation. Retry with a selector built from discovered labels."
+                ),
+                "data": result.get("data", {}),
+            }
+
+        try:
+            catalog = await self.tools._loki_adapter.query_labels()
+        except AttributeError:
+            logger.warning("Loki adapter has no label-catalog method; skipping validation")
+            return result
+        except LokiError as exc:
+            return {
+                "status": "empty",
+                "error": f"Loki selector validation failed: {exc}",
+                "data": result.get("data", {}),
+            }
+
+        available_labels = catalog.get("data", []) if isinstance(catalog, dict) else []
+        available_set = {str(label) for label in available_labels}
+        missing_labels = sorted({label for label, _, _ in matchers} - available_set)
+        if missing_labels:
+            return {
+                "status": "empty",
+                "error": (
+                    "Loki returned no entries because selector labels were not present "
+                    f"in the discovered schema: {', '.join(missing_labels)}."
+                ),
+                "data": result.get("data", {}),
+                "available_labels": sorted(available_set),
+            }
+
+        invalid_values = await self._invalid_loki_selector_values(matchers)
+        if invalid_values is None:
+            return result
+        if invalid_values:
+            return {
+                "status": "empty",
+                "error": (
+                    "Loki returned no entries and one or more selector values were not "
+                    "validated. Retry using returned label values."
+                ),
+                "data": result.get("data", {}),
+                "invalid_selector_values": invalid_values,
+            }
+        return result
+
     async def _execute_tool(  # noqa: C901
         self,
         function_name: str,
@@ -1991,16 +2155,16 @@ class PamawasInvestigator:
                     and result.get("status") == "success"
                     and not _prometheus_has_numeric_samples(result)
                 ):
-                    metric_names: Any = []
+                    metric_catalog: Any = []
                     try:
-                        catalog = await self.tools._prometheus_adapter.query_metric_names()
-                        metric_names = catalog.get("data", [])
+                        catalog = await self.tools._prometheus_adapter.query_metric_catalog()
+                        metric_catalog = catalog.get("data", [])
                     except (AttributeError, PrometheusError) as exc:
                         logger.warning(
                             "Prometheus metric-name discovery failed after empty query: %s",
                             exc,
                         )
-                    candidates = _prometheus_metric_candidates(promql, metric_names)
+                    candidates = _prometheus_metric_candidates(promql, metric_catalog)
                     logger.warning(
                         "Prometheus query returned no numeric series; retry candidates: %s",
                         candidates,
@@ -2087,6 +2251,12 @@ class PamawasInvestigator:
                     end,
                     bounded_limit,
                 )
+                if (
+                    isinstance(result, dict)
+                    and result.get("status") == "success"
+                    and not _loki_has_entries(result)
+                ):
+                    result = await self._validate_empty_loki_result(logql, result)
                 return result, None, False
 
             elif function_name == "get_related_incidents":
