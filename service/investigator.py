@@ -1687,6 +1687,52 @@ class PamawasInvestigator:
                 service=state.service,
             )
 
+    async def _close_verification_on_repeat_budget(
+        self,
+        incident_id: str,
+        request_key_hash: str,
+        state: InvestigationState,
+        function_name: str,
+    ) -> None:
+        """After 2 repeated tool calls in verification, submit findings as-is.
+
+        The model had two chances to query the live metric; repeating further
+        adds no new information. Preserve whatever evidence was collected so far
+        and close the verification loop so the stale_verification worker can
+        record the verdict.
+        """
+        logger.warning(
+            "Verification for incident %s exceeded repeat budget on %s; "
+            "submitting gathered findings as final verdict",
+            incident_id,
+            function_name,
+        )
+        # Build whatever findings exist (they were already tracked in state.findings).
+        # If nothing was captured, an UNKNOWN fallback will come from the outer loop.
+        if not state.findings:
+            state.findings.append(
+                Finding(
+                    type=EvidenceType.UNKNOWN,
+                    content="No findings recorded before verification closed on repeat budget",
+                    source=EvidenceSource.SYSTEM,
+                    confidence=0.0,
+                )
+            )
+        # Mark as completed so the loop terminates with a verdict.
+        state.completed = True
+        await self._persist_investigation(
+            incident_id=incident_id,
+            request_key_hash=request_key_hash,
+            findings=state.findings,
+            tool_calls=state.tool_calls,
+            model_provider=self.config.llm_base_url,
+            model_name=self.config.llm_model,
+            prompt_version="pamawas-investigator-v1",
+            tool_contract=1,
+            max_tool_calls=self.config.max_tool_calls,
+            service=state.service,
+        )
+
     async def investigate_async(
         self, incident_id: str, request_key_hash: str = ""
     ) -> list[Finding]:
@@ -2256,9 +2302,31 @@ class PamawasInvestigator:
                 # list eleven times, received the same fifteen names each time,
                 # and reached the tool limit having learned nothing after the
                 # second call.
-                if self._serve_repeated_call(
+                repeated = self._serve_repeated_call(
                     tool_call, function_name, function_args, state, messages
-                ):
+                )
+                if repeated:
+                    # Verification is a single "is the target still down?"
+                    # question. A repeated query returns the same data, adds
+                    # nothing new, and only wastes budget before the verdict.
+                    # Close after 2 repeats; non-verification investigations
+                    # keep their own escalation path (MAX_CONSECUTIVE_REPEATED_TURNS).
+                    if verification and state.seen_call_counts.get(
+                        self._call_signature(function_name, function_args), 0
+                    ) >= 2:
+                        logger.warning(
+                            "Verification for incident %s exceeded repeat budget "
+                            "on %s; closing with the evidence gathered so far",
+                            incident_id,
+                            function_name,
+                        )
+                        await self._close_verification_on_repeat_budget(
+                            incident_id=incident_id,
+                            request_key_hash=request_key_hash,
+                            state=state,
+                            function_name=function_name,
+                        )
+                        return state.findings
                     continue
 
                 has_fresh_tool_call = True
