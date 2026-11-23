@@ -11,6 +11,7 @@ from service.investigator import (
     InvestigatorLLM,
     PamawasInvestigator,
     _drop_trigger_restatements,
+    _ground_findings_in_data_queries,
     _logs_from_tool_calls,
     _metrics_from_tool_calls,
 )
@@ -164,7 +165,17 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     from unittest.mock import AsyncMock
 
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
-        return_value={"status": "success", "data": [1]}
+        return_value={
+            "status": "success",
+            "data": {
+                "result": [
+                    {
+                        "metric": {"target": "api"},
+                        "values": [[1, "1"], [2, "0"]],
+                    }
+                ]
+            },
+        }
     )
     investigator.tools._loki_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": {"result": []}}
@@ -208,6 +219,9 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     findings = investigator.investigate("inc")
 
     assert findings[0].type is EvidenceType.FACT
+    assert "observed range was 0 to 1" in findings[0].content
+    assert findings[0].source_detail == "query_prometheus: up [s to e]"
+    assert all(finding.content != "down" for finding in findings)
     investigator.tools._prometheus_adapter.query_range.assert_called_once_with("up", "s", "e")
     investigator.tools._loki_adapter.query_range.assert_called_once_with(
         '{service="api"}', "s", "e", 100
@@ -610,7 +624,17 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
 
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
-        return_value={"status": "success", "data": [1]}
+        return_value={
+            "status": "success",
+            "data": {
+                "result": [
+                    {
+                        "metric": {"target": "api"},
+                        "values": [[1, "25"], [2, "10"]],
+                    }
+                ]
+            },
+        }
     )
     investigator.tools._loki_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": {"result": []}}
@@ -679,7 +703,8 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
     ]
     assert forced, "the loop must force submit_findings once the reserve is reached"
     assert findings[0].type is EvidenceType.FACT
-    assert "load1" in findings[0].content
+    assert "observed range was 10 to 25" in findings[0].content
+    assert all("load1" not in finding.content for finding in findings)
     assert investigator.tools._prometheus_adapter.query_range.await_count < 50, (
         "the reserve must stop exploration before the turn budget runs out"
     )
@@ -1007,6 +1032,85 @@ def test_query_results_persist_without_assuming_data_lake_labels():
         "scope_dimension": "alpha-target",
         "source_dimension": "custom-runtime",
     }
+
+
+def test_provider_findings_are_grounded_in_exact_executed_queries():
+    """A cheap model cannot cite invented queries or alert-payload values as telemetry."""
+    tool_calls = [
+        ToolResult(
+            tool_name="query_prometheus",
+            arguments={
+                "promql": "custom_utilization_expression",
+                "start": "2026-11-23T11:30:00Z",
+                "end": "2026-11-23T11:45:00Z",
+            },
+            result={
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"tenant_dimension": "alpha-target"},
+                            "values": [[1, "68.0"], [2, "86.5"], [3, "71.0"]],
+                        }
+                    ]
+                },
+            },
+            duration_ms=1,
+        ),
+        ToolResult(
+            tool_name="query_loki",
+            arguments={
+                "logql": '{scope_dimension="alpha-target"}',
+                "start": "2026-11-23T11:30:00Z",
+                "end": "2026-11-23T11:45:00Z",
+            },
+            result={"status": "success", "data": {"result": []}},
+            duration_ms=1,
+        ),
+    ]
+    model_findings = [
+        Finding(
+            type=EvidenceType.FACT,
+            content="Copied alert value that the executed query did not establish.",
+            source=EvidenceSource.PROMETHEUS,
+            source_detail="invented_promql_expression",
+            confidence=0.9,
+        ),
+        Finding(
+            type=EvidenceType.UNKNOWN,
+            content="Invented Loki selector returned no data.",
+            source=EvidenceSource.LOKI,
+            source_detail='{invented_label="value"}',
+            confidence=0.0,
+        ),
+        Finding(
+            type=EvidenceType.RECOMMENDATION,
+            content="Collect process-level telemetry for the same window.",
+            source=EvidenceSource.LLM,
+            source_detail="follow-up",
+            confidence=0.7,
+        ),
+    ]
+
+    grounded = _ground_findings_in_data_queries(model_findings, tool_calls)
+
+    assert [finding.source for finding in grounded] == [
+        EvidenceSource.PROMETHEUS,
+        EvidenceSource.LOKI,
+        EvidenceSource.LLM,
+    ]
+    assert "observed range was 68 to 86.5" in grounded[0].content
+    assert grounded[0].source_detail == (
+        "query_prometheus: custom_utilization_expression "
+        "[2026-11-23T11:30:00Z to 2026-11-23T11:45:00Z]"
+    )
+    assert grounded[1].content == "Loki returned no log entries for the executed query."
+    assert grounded[1].source_detail == (
+        'query_loki: {scope_dimension="alpha-target"} '
+        "[2026-11-23T11:30:00Z to 2026-11-23T11:45:00Z]"
+    )
+    assert all("invented" not in finding.source_detail for finding in grounded)
+    assert grounded[2].type is EvidenceType.RECOMMENDATION
 
 
 def test_each_investigation_gets_its_own_conversation(investigator):

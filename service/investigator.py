@@ -45,7 +45,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v7"
+PROMPT_VERSION = "pamawas-investigator-v8"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -53,6 +53,7 @@ _DISCOVERY_TO_DATA_TOOL = {
     "get_prometheus_labels": "query_prometheus",
     "get_loki_labels": "query_loki",
 }
+_MAX_GROUNDED_FINDINGS_PER_SOURCE = 3
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
@@ -423,6 +424,151 @@ def _logs_from_tool_calls(
                     return entries
 
     return entries
+
+
+def _query_source_detail(call: ToolResult, argument_name: str) -> str:
+    """Identify one executed data query without assuming deployment labels."""
+    arguments = call.arguments if isinstance(call.arguments, dict) else {}
+    query = str(arguments.get(argument_name) or "")
+    start = str(arguments.get("start") or "")
+    end = str(arguments.get("end") or "")
+    return f"{call.tool_name}: {query} [{start} to {end}]"
+
+
+def _series_numeric_samples(series: Any) -> list[float]:
+    """Return parseable values from one Prometheus vector or matrix series."""
+    if not isinstance(series, dict):
+        return []
+    points = series.get("values")
+    if not isinstance(points, list):
+        point = series.get("value")
+        points = [point] if isinstance(point, list) else []
+
+    values: list[float] = []
+    for point in points:
+        if not isinstance(point, list) or len(point) < 2:
+            continue
+        try:
+            values.append(float(point[1]))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _format_observed_number(value: float) -> str:
+    """Render provider values consistently without inventing precision."""
+    return format(value, ".6g")
+
+
+def _prometheus_query_finding(call: ToolResult) -> Finding:
+    """Build a deterministic finding from one successful Prometheus response."""
+    detail = _query_source_detail(call, "promql")
+    data = call.result.get("data") if isinstance(call.result, dict) else None
+    series = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(series, list) or not series:
+        return Finding(
+            type=EvidenceType.UNKNOWN,
+            content="Prometheus returned no result series for the executed query.",
+            source=EvidenceSource.PROMETHEUS,
+            source_detail=detail,
+            confidence=0.0,
+        )
+
+    per_series = [_series_numeric_samples(item) for item in series]
+    all_samples = [sample for samples in per_series for sample in samples]
+    latest_samples = [samples[-1] for samples in per_series if samples]
+    if not all_samples:
+        return Finding(
+            type=EvidenceType.UNKNOWN,
+            content=(
+                f"Prometheus returned {len(series)} result series, but none contained "
+                "parseable numeric samples."
+            ),
+            source=EvidenceSource.PROMETHEUS,
+            source_detail=detail,
+            confidence=0.0,
+        )
+
+    content = (
+        f"Prometheus returned {len(series)} result series with {len(all_samples)} "
+        f"numeric samples. The observed range was "
+        f"{_format_observed_number(min(all_samples))} to "
+        f"{_format_observed_number(max(all_samples))}."
+    )
+    if latest_samples:
+        content += (
+            " The latest sample range was "
+            f"{_format_observed_number(min(latest_samples))} to "
+            f"{_format_observed_number(max(latest_samples))}."
+        )
+    return Finding(
+        type=EvidenceType.FACT,
+        content=content,
+        source=EvidenceSource.PROMETHEUS,
+        source_detail=detail,
+        confidence=1.0,
+    )
+
+
+def _loki_query_finding(call: ToolResult) -> Finding:
+    """Build a deterministic finding from one successful Loki response."""
+    detail = _query_source_detail(call, "logql")
+    data = call.result.get("data") if isinstance(call.result, dict) else None
+    streams = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(streams, list):
+        streams = []
+    line_count = sum(
+        len(stream.get("values", []))
+        for stream in streams
+        if isinstance(stream, dict) and isinstance(stream.get("values"), list)
+    )
+    if line_count == 0:
+        return Finding(
+            type=EvidenceType.UNKNOWN,
+            content="Loki returned no log entries for the executed query.",
+            source=EvidenceSource.LOKI,
+            source_detail=detail,
+            confidence=0.0,
+        )
+    return Finding(
+        type=EvidenceType.FACT,
+        content=(
+            f"Loki returned {line_count} log entries across {len(streams)} "
+            "result streams for the executed query."
+        ),
+        source=EvidenceSource.LOKI,
+        source_detail=detail,
+        confidence=1.0,
+    )
+
+
+def _ground_findings_in_data_queries(
+    findings: list[Finding], tool_calls: list[ToolResult]
+) -> list[Finding]:
+    """Replace model-authored telemetry claims with exact executed-query summaries.
+
+    A weak model can call the required tools and still cite a different query or
+    copy values from the triggering incident. Prometheus/Loki findings therefore
+    come from parsed tool results, not model prose. Model synthesis and operator
+    recommendations remain available under their non-provider sources.
+    """
+    kept = [
+        finding
+        for finding in findings
+        if finding.source not in (EvidenceSource.PROMETHEUS, EvidenceSource.LOKI)
+    ]
+    grounded: list[Finding] = []
+    prometheus_calls = _successful_tool_calls(tool_calls, "query_prometheus")
+    loki_calls = _successful_tool_calls(tool_calls, "query_loki")
+    grounded.extend(
+        _prometheus_query_finding(call)
+        for call in prometheus_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
+    )
+    grounded.extend(
+        _loki_query_finding(call)
+        for call in loki_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
+    )
+    return grounded + kept
 
 
 def _decode_cached_tool_result(cached: Any) -> dict[str, Any] | None:
@@ -1952,11 +2098,14 @@ class PamawasInvestigator:
         incident_id: str,
         request_key_hash: str,
         state: InvestigationState,
+        verification: bool = False,
     ):
         """Handle submit_findings tool call."""
         logger.info("Investigation completed via submit_findings")
         findings = [_sanitize_finding(f) for f in findings]
         findings = _drop_trigger_restatements(findings, incident_id)
+        if not verification:
+            findings = _ground_findings_in_data_queries(findings, state.tool_calls)
         state.findings = findings
         state.completed = True
 
@@ -2847,10 +2996,14 @@ class PamawasInvestigator:
 
                 if is_final:
                     await self._handle_submit_findings(
-                        findings, incident_id, request_key_hash, state
+                        findings,
+                        incident_id,
+                        request_key_hash,
+                        state,
+                        verification=verification,
                     )
                     increment_findings_by_type(state.findings)
-                    return findings
+                    return state.findings
 
                 state.seen_calls[self._call_signature(function_name, function_args)] = (
                     self._truncate_result(result)
