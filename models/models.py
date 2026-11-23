@@ -58,9 +58,8 @@ class Finding:
     content: str
     source: EvidenceSource
     confidence: float  # 0.0 to 1.0
-    # Which query, stream, or metric the finding rests on (e.g.
-    # 'up{job="system_node", instance="koba-labs"}'). The source alone says
-    # which system answered; this says what was asked.
+    # Exact query, stream selector, or incident identifier the finding rests on.
+    # The source alone says which system answered; this says what was asked.
     source_detail: str = ""
 
     def to_dict(self) -> dict[str, Any]:
@@ -160,8 +159,8 @@ class InvestigationState:
     seen_call_counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     request_key_hash: str | None = None
-    # Affected service for this incident; selects the Loki stream during
-    # enrichment. None when the incident has no service (enrichment skips).
+    # Legacy affected-target hint retained for request compatibility. It is not
+    # mapped onto any Prometheus or Loki label without schema validation.
     service: str | None = None
 
 

@@ -16,7 +16,9 @@ from service.prometheus_fetcher import PrometheusFetcher
 
 def test_prometheus_fetch_returns_metric_models():
     """Instant-query samples come back as Metric instances with a datetime."""
-    fetcher = PrometheusFetcher(base_url="http://prometheus:9090")
+    fetcher = PrometheusFetcher(
+        base_url="http://prometheus:9090", service_label="tenant_target"
+    )
 
     async def fake_query_instant(query, eval_time):
         return {
@@ -25,7 +27,10 @@ def test_prometheus_fetch_returns_metric_models():
                 "resultType": "vector",
                 "result": [
                     {
-                        "metric": {"__name__": "up", "job": "docker_cadvisor"},
+                        "metric": {
+                            "__name__": "vendor_health",
+                            "tenant_target": "grafana",
+                        },
                         "value": [1794742200, "1"],
                     }
                 ],
@@ -46,7 +51,7 @@ def test_prometheus_fetch_returns_metric_models():
     assert len(samples) == 1
     sample = samples[0]
     assert isinstance(sample, Metric)
-    assert sample.name == "up"
+    assert sample.name == "vendor_health"
     assert sample.value == 1.0
     # to_dict is what persistence encodes; it must be JSON-safe.
     assert isinstance(sample.to_dict()["at"], str)
@@ -54,7 +59,7 @@ def test_prometheus_fetch_returns_metric_models():
 
 def test_loki_fetch_returns_log_entry_models():
     """Query-range lines come back as LogEntry instances with a datetime."""
-    fetcher = LokiFetcher(base_url="http://loki:3100")
+    fetcher = LokiFetcher(base_url="http://loki:3100", service_label="stream_target")
 
     async def fake_query_range(query, start, end, limit):
         return {
@@ -63,7 +68,7 @@ def test_loki_fetch_returns_log_entry_models():
                 "resultType": "streams",
                 "result": [
                     {
-                        "stream": {"kubernetes_container_name": "grafana"},
+                        "stream": {"stream_target": "grafana"},
                         "values": [["1794742200000000000", "level=error boom"]],
                     }
                 ],
@@ -89,12 +94,12 @@ def test_loki_fetch_returns_log_entry_models():
     assert isinstance(entry.to_dict()["timestamp"], str)
 
 
-def test_fetchers_skip_without_a_service():
-    """No service means no truthful selector, so enrichment yields nothing."""
+def test_fetchers_skip_without_an_explicit_selector_mapping():
+    """No configured label mapping means the legacy fetchers must not guess."""
     assert (
         asyncio.run(
             PrometheusFetcher(base_url="http://prometheus:9090").fetch_async(
-                incident_id="inc_1", start="", end="", service=None
+                incident_id="inc_1", start="", end="", service="target"
             )
         )
         == []
@@ -102,7 +107,7 @@ def test_fetchers_skip_without_a_service():
     assert (
         asyncio.run(
             LokiFetcher(base_url="http://loki:3100").fetch_async(
-                incident_id="inc_1", start="", end="", service=None
+                incident_id="inc_1", start="", end="", service="target"
             )
         )
         == []

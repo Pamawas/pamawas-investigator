@@ -56,11 +56,6 @@ class Config:
     # slot and then run normally, instead of all of them timing out together.
     max_concurrent_investigations: int = 4
     truncation_limit: int = 8192
-    # Labels that carry the service name, used to build enrichment
-    # selectors. Neither store has an "incident" label, so enrichment selects
-    # on the incident's service through these labels.
-    prometheus_service_label: str = "service"
-    loki_service_label: str = "kubernetes_container_name"
     # Adapter settings
     prometheus_timeout_seconds: float = 10.0
     prometheus_max_response_bytes: int = 1_000_000
@@ -127,8 +122,6 @@ class Config:
             llm_models=_parse_env_list(os.getenv("LLM_MODELS")),
             prometheus_url=os.getenv("PROMETHEUS_URL", "http://prometheus:9090"),
             loki_url=os.getenv("LOKI_URL", "http://loki:3100"),
-            prometheus_service_label=os.getenv("PROMETHEUS_SERVICE_LABEL", "service"),
-            loki_service_label=os.getenv("LOKI_SERVICE_LABEL", "kubernetes_container_name"),
             max_tool_calls=int(os.getenv("MAX_TOOL_CALLS", "100")),
             max_concurrent_investigations=int(os.getenv("MAX_CONCURRENT_INVESTIGATIONS", "4")),
             truncation_limit=int(os.getenv("TRUNCATION_LIMIT", "8192")),

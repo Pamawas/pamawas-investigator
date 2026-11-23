@@ -31,17 +31,14 @@ class LokiFetcher(LogsFetcher):
     def __init__(
         self,
         base_url: str,
-        service_label: str = "kubernetes_container_name",
+        service_label: str = "",
         timeout_seconds: float = 10.0,
         max_lines: int = 10000,
         max_response_bytes: int = 1_000_000,
     ):
         self.base_url = base_url.rstrip("/")
-        # Label that carries the service/container name in this Loki instance.
-        # Enrichment selects on the incident's service, because that is the
-        # only thing we can build a truthful selector from: Loki has no
-        # "incident" label, so the old `{incident="<id>"}` template matched
-        # nothing and every enrichment silently produced zero logs.
+        # Optional explicit override for legacy callers. There is intentionally
+        # no default: deployment label schemas must not be guessed.
         self.service_label = service_label
         self.timeout_seconds = timeout_seconds
         self.max_lines = max_lines
@@ -192,9 +189,9 @@ class LokiFetcher(LogsFetcher):
             List of LogEntry samples (the typed model, so `timestamp` is
             serialized consistently with everything else we persist).
         """
-        if not service:
+        if not service or not self.service_label:
             logger.info(
-                "Skipping Loki enrichment for incident %s: no service to select on",
+                "Skipping Loki enrichment for incident %s: no explicit selector mapping",
                 incident_id,
             )
             return []

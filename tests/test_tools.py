@@ -73,6 +73,10 @@ def test_tool_registry_names_match_definitions():
     ]
     submit_schema = definitions[-1]["function"]["parameters"]
     assert submit_schema["required"] == ["findings"]
+    finding_schema = submit_schema["properties"]["findings"]["items"]
+    assert "source_detail" in finding_schema["required"]
+    source_description = finding_schema["properties"]["source"]["description"]
+    assert "never the original alert metadata" in source_description
 
 
 def test_tool_registry_verification_excludes_related_incidents():

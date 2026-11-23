@@ -29,14 +29,13 @@ class PrometheusFetcher(MetricsFetcher):
     def __init__(
         self,
         base_url: str,
-        service_label: str = "service",
+        service_label: str = "",
         timeout_seconds: float = 10.0,
         max_response_bytes: int = 1_000_000,
     ):
         self.base_url = base_url.rstrip("/")
-        # Label carrying the service name. Prometheus has no "incident" label,
-        # so the old `{incident="<id>"}` template matched nothing and every
-        # enrichment silently produced zero metrics.
+        # Optional explicit override for legacy callers. There is intentionally
+        # no default: deployment label schemas must not be guessed.
         self.service_label = service_label
         self.timeout_seconds = timeout_seconds
         self.max_response_bytes = max_response_bytes
@@ -131,9 +130,9 @@ class PrometheusFetcher(MetricsFetcher):
             List of Metric samples (the typed model, so `at` is serialized
             consistently with everything else the investigator persists).
         """
-        if not service:
+        if not service or not self.service_label:
             logger.info(
-                "Skipping Prometheus enrichment for incident %s: no service to select on",
+                "Skipping Prometheus enrichment for incident %s: no explicit selector mapping",
                 incident_id,
             )
             return []

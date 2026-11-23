@@ -35,12 +35,12 @@ from models import (
     Finding,
     IncidentContext,
     InvestigationState,
+    LogEntry,
+    Metric,
     ToolResult,
 )
 from service.daily_summary import write_day_summary as _write_day_summary
-from service.loki_fetcher import LogsFetcher, LokiFetcher
 from service.persistence import InvestigationPersistence
-from service.prometheus_fetcher import MetricsFetcher, PrometheusFetcher
 from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -171,6 +171,209 @@ def _normalize_finding(finding: Finding) -> Finding:
     if content == finding.content and confidence == finding.confidence:
         return finding
     return replace(finding, content=content, confidence=confidence)
+
+
+def _is_trigger_restatement(finding: Finding, incident_id: str) -> bool:
+    """Return whether a finding merely restates the incident that triggered the run.
+
+    The current incident is input to the investigation, not newly gathered
+    evidence. Related-incident lookups remain useful because they add recurrence
+    information that was not already guaranteed by receiving this incident.
+    """
+    if finding.type != EvidenceType.FACT or finding.source != EvidenceSource.INCIDENTS:
+        return False
+
+    detail = (finding.source_detail or "").lower()
+    if any(
+        marker in detail
+        for marker in (
+            "get_related_incidents",
+            "related incident",
+            "post-trigger",
+            "lifecycle event",
+        )
+    ):
+        return False
+
+    referenced_ids = set(re.findall(r"inc_[a-zA-Z0-9-]+", finding.source_detail or ""))
+    if any(referenced_id != incident_id for referenced_id in referenced_ids):
+        return False
+    return True
+
+
+def _drop_trigger_restatements(
+    findings: list[Finding], incident_id: str
+) -> list[Finding]:
+    """Remove tautological facts copied from the triggering incident payload."""
+    kept: list[Finding] = []
+    dropped = 0
+    for finding in findings:
+        if _is_trigger_restatement(finding, incident_id):
+            dropped += 1
+            logger.warning(
+                "Discarding current-incident restatement from findings: %s",
+                finding.content[:160],
+            )
+            continue
+        kept.append(finding)
+    if dropped and not kept:
+        kept.append(
+            Finding(
+                type=EvidenceType.UNKNOWN,
+                content=(
+                    "The investigation produced no new evidence beyond the triggering "
+                    "incident metadata."
+                ),
+                source=EvidenceSource.SYSTEM,
+                source_detail="current-incident restatement filter",
+                confidence=0.0,
+            )
+        )
+    return kept
+
+
+def _successful_tool_calls(
+    tool_calls: list[ToolResult], tool_name: str
+) -> list[ToolResult]:
+    """Return successful executions of one data-query tool."""
+    return [
+        call
+        for call in tool_calls
+        if call.tool_name == tool_name
+        and isinstance(call.result, dict)
+        and call.result.get("status") == "success"
+    ]
+
+
+def _metric_from_series(series: Any, query_name: str) -> Metric | None:
+    """Convert the latest sample of one Prometheus result series."""
+    if not isinstance(series, dict):
+        return None
+    raw_labels = series.get("metric")
+    labels = dict(raw_labels) if isinstance(raw_labels, dict) else {}
+    name = str(labels.pop("__name__", query_name))
+    points = series.get("values")
+    if not isinstance(points, list) or not points:
+        point = series.get("value")
+        points = [point] if isinstance(point, list) else []
+    if not points:
+        return None
+
+    point = points[-1]
+    if not isinstance(point, list) or len(point) < 2:
+        return None
+    try:
+        at = datetime.fromtimestamp(float(point[0]), tz=UTC)
+        value = float(point[1])
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+
+    normalized_labels = {str(key): str(value) for key, value in labels.items()}
+    return Metric(name=name, value=value, labels=normalized_labels, at=at)
+
+
+def _metrics_from_tool_calls(
+    tool_calls: list[ToolResult], max_items: int = 1000
+) -> list[Metric]:
+    """Extract bounded metric evidence from the queries the investigator executed.
+
+    The query result already carries the data lake's real metric and label schema.
+    Reusing it avoids a second enrichment query built from a deployment-specific
+    selector. One latest sample per returned series is enough for report evidence;
+    the complete response remains available in tool_executions.
+    """
+    samples: list[Metric] = []
+    seen: set[tuple[Any, ...]] = set()
+
+    for call in _successful_tool_calls(tool_calls, "query_prometheus"):
+        data = call.result.get("data")
+        if not isinstance(data, dict):
+            continue
+        result = data.get("result")
+        if not isinstance(result, list):
+            continue
+
+        query_name = str(call.arguments.get("promql") or "prometheus_query")
+        for series in result:
+            sample = _metric_from_series(series, query_name)
+            if sample is None:
+                continue
+            identity = (
+                sample.name,
+                tuple(sorted(sample.labels.items())),
+                sample.at,
+                sample.value,
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            samples.append(sample)
+            if len(samples) >= max_items:
+                return samples
+
+    return samples
+
+
+def _log_entry_from_point(point: Any, stream: str) -> LogEntry | None:
+    """Convert one Loki result point, accepting nanosecond or second timestamps."""
+    if not isinstance(point, list) or len(point) < 2:
+        return None
+    try:
+        raw_timestamp = float(point[0])
+        seconds = (
+            raw_timestamp / 1_000_000_000
+            if abs(raw_timestamp) > 1_000_000_000_000
+            else raw_timestamp
+        )
+        timestamp = datetime.fromtimestamp(seconds, tz=UTC)
+    except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    return LogEntry(timestamp=timestamp, stream=stream, line=str(point[1]))
+
+
+def _log_entries_from_stream(stream_result: Any) -> list[LogEntry]:
+    """Convert all valid points returned for one schema-independent Loki stream."""
+    if not isinstance(stream_result, dict):
+        return []
+    raw_stream = stream_result.get("stream")
+    stream = json.dumps(
+        raw_stream if isinstance(raw_stream, dict) else {},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    values = stream_result.get("values")
+    if not isinstance(values, list):
+        return []
+    entries = [_log_entry_from_point(point, stream) for point in values]
+    return [entry for entry in entries if entry is not None]
+
+
+def _logs_from_tool_calls(
+    tool_calls: list[ToolResult], max_items: int = 1000
+) -> list[LogEntry]:
+    """Extract bounded log evidence while preserving the returned stream schema."""
+    entries: list[LogEntry] = []
+    seen: set[tuple[datetime, str, str]] = set()
+
+    for call in _successful_tool_calls(tool_calls, "query_loki"):
+        data = call.result.get("data")
+        if not isinstance(data, dict):
+            continue
+        result = data.get("result")
+        if not isinstance(result, list):
+            continue
+
+        for stream_result in result:
+            for entry in _log_entries_from_stream(stream_result):
+                identity = (entry.timestamp, entry.stream, entry.line)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                entries.append(entry)
+                if len(entries) >= max_items:
+                    return entries
+
+    return entries
 
 
 def _is_placeholder_or_dummy(text: str) -> bool:
@@ -810,19 +1013,6 @@ class PamawasInvestigator:
         self.llm = InvestigatorLLM(config)
         self.tools = InvestigatorTools(config)
 
-        # Initialize fetchers for evidence enrichment
-        self.metrics_fetcher: MetricsFetcher = PrometheusFetcher(
-            base_url=config.prometheus_url,
-            service_label=config.prometheus_service_label,
-            timeout_seconds=config.prometheus_timeout_seconds,
-        )
-        self.logs_fetcher: LogsFetcher = LokiFetcher(
-            base_url=config.loki_url,
-            service_label=config.loki_service_label,
-            timeout_seconds=config.loki_timeout_seconds,
-            max_lines=config.loki_max_log_lines,
-        )
-
         self.db_conn = None
         self.persistence = None
         self._connect_db()
@@ -850,10 +1040,8 @@ class PamawasInvestigator:
             self.db_conn = None
 
     async def close(self):
-        """Close investigator, tools, fetchers, and database connections."""
+        """Close investigator tools and database connections."""
         await self.tools.close()
-        await self.metrics_fetcher.close()
-        await self.logs_fetcher.close()
         if self.db_conn and not self.db_conn.closed:
             self.db_conn.close()
         if self.persistence:
@@ -959,17 +1147,7 @@ class PamawasInvestigator:
         return text[:half] + marker + text[-half:]
 
     def _build_system_prompt(self, context: IncidentContext | None = None) -> str:
-        """Build the system prompt for the investigator.
-
-        The incident's identity is part of the system prompt, not only of the
-        first user message. Every investigation gets a fresh conversation, but a
-        model with no stated scope will happily explain the incident using
-        another incident's evidence — the related-incidents tool hands it real
-        neighbours, and Prometheus and Loki are queried by host, so a
-        neighbouring host's symptoms are one query away. Naming the incident at
-        the top and stating what is out of scope keeps the findings about this
-        incident.
-        """
+        """Build the bounded, evidence-grounded investigator system prompt."""
         scope = ""
         if context is not None:
             affected = ", ".join(context.affected_services or []) or "unspecified"
@@ -987,131 +1165,93 @@ class PamawasInvestigator:
                 "=== END SESSION SCOPE ===\n\n"
             )
         return scope + (
-            "You are an expert infrastructure incident investigator. Your goal is to:\n"
-            "1. Understand the symptom and blast radius\n"
-            "2. Find the first abnormal signal, not just the loudest alert\n"
-            "3. Check recent changes near the time of the incident\n"
-            "4. Check dependencies\n"
-            "5. Form and test competing hypotheses rather than confirming one\n"
-            "6. Use tool calls deliberately - no duplicate queries, no unused fetches\n"
-            "7. Prefer UNKNOWN over a fabricated-sounding conclusion when evidence is "
-            "insufficient\n"
-            "\n"
-            "You have access to tools to query Prometheus, Loki, check recent "
-            "deployments, and find related incidents.\n"
-            "You must use the submit_findings tool to end the investigation with your "
-            "final conclusions. A plain text reply is not a submission: if you "
-            "answer in prose instead of calling submit_findings, the operator gets "
-            "no conclusion from this run. When you have enough evidence, submit.\n"
-            "\n"
-            "Every finding must be classified as:\n"
-            "- FACT: directly observed in metrics/logs\n"
-            "- LIKELY_CAUSE: strongly supported by evidence, not certain\n"
-            "- HYPOTHESIS: plausible, unverified\n"
-            "- UNKNOWN: insufficient evidence; stated explicitly rather than guessed\n"
-            "- RECOMMENDATION: a concrete action the operator should take, derived "
-            "from the findings. Put these in their own findings — never bury an "
-            "action inside a FACT.\n"
-            "\n"
-            "Every finding must name its source, because the report shows it and a "
-            "reader must be able to tell a metric from a log from your inference:\n"
-            "- prometheus: a metric you queried\n"
-            "- loki: a log line you read\n"
-            "- incidents: incident history\n"
-            "- llm: your own synthesis across sources (correlation, inference)\n"
-            "- system: a harness limit such as a timeout\n"
-            "Also set source_detail to the specific query, stream, or metric the "
-            'finding rests on, e.g. \'up{job="system_node", instance="koba-labs"}\'. '
-            "If a finding combines metrics AND logs, say so in source_detail "
-            "(e.g. 'prometheus up + loki docker_logs') and use source llm, since "
-            "the combination is your synthesis, not a single observation.\n"
-            "\n"
-            "Always provide confidence scores (0.0 to 1.0) for your findings.\n"
-            "\n"
-            "HOW TO WRITE A FINDING:\n"
-            "A finding is a claim, in one or two plain sentences, that an on-call "
-            "engineer can act on. Write it the way an engineer writes in a "
-            "postmortem, not the way a marketing page reads.\n"
-            "- Lead with what happened, then the evidence: 'netbird-agent stopped "
-            'reporting at 07:12; up{job="system_node"} dropped from 1 to 0 at the '
-            "same minute.'\n"
-            "- Never narrate your process. No 'Let me check', 'I will now query', "
-            "'Looking at the data, I can see'. Those describe your work, not the "
-            "incident, and they are not findings.\n"
-            "- No em dashes or en dashes. Use a comma, a period, or 'and'.\n"
-            "- Avoid filler and inflated wording: delve, leverage, robust, "
-            "seamless, crucial, pivotal, comprehensive, holistic, 'it is worth "
-            "noting', 'it is important to', 'in conclusion', 'navigate the "
-            "complexities', 'unlock', 'showcase', 'underscore'. Say the thing.\n"
-            "- Do not use the 'not just X, but Y' construction, and do not pad "
-            "lists to three items for rhythm. State the findings you actually "
-            "have.\n"
-            "- No hedging stacks ('it may potentially possibly'). One qualifier is "
-            "enough, and the confidence score already carries it.\n"
-            "\n"
-            "Always end with at least one RECOMMENDATION: the concrete next step "
-            "the on-call engineer should take. If the incident self-resolved, say "
-            "so ('No action needed: ...'). An action must be specific enough to "
-            "act on — name the component and the check or change, not 'investigate "
-            "further'.\n"
-            "\n"
-            "UPTIME KUMA MONITORS (external availability):\n"
-            "Uptime Kuma probes hosts and URLs from outside the cluster and "
-            'exports its state to Prometheus under job="uptime_kuma". This is '
-            "the second opinion on whether something is actually down: when the "
-            "alert says a target is unreachable, the monitor says whether the "
-            "probe failed too, since when, and for how long it has been failing.\n"
-            "- monitor_status{monitor_name, monitor_hostname, monitor_type} is "
-            "the current check result: 1 up, 0 down, 2 pending, 3 maintenance.\n"
-            "- monitor_response_time is the last probe latency in milliseconds.\n"
-            '- monitor_uptime_ratio{window="1d"|"30d"|"365d"} is the fraction '
-            "of successful checks in that window.\n"
-            "- monitor_cert_days_remaining and monitor_cert_is_valid cover TLS "
-            "expiry for http monitors.\n"
-            'monitor_hostname is often the string "null" or a shared front-end '
-            "domain for http monitors, so match those on monitor_name or "
-            "monitor_url instead. A monitor's name is free text an operator "
-            "wrote, so search it loosely, for example "
-            'monitor_status{monitor_name=~"(?i)last-labs"}.\n'
-            "Use these to answer three questions the alert cannot: did the probe "
-            "fail, when exactly did it start failing (changes(monitor_status[1h]) "
-            "or the raw series over the incident window), and is this a chronic "
-            "flap or a first occurrence (monitor_uptime_ratio).\n"
-            "\n"
-            "CRITICAL INVESTIGATION DISCIPLINE:\n"
-            "- Submit findings as soon as you have enough evidence to answer the "
-            "incident question — do not exhaust the tool budget unnecessarily.\n"
-            "- If a tool call returns unavailable (external dependency degraded), "
-            "note it as a limitation and proceed with what evidence you have; do "
-            "not retry the same failing query.\n"
-            "- If tool calls keep returning errors or unavailable, submit your best "
-            "findings with UNKNOWN confidence rather than looping.\n"
-            "- Do not issue duplicate or near-duplicate queries.\n"
-            "- Each turn should add new evidence or lead directly to submission.\n"
-            "\n"
-            "IMPORTANT LOGQL SYNTAX RULES:\n"
-            "- Loki supports these line-filter operators: |=, |!=, |~, |!~\n"
-            "- Never use |==, |=~, |!=~ — these cause parse errors\n"
-            "- Never use 'OR' between stream selectors like {a} OR {b} — Loki "
-            "cannot parse. Combine selectors or use pipe-separated values with |~\n"
-            "- Never use '|=' with parentheses grouping alternation like |= "
-            '("term" OR "other") — Loki only supports pipe-separated values '
-            'inside the string: |= "term|other"\n'
-            "- Use |!= for a 'does not contain' line filter, e.g. {app=\"x\"} |= "
-            '"error" |!= "debug". Note: a bare \'!=\' without the pipe (label '
-            'matcher) goes inside curly braces: {service!="value"}\n'
-            "- When grouping alternatives, use |~ with pipe-separated values, "
-            'e.g. |~ "error|timeout|refused" or combine streams: {service} |~ "x|y"\n'
-            "\n"
-            "CRITICAL: LABEL NAMES ARE DEPLOYMENT-SPECIFIC.\n"
-            "- A selector naming a label or value that does not exist returns "
-            "status=success with ZERO streams. That is indistinguishable from "
-            "'no logs', so never conclude 'no logs exist' from an empty result "
-            "until you have verified the selector.\n"
-            "- Call get_loki_labels first to list the real label names, then "
-            "get_loki_labels with a specific label to list its values, and build "
-            "your selector from what actually exists.\n"
-            "- Do not assume a 'service' or 'app' label exists.\n"
+            "You are Pamawas Investigator. Determine what happened, its scope, the best "
+            "supported explanation, and the next operator action. Be accurate before being "
+            "complete. An honest UNKNOWN is better than an unsupported conclusion.\n\n"
+            "OPERATING CONTRACT:\n"
+            "- The current incident is the investigation premise, not a finding. Its ID, "
+            "title, severity, target, start time, status, affected services, and original "
+            "alert firing are already known. Use them to scope queries; do not submit them "
+            "as evidence.\n"
+            "- New evidence comes from returned tool results, additional post-trigger events, "
+            "or related history that answers an unresolved question.\n"
+            "- Tool definitions supplied to this request are authoritative. Never claim a "
+            "tool or data source was used, available, or unavailable unless its definition "
+            "or result is present.\n"
+            "- Prometheus and Loki are the primary evidence sources in this tool set. Consider "
+            "both for a full investigation, but call each only to answer a distinct question, "
+            "not merely to complete a checklist.\n"
+            "- Keep this incident separate from neighbouring incidents. Related incidents "
+            "may establish recurrence, but cannot establish this occurrence's cause.\n\n"
+            "PROMETHEUS AND LOKI STEERING:\n"
+            "- Use query_prometheus to establish whether the reported condition exists in "
+            "telemetry, its magnitude, when it began, how it changed, and whether it recovered.\n"
+            "Prefer the alert's original expression and identifiers when available.\n"
+            "- Use query_loki over the same target and time window to look for discrete errors, "
+            "restarts, state changes, saturation messages, dependency failures, or other events "
+            "that can explain or contradict the metric timeline.\n"
+            "- If the Prometheus selector schema is unknown, call get_prometheus_labels once. "
+            "If the Loki selector schema is unknown, call get_loki_labels once. Then request "
+            "values for one promising returned label and immediately run the data query. Never "
+            "repeat catalogs and never treat catalog output as evidence.\n"
+            "- A full investigation should normally obtain at least one data result from both "
+            "Prometheus and Loki. Skip a source only when it cannot answer a relevant question, "
+            "is unavailable, or no selector can be validated; record that limitation as UNKNOWN.\n"
+            "- Do not stop after validating the alert metric. Metrics describe what changed; "
+            "logs may explain why. Conversely, a log line without matching telemetry does not "
+            "prove it caused the incident.\n\n"
+            "DECISION PROCEDURE:\n"
+            "1. Establish the reported symptom, target, start time, current status, and "
+            "reported blast radius from the incident events.\n"
+            "2. Identify the smallest set of unresolved questions needed to explain the "
+            "incident. Consider the primary signal, correlated symptoms, dependencies, "
+            "recent changes when a change source exists, and recurrence when history matters.\n"
+            "3. Query Prometheus for the primary signal and its timeline. Query Loki for "
+            "explanatory or contradictory events in the same window. Query related incidents "
+            "when recurrence changes the operator action.\n"
+            "4. Use the alert's original identifiers, expression, and time window when available. "
+            "When a backend schema is unknown, perform one bounded discovery pass, validate "
+            "a candidate key and value, then run the data query. Never invent schema.\n"
+            "5. Compare the result with the incident timeline and competing explanations. "
+            "Correlation alone is not a cause; a cause needs temporal alignment and a "
+            "plausible mechanism supported by evidence.\n"
+            "6. Stop when the primary question has a supported answer, or when the remaining "
+            "uncertainty cannot be reduced with the available tools. Then submit findings.\n\n"
+            "TOOL DISCIPLINE:\n"
+            "- Every call must answer one distinct unresolved question.\n"
+            "- Discovery output describes schema; it is not incident evidence.\n"
+            "- Never repeat an identical or equivalent call. After an empty result, make at "
+            "most one materially different attempt using validated schema.\n"
+            "- Treat unavailable, error, and empty as different outcomes. An empty result is "
+            "meaningful only after validating the selector and time window.\n"
+            "- Preserve the returned measurement semantics and units. Do not reinterpret an "
+            "availability signal as utilization, a cumulative counter as a point value, or a "
+            "raw number as a percentage without an evidence-backed transformation.\n"
+            "- Each turn must add evidence, test a different hypothesis, or submit.\n\n"
+            "EVIDENCE CONTRACT:\n"
+            "- FACT: a new observation from a successful data query, a post-trigger lifecycle "
+            "event, or related history. Restating the triggering alert is not a finding.\n"
+            "- LIKELY_CAUSE: supported by multiple consistent observations and a plausible "
+            "mechanism, with no stronger contradiction.\n"
+            "- HYPOTHESIS: plausible but not adequately tested.\n"
+            "- UNKNOWN: a material question the available evidence cannot answer.\n"
+            "- RECOMMENDATION: a concrete next action tied to a finding or unknown.\n"
+            "Use source=prometheus only for a successful Prometheus data query, source=loki "
+            "only for returned log data, source=incidents only for new related-history or "
+            "post-trigger lifecycle evidence, "
+            "source=llm for synthesis or a tool without a dedicated source enum, and "
+            "source=system for harness limits. Set source_detail to the exact executed query, "
+            "tool call, or exact incident/event identifier. A catalog call cannot support a "
+            "FACT. Never claim a source was not checked after its result is already present.\n\n"
+            "SUBMISSION:\n"
+            "- Use submit_findings; prose alone does not complete the investigation.\n"
+            "- Report only substantive findings: the key observed facts, at most one best "
+            "cause or hypothesis, important unknowns, and at least one specific recommendation.\n"
+            "- Never submit a FACT whose only content is that this incident exists, fired, "
+            "has a severity, targets a service, or started at the supplied time.\n"
+            "- Keep each finding to one or two plain sentences. State the conclusion and its "
+            "evidence, not your investigation process. Do not pad the report.\n"
+            "- Confidence is confidence in the stated claim. UNKNOWN findings use 0.0.\n"
         )
 
     def _build_verification_prompt(self, context: IncidentContext | None = None) -> str:
@@ -1670,6 +1810,7 @@ class PamawasInvestigator:
         """Handle submit_findings tool call."""
         logger.info("Investigation completed via submit_findings")
         findings = [_sanitize_finding(f) for f in findings]
+        findings = _drop_trigger_restatements(findings, incident_id)
         state.findings = findings
         state.completed = True
 
@@ -1681,7 +1822,7 @@ class PamawasInvestigator:
                 tool_calls=state.tool_calls,
                 model_provider=self.config.llm_base_url,
                 model_name=self.config.llm_model,
-                prompt_version="pamawas-investigator-v1",
+                prompt_version="pamawas-investigator-v6",
                 tool_contract=1,
                 max_tool_calls=self.config.max_tool_calls,
                 service=state.service,
@@ -1784,7 +1925,7 @@ class PamawasInvestigator:
             tool_calls=state.tool_calls,
             model_provider=self.config.llm_base_url,
             model_name=self.config.llm_model,
-            prompt_version="pamawas-investigator-v1",
+            prompt_version="pamawas-investigator-v6",
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
             service=state.service,
@@ -1924,7 +2065,7 @@ class PamawasInvestigator:
             tool_calls=[],
             model_provider=self.config.llm_base_url,
             model_name=self.config.llm_model,
-            prompt_version="pamawas-investigator-v1",
+            prompt_version="pamawas-investigator-v6",
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
             service=context.affected_services[0] if context.affected_services else None,
@@ -2185,7 +2326,7 @@ class PamawasInvestigator:
                     tool_calls=state.tool_calls,
                     model_provider=self.config.llm_base_url,
                     model_name=self.config.llm_model,
-                    prompt_version="pamawas-investigator-v1",
+                    prompt_version="pamawas-investigator-v6",
                     tool_contract=1,
                     max_tool_calls=self.config.max_tool_calls,
                     service=state.service,
@@ -2238,7 +2379,7 @@ class PamawasInvestigator:
             tool_calls=state.tool_calls,
             model_provider=self.config.llm_base_url,
             model_name=self.config.llm_model,
-            prompt_version="pamawas-investigator-v1",
+            prompt_version="pamawas-investigator-v6",
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
             service=state.service,
@@ -2416,7 +2557,7 @@ class PamawasInvestigator:
                     tool_calls=state.tool_calls,
                     model_provider=self.config.llm_base_url,
                     model_name=self.config.llm_model,
-                    prompt_version="pamawas-investigator-v1",
+                    prompt_version="pamawas-investigator-v6",
                     tool_contract=1,
                     max_tool_calls=self.config.max_tool_calls,
                 )
@@ -2440,7 +2581,7 @@ class PamawasInvestigator:
                 tool_calls=state.tool_calls,
                 model_provider=self.config.llm_base_url,
                 model_name=self.config.llm_model,
-                prompt_version="pamawas-investigator-v1",
+                prompt_version="pamawas-investigator-v6",
                 tool_contract=1,
                 max_tool_calls=self.config.max_tool_calls,
                 service=state.service,
@@ -2494,42 +2635,20 @@ class PamawasInvestigator:
                     duration_ms=int(tool_call.duration_ms),
                 )
 
-            # Fetch evidence enrichment (metrics and logs) from Prometheus and Loki
-            # Use a default time window for incident context enrichment
-            now = datetime.now(UTC)
-            five_minutes_ago = datetime.fromtimestamp(now.timestamp() - 300, tz=UTC)
-            start_time = five_minutes_ago.strftime("%Y-%m-%dT%H:%M:%SZ")
-            end_time = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-            enrichment_data = {}
-            # Fetch metrics from Prometheus
-            if self.metrics_fetcher:
-                try:
-                    enriched_metrics = await self.metrics_fetcher.fetch_async(
-                        incident_id=incident_id,
-                        start=start_time,
-                        end=end_time,
-                        service=service,
-                    )
-                    enrichment_data["metrics"] = enriched_metrics
-                    logger.info(f"Fetched {len(enriched_metrics)} metrics for enrichment")
-                except (OSError, ValueError, RuntimeError) as e:
-                    logger.warning(f"Failed to fetch Prometheus metrics for enrichment: {e}")
-
-            # Fetch logs from Loki
-            if self.logs_fetcher:
-                try:
-                    enriched_logs = await self.logs_fetcher.fetch_async(
-                        incident_id=incident_id,
-                        start=start_time,
-                        end=end_time,
-                        limit=self.config.loki_max_log_lines,
-                        service=service,
-                    )
-                    enrichment_data["logs"] = enriched_logs
-                    logger.info(f"Fetched {len(enriched_logs)} logs for enrichment")
-                except (OSError, ValueError, RuntimeError) as e:
-                    logger.warning(f"Failed to fetch Loki logs for enrichment: {e}")
+            # Persist evidence from the exact successful data-lake queries already
+            # executed. This is schema-neutral: no second request guesses a label
+            # name or maps affected_services[0] onto a deployment-specific key.
+            enriched_metrics = _metrics_from_tool_calls(
+                tool_calls, max_items=self.config.prometheus_max_series
+            )
+            enriched_logs = _logs_from_tool_calls(
+                tool_calls, max_items=self.config.loki_max_log_lines
+            )
+            logger.info(
+                "Extracted %d metrics and %d logs from executed tool results",
+                len(enriched_metrics),
+                len(enriched_logs),
+            )
 
             # Every finding reaches the report and the API through this one
             # call, so normalize it here rather than trusting the prompt.
@@ -2540,8 +2659,8 @@ class PamawasInvestigator:
                 incident_id=incident_id,
                 run_id=run_id,
                 findings=findings,
-                metrics=enrichment_data.get("metrics", []),
-                logs=enrichment_data.get("logs", []),
+                metrics=enriched_metrics,
+                logs=enriched_logs,
             )
 
             # Mark run as completed
@@ -2553,8 +2672,8 @@ class PamawasInvestigator:
 
             logger.info(
                 f"Persisted investigation run {run_id} with {len(findings)} findings, "
-                f"{len(enrichment_data.get('metrics', []))} metrics, "
-                f"{len(enrichment_data.get('logs', []))} logs"
+                f"{len(enriched_metrics)} metrics, "
+                f"{len(enriched_logs)} logs"
             )
 
         except (psycopg2.Error, RuntimeError) as e:

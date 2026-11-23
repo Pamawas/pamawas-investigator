@@ -6,8 +6,14 @@ import httpx
 import openai
 import pytest
 
-from models import EvidenceType, IncidentContext
-from service.investigator import InvestigatorLLM, PamawasInvestigator
+from models import EvidenceSource, EvidenceType, Finding, IncidentContext, ToolResult
+from service.investigator import (
+    InvestigatorLLM,
+    PamawasInvestigator,
+    _drop_trigger_restatements,
+    _logs_from_tool_calls,
+    _metrics_from_tool_calls,
+)
 
 
 def tool_call(name, arguments, call_id="call-1"):
@@ -613,6 +619,168 @@ def test_system_prompt_names_the_incident_it_serves(investigator):
     # The out-of-scope rule must be explicit, not implied.
     assert "THIS incident" in prompt
     assert "different host" in prompt
+
+
+def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
+    """The prompt selects tools by question and grounds every submitted source."""
+    context = IncidentContext(
+        incident_id="inc_cpu_prompt",
+        title="CPU",
+        status="open",
+        severity="warning",
+        started_at="2026-11-23T10:15:10Z",
+        affected_services=["koba-labs", "system_node"],
+        events=[
+            {
+                "labels": {
+                    "alertname": "CPU",
+                    "instance": "koba-labs",
+                    "job": "system_node",
+                }
+            }
+        ],
+    )
+
+    prompt = investigator._build_system_prompt(context)
+
+    assert "OPERATING CONTRACT" in prompt
+    assert "Tool definitions supplied to this request are authoritative" in prompt
+    assert "Prometheus and Loki are the primary evidence sources" in prompt
+    assert "PROMETHEUS AND LOKI STEERING" in prompt
+    assert "Use query_prometheus to establish" in prompt
+    assert "Use query_loki over the same target and time window" in prompt
+    assert "call get_prometheus_labels once" in prompt
+    assert "call get_loki_labels once" in prompt
+    assert "Metrics describe what changed; logs may explain why" in prompt
+    assert "never treat catalog output as evidence" in prompt
+    assert "record that limitation as UNKNOWN" in prompt
+    assert "The current incident is the investigation premise, not a finding" in prompt
+    assert "Restating the triggering alert is not a finding" in prompt
+    assert "DECISION PROCEDURE" in prompt
+    assert "Query Prometheus for the primary signal and its timeline" in prompt
+    assert "Query Loki for explanatory or contradictory events" in prompt
+    assert "Query related incidents when recurrence changes the operator action" in prompt
+    assert "perform one bounded discovery pass" in prompt
+    assert "TOOL DISCIPLINE" in prompt
+    assert "Every call must answer one distinct unresolved question" in prompt
+    assert "EVIDENCE CONTRACT" in prompt
+    assert "Set source_detail to the exact executed query" in prompt
+    assert "SUBMISSION" in prompt
+    assert "Never submit a FACT whose only content is that this incident exists" in prompt
+    assert "Normally a full investigation must attempt both" not in prompt
+    assert "CPU ALERT RULES" not in prompt
+    assert "IMPORTANT LOGQL SYNTAX RULES" not in prompt
+    assert "check recent deployments" not in prompt
+    assert 'try {instance="<host>"}' not in prompt
+    assert 'job="system_node"' not in prompt
+    assert "kubernetes_container_name" not in prompt
+    assert "node_cpu_seconds_total" not in prompt
+
+
+def test_current_incident_restatements_are_not_reported_as_facts():
+    current_id = "inc_current"
+    findings = [
+        Finding(
+            type=EvidenceType.FACT,
+            content="The CPU incident fired for target alpha.",
+            source=EvidenceSource.INCIDENTS,
+            source_detail=current_id,
+            confidence=1.0,
+        ),
+        Finding(
+            type=EvidenceType.FACT,
+            content="This condition occurred three times today.",
+            source=EvidenceSource.INCIDENTS,
+            source_detail="get_related_incidents returned inc_previous",
+            confidence=1.0,
+        ),
+    ]
+
+    filtered = _drop_trigger_restatements(findings, current_id)
+
+    assert [finding.content for finding in filtered] == [
+        "This condition occurred three times today."
+    ]
+
+
+def test_only_trigger_restatements_become_one_honest_unknown():
+    filtered = _drop_trigger_restatements(
+        [
+            Finding(
+                type=EvidenceType.FACT,
+                content="Incident inc_current started at the supplied time.",
+                source=EvidenceSource.INCIDENTS,
+                source_detail="inc_current",
+                confidence=1.0,
+            )
+        ],
+        "inc_current",
+    )
+
+    assert len(filtered) == 1
+    assert filtered[0].type is EvidenceType.UNKNOWN
+    assert filtered[0].source is EvidenceSource.SYSTEM
+    assert "no new evidence" in filtered[0].content
+
+
+def test_query_results_persist_without_assuming_data_lake_labels():
+    """Evidence extraction must preserve arbitrary schemas returned by each backend."""
+    tool_calls = [
+        ToolResult(
+            tool_name="query_prometheus",
+            arguments={"promql": "custom_utilization_expression"},
+            result={
+                "status": "success",
+                "data": {
+                    "resultType": "matrix",
+                    "result": [
+                        {
+                            "metric": {
+                                "__name__": "vendor_utilization_total",
+                                "tenant_dimension": "alpha-target",
+                            },
+                            "values": [[1795428900, "41.5"], [1795428960, "42.5"]],
+                        }
+                    ],
+                },
+            },
+            duration_ms=1,
+        ),
+        ToolResult(
+            tool_name="query_loki",
+            arguments={"logql": '{scope_dimension="alpha-target"}'},
+            result={
+                "status": "success",
+                "data": {
+                    "resultType": "streams",
+                    "result": [
+                        {
+                            "stream": {
+                                "scope_dimension": "alpha-target",
+                                "source_dimension": "custom-runtime",
+                            },
+                            "values": [["1795428960000000000", "custom log line"]],
+                        }
+                    ],
+                },
+            },
+            duration_ms=1,
+        ),
+    ]
+
+    metrics = _metrics_from_tool_calls(tool_calls)
+    logs = _logs_from_tool_calls(tool_calls)
+
+    assert len(metrics) == 1
+    assert metrics[0].name == "vendor_utilization_total"
+    assert metrics[0].value == 42.5
+    assert metrics[0].labels == {"tenant_dimension": "alpha-target"}
+    assert len(logs) == 1
+    assert logs[0].line == "custom log line"
+    assert json.loads(logs[0].stream) == {
+        "scope_dimension": "alpha-target",
+        "source_dimension": "custom-runtime",
+    }
 
 
 def test_each_investigation_gets_its_own_conversation(investigator):

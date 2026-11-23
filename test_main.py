@@ -250,12 +250,14 @@ class TestSystemPrompt:
 
         source = inspect.getsource(PamawasInvestigator._build_system_prompt)
 
-        assert "Understand the symptom and blast radius" in source
-        assert "Find the first abnormal signal" in source
-        assert "Check recent changes near the time" in source
-        assert "Check dependencies" in source
-        assert "competing hypotheses" in source
-        assert "UNKNOWN over a fabricated-sounding conclusion" in source
+        assert "OPERATING CONTRACT" in source
+        assert "PROMETHEUS AND LOKI STEERING" in source
+        assert "DECISION PROCEDURE" in source
+        assert "Use query_prometheus to establish" in source
+        assert "Use query_loki over the same target and time window" in source
+        assert "TOOL DISCIPLINE" in source
+        assert "EVIDENCE CONTRACT" in source
+        assert "SUBMISSION" in source
         assert "FACT" in source
         assert "LIKELY_CAUSE" in source
         assert "HYPOTHESIS" in source

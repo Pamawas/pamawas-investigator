@@ -368,9 +368,8 @@ class ToolRegistry:
                             "label": {
                                 "type": "string",
                                 "description": (
-                                    "Optional label name whose values to list "
-                                    "(e.g. kubernetes_container_name). Omit to list "
-                                    "all label names."
+                                    "Optional label name returned by the catalog whose "
+                                    "values to list. Omit to list all label names."
                                 ),
                             },
                         },
@@ -412,7 +411,12 @@ class ToolRegistry:
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "service": {"type": "string", "description": "Service name"},
+                            "service": {
+                                "type": "string",
+                                "description": (
+                                    "Affected target or service identifier from the incident"
+                                ),
+                            },
                             "symptom_keywords": {
                                 "type": "array",
                                 "items": {"type": "string"},
@@ -467,7 +471,9 @@ class ToolRegistry:
                                             ],
                                             "description": (
                                                 "Where this came from: prometheus (metrics), "
-                                                "loki (logs), incidents (incident history), "
+                                                "loki (logs), incidents (new related-history "
+                                                "or post-trigger lifecycle evidence, never "
+                                                "the original alert metadata), "
                                                 "llm (your own synthesis across sources), "
                                                 "system (a harness limit such as a timeout)"
                                             ),
@@ -475,10 +481,10 @@ class ToolRegistry:
                                         "source_detail": {
                                             "type": "string",
                                             "description": (
-                                                "The specific query/stream/metric it rests "
-                                                'on, e.g. \'up{job="system_node", '
-                                                'instance="koba-labs"}\' or '
-                                                "'kubernetes_container_name=netbird-agent'"
+                                                "Exact executed query or exact incident/event "
+                                                "identifier supporting this finding. For a "
+                                                "recommendation, identify the finding or "
+                                                "unknown that motivates the action."
                                             ),
                                         },
                                         "confidence": {
@@ -487,7 +493,13 @@ class ToolRegistry:
                                             "maximum": 1.0,
                                         },
                                     },
-                                    "required": ["type", "content", "source", "confidence"],
+                                    "required": [
+                                        "type",
+                                        "content",
+                                        "source",
+                                        "source_detail",
+                                        "confidence",
+                                    ],
                                 },
                             }
                         },
