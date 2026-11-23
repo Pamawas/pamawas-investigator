@@ -144,6 +144,14 @@ class InvestigationState:
     # Consecutive turns where all tool calls were repeats served from cache.
     # A model that repeats the same query over and over is stuck in a loop.
     consecutive_repeated_turns: int = 0
+    # Set when the harness must force real data queries instead of allowing
+    # more discovery, prose, or submission attempts. Discovery calls never
+    # satisfy this gate.
+    required_query_enforcement: bool = False
+    # Consecutive forced-query turns that failed to produce a successful data
+    # query. This bounds endpoints that ignore tool_choice or keep emitting
+    # invalid calls.
+    required_query_failures: int = 0
     completed: bool = False
     # Results already produced in this run, keyed by (tool, arguments). A model
     # that asks the same question again is answered from here instead of paying

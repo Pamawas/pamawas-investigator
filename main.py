@@ -31,7 +31,7 @@ from metrics import (
 )
 from otel import OTelConfig, init_tracer
 from ratelimit_middleware import RateLimitMiddleware
-from service.investigator import PamawasInvestigator
+from service.investigator import PROMPT_VERSION, PamawasInvestigator
 
 # Configure structured logging
 log = get_logger()
@@ -388,7 +388,7 @@ async def _ensure_investigation_run(
             request_key_hash=request_key_hash,
             model_provider=investigator.config.llm_base_url,
             model_name=investigator.config.llm_model,
-            prompt_version="pamawas-investigator-v1",
+            prompt_version=PROMPT_VERSION,
             tool_contract=1,
             max_tool_calls=investigator.config.max_tool_calls,
         )

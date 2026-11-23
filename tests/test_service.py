@@ -166,12 +166,23 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": [1]}
     )
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
     investigator.tools.submit_findings = MagicMock(return_value={"status": "success"})
     investigator.llm.chat_completion = MagicMock(
         side_effect=[
             response(
                 tool_calls=[
                     tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})
+                ]
+            ),
+            response(
+                tool_calls=[
+                    tool_call(
+                        "query_loki",
+                        {"logql": '{service="api"}', "start": "s", "end": "e"},
+                    )
                 ]
             ),
             response(
@@ -198,10 +209,190 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
 
     assert findings[0].type is EvidenceType.FACT
     investigator.tools._prometheus_adapter.query_range.assert_called_once_with("up", "s", "e")
-    assert investigator.llm.chat_completion.call_count == 2
+    investigator.tools._loki_adapter.query_range.assert_called_once_with(
+        '{service="api"}', "s", "e", 100
+    )
+    assert investigator.llm.chat_completion.call_count == 3
 
 
-def test_investigate_final_text_response_becomes_hypothesis(investigator):
+def test_early_submission_is_rejected_until_both_data_queries_succeed(investigator):
+    """Metadata or discovery alone can never complete a full investigation."""
+    investigator.config.max_tool_calls = 4
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "Outage")
+    )
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": []}
+    )
+    investigator.tools._prometheus_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["schema_key"]}
+    )
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
+    investigator.tools._loki_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["schema_key"]}
+    )
+
+    choices = []
+
+    def complete(
+        messages,
+        tools=None,
+        tool_choice="auto",
+        max_tokens=2000,
+        session="",
+        budget_seconds=None,
+    ):
+        choices.append(tool_choice)
+        forced_name = (
+            tool_choice.get("function", {}).get("name")
+            if isinstance(tool_choice, dict)
+            else None
+        )
+        if forced_name == "query_prometheus":
+            return response(
+                tool_calls=[
+                    tool_call(
+                        "query_prometheus",
+                        {"promql": "metric_from_discovered_schema", "start": "s", "end": "e"},
+                    )
+                ]
+            )
+        if forced_name == "query_loki":
+            return response(
+                tool_calls=[
+                    tool_call(
+                        "query_loki",
+                        {"logql": '{schema_key="validated"}', "start": "s", "end": "e"},
+                    )
+                ]
+            )
+        return response(
+            tool_calls=[
+                tool_call(
+                    "submit_findings",
+                    {
+                        "findings": [
+                            {
+                                "type": "unknown",
+                                "content": "No matching data was present in either query.",
+                                "source": "llm",
+                                "source_detail": "required data-query results",
+                                "confidence": 0.0,
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    investigator.llm.chat_completion = MagicMock(side_effect=complete)
+
+    findings = investigator.investigate("inc")
+
+    assert findings[0].type is EvidenceType.UNKNOWN
+    forced_names = [
+        choice["function"]["name"]
+        for choice in choices
+        if isinstance(choice, dict)
+    ]
+    assert forced_names == ["query_prometheus", "query_loki", "submit_findings"]
+    assert investigator.tools._prometheus_adapter.query_range.await_count == 1
+    assert investigator.tools._loki_adapter.query_range.await_count == 1
+
+
+def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
+    """Regression for the live run that repeated both label catalogs three times."""
+    investigator.config.max_tool_calls = 5
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "Outage")
+    )
+    investigator.tools._prometheus_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": []}
+    )
+    investigator.tools._prometheus_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["validated"]}
+    )
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
+    investigator.tools._loki_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["validated"]}
+    )
+
+    auto_turn = 0
+
+    def complete(
+        messages,
+        tools=None,
+        tool_choice="auto",
+        max_tokens=2000,
+        session="",
+        budget_seconds=None,
+    ):
+        nonlocal auto_turn
+        forced_name = (
+            tool_choice.get("function", {}).get("name")
+            if isinstance(tool_choice, dict)
+            else None
+        )
+        if forced_name == "query_prometheus":
+            return response(
+                tool_calls=[
+                    tool_call(
+                        "query_prometheus",
+                        {"promql": "validated_metric", "start": "s", "end": "e"},
+                    )
+                ]
+            )
+        if forced_name == "query_loki":
+            return response(
+                tool_calls=[
+                    tool_call(
+                        "query_loki",
+                        {"logql": '{validated="value"}', "start": "s", "end": "e"},
+                    )
+                ]
+            )
+
+        auto_turn += 1
+        if auto_turn <= 2:
+            return response(
+                tool_calls=[
+                    tool_call("get_prometheus_labels", {}, "prom-labels"),
+                    tool_call("get_loki_labels", {}, "loki-labels"),
+                ]
+            )
+        return response(
+            tool_calls=[
+                tool_call(
+                    "submit_findings",
+                    {
+                        "findings": [
+                            {
+                                "type": "unknown",
+                                "content": "The required queries completed without matching data.",
+                                "source": "llm",
+                                "source_detail": "Prometheus and Loki queries",
+                                "confidence": 0.0,
+                            }
+                        ]
+                    },
+                )
+            ]
+        )
+
+    investigator.llm.chat_completion = MagicMock(side_effect=complete)
+
+    findings = investigator.investigate("inc")
+
+    assert findings[0].type is EvidenceType.UNKNOWN
+    assert investigator.tools._prometheus_adapter.query_range.await_count == 1
+    assert investigator.tools._loki_adapter.query_range.await_count == 1
+
+
+def test_investigate_final_text_without_data_becomes_unknown(investigator):
     investigator.config.max_tool_calls = 1
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
     investigator.llm.chat_completion = MagicMock(
@@ -209,8 +400,9 @@ def test_investigate_final_text_response_becomes_hypothesis(investigator):
     )
     findings = investigator.investigate("inc")
     assert findings == [pytest.approx(findings[0])]
-    assert findings[0].type is EvidenceType.HYPOTHESIS
-    assert findings[0].confidence == 0.3
+    assert findings[0].type is EvidenceType.UNKNOWN
+    assert findings[0].confidence == 0.0
+    assert "without calling any tools" in findings[0].content
 
 
 def test_investigate_returns_unknown_when_llm_raises(investigator):
@@ -251,13 +443,13 @@ def test_text_only_turns_are_bounded_by_turn_budget(investigator):
 
     # Exactly max_tool_calls LLM turns — bounded, not an infinite loop.
     assert investigator.llm.chat_completion.call_count == 3
-    # The final turn's prose is captured as a hypothesis rather than discarded.
-    assert findings[0].type is EvidenceType.HYPOTHESIS
-    assert findings[0].content == "still thinking"
+    # Prose cannot bypass the required Prometheus/Loki data-query gate.
+    assert findings[0].type is EvidenceType.UNKNOWN
+    assert "without calling any tools" in findings[0].content
 
 
-def test_repeated_text_only_turns_force_a_submission(investigator):
-    """Three prose-only turns escalate to a forced submit, not a null result.
+def test_repeated_text_only_turns_force_data_queries_then_stop_unknown(investigator):
+    """Three prose turns activate data-query enforcement, not submission.
 
     The model stops calling tools when it has gathered what it needs but forgets
     to submit. Previously the loop kept asking it to "continue" until either the
@@ -273,12 +465,13 @@ def test_repeated_text_only_turns_force_a_submission(investigator):
 
     findings = investigator.investigate("inc")
 
-    # Three patience turns, then one forced turn.
+    # Three patience turns, then three bounded forced-query failures.
     assert investigator.llm.chat_completion.call_count == (
-        investigator.MAX_CONSECUTIVE_TEXT_TURNS + 1
+        investigator.MAX_CONSECUTIVE_TEXT_TURNS
+        + investigator.MAX_REQUIRED_QUERY_FAILURES
     )
-    assert findings[0].type is EvidenceType.HYPOTHESIS
-    assert findings[0].content == "I think the node rebooted"
+    assert findings[0].type is EvidenceType.UNKNOWN
+    assert "required data queries did not succeed" in findings[0].content
 
 
 def test_text_patience_escalates_only_at_the_limit(investigator):
@@ -293,8 +486,9 @@ def test_text_patience_escalates_only_at_the_limit(investigator):
     assert messages == []
 
     state.consecutive_text_turns = investigator.MAX_CONSECUTIVE_TEXT_TURNS
-    assert investigator._escalate_text_patience("inc", state, messages) is True
-    assert "submit_findings" in messages[-1]["content"]
+    assert investigator._escalate_text_patience("inc", state, messages) is False
+    assert state.required_query_enforcement is True
+    assert "query_prometheus, query_loki" in messages[-1]["content"]
 
 
 def test_reasoning_preamble_is_not_recorded_as_a_finding(investigator):
@@ -410,7 +604,7 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
     from unittest.mock import AsyncMock
 
     investigator.config.max_tool_calls = 50
-    investigator.config.investigation_timeout_seconds = 4.0
+    investigator.config.investigation_timeout_seconds = 12.0
     investigator.DEADLINE_RESERVE_MIN_SECONDS = 2.0
     _advancing_clock(monkeypatch, step=0.5)
 
@@ -418,14 +612,20 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": [1]}
     )
+    investigator.tools._loki_adapter.query_range = AsyncMock(
+        return_value={"status": "success", "data": {"result": []}}
+    )
 
     seen_tool_choices = []
+    auto_turn = 0
 
     def fake_completion(
         messages, tools=None, tool_choice="auto", max_tokens=2000, session="", budget_seconds=None
     ):
+        nonlocal auto_turn
         seen_tool_choices.append(tool_choice)
         if isinstance(tool_choice, dict):
+            assert tool_choice["function"]["name"] == "submit_findings"
             return response(
                 tool_calls=[
                     tool_call(
@@ -443,15 +643,40 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
                     )
                 ]
             )
+        auto_turn += 1
+        if auto_turn == 1:
+            return response(
+                tool_calls=[
+                    tool_call(
+                        "query_prometheus",
+                        {"promql": "up", "start": "s", "end": "e"},
+                        "prom-required",
+                    ),
+                    tool_call(
+                        "query_loki",
+                        {"logql": '{service="api"}', "start": "s", "end": "e"},
+                        "loki-required",
+                    ),
+                ]
+            )
         return response(
-            tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
+            tool_calls=[
+                tool_call(
+                    "query_prometheus",
+                    {"promql": f"metric_{auto_turn}", "start": "s", "end": "e"},
+                )
+            ]
         )
 
     investigator.llm.chat_completion = MagicMock(side_effect=fake_completion)
 
     findings = investigator.investigate("inc")
 
-    forced = [c for c in seen_tool_choices if isinstance(c, dict)]
+    forced = [
+        c
+        for c in seen_tool_choices
+        if isinstance(c, dict) and c["function"]["name"] == "submit_findings"
+    ]
     assert forced, "the loop must force submit_findings once the reserve is reached"
     assert findings[0].type is EvidenceType.FACT
     assert "load1" in findings[0].content
@@ -653,7 +878,8 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "call get_loki_labels once" in prompt
     assert "Metrics describe what changed; logs may explain why" in prompt
     assert "never treat catalog output as evidence" in prompt
-    assert "record that limitation as UNKNOWN" in prompt
+    assert "MUST execute at least one successful query_prometheus" in prompt
+    assert "The harness enforces this rule and rejects early submissions" in prompt
     assert "The current incident is the investigation premise, not a finding" in prompt
     assert "Restating the triggering alert is not a finding" in prompt
     assert "DECISION PROCEDURE" in prompt
@@ -1128,8 +1354,8 @@ def test_repeated_call_escalates_message_on_second_repeat(investigator):
     assert state.seen_call_counts[sig] == 2
 
 
-def test_repeat_patience_forces_submission_after_limit(investigator):
-    """Consecutive turns of only-repeated calls escalate to forced submission."""
+def test_repeat_patience_forces_missing_data_queries_after_limit(investigator):
+    """Repeated discovery activates data-query enforcement, not submission."""
     from models import InvestigationState
 
     state = InvestigationState(incident_id="inc", findings=[], tool_calls=[])
@@ -1140,10 +1366,11 @@ def test_repeat_patience_forces_submission_after_limit(investigator):
     assert investigator._escalate_repeat_patience("inc", state, messages) is False
     assert messages == []
 
-    # At the limit: should force
+    # At the limit: redirect to the missing data-query tools.
     state.consecutive_repeated_turns = investigator.MAX_CONSECUTIVE_REPEATED_TURNS
-    assert investigator._escalate_repeat_patience("inc", state, messages) is True
-    assert "repeatedly issuing the same queries" in messages[-1]["content"]
+    assert investigator._escalate_repeat_patience("inc", state, messages) is False
+    assert state.required_query_enforcement is True
+    assert "query_prometheus, query_loki" in messages[-1]["content"]
 
 
 def test_fresh_tool_call_resets_consecutive_repeated_turns(investigator):
@@ -1170,9 +1397,10 @@ def test_fresh_tool_call_resets_consecutive_repeated_turns(investigator):
 
     assert state.consecutive_repeated_turns == 0
 
-    # Confirm escalation fires at the threshold
+    # Confirm the threshold activates required data-query enforcement.
     state.consecutive_repeated_turns = investigator.MAX_CONSECUTIVE_REPEATED_TURNS
-    assert investigator._escalate_repeat_patience("inc", state, messages) is True
+    assert investigator._escalate_repeat_patience("inc", state, messages) is False
+    assert state.required_query_enforcement is True
 
 
 def test_an_unknown_finding_carries_no_confidence():

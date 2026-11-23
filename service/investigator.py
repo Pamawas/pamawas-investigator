@@ -45,6 +45,15 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
+PROMPT_VERSION = "pamawas-investigator-v7"
+
+_FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
+_VERIFICATION_DATA_TOOLS = ("query_prometheus",)
+_DISCOVERY_TO_DATA_TOOL = {
+    "get_prometheus_labels": "query_prometheus",
+    "get_loki_labels": "query_loki",
+}
+
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
     from datetime import UTC
@@ -243,6 +252,46 @@ def _successful_tool_calls(
         and isinstance(call.result, dict)
         and call.result.get("status") == "success"
     ]
+
+
+def _required_data_tools(verification: bool = False) -> tuple[str, ...]:
+    """Return data-query tools required before findings may be accepted."""
+    return _VERIFICATION_DATA_TOOLS if verification else _FULL_INVESTIGATION_DATA_TOOLS
+
+
+def _missing_required_data_tools(
+    tool_calls: list[ToolResult], verification: bool = False
+) -> tuple[str, ...]:
+    """Return required data queries that have not completed successfully."""
+    successful = {
+        call.tool_name
+        for call in tool_calls
+        if call.tool_name in _required_data_tools(verification)
+        and isinstance(call.result, dict)
+        and call.result.get("status") == "success"
+    }
+    return tuple(
+        tool_name
+        for tool_name in _required_data_tools(verification)
+        if tool_name not in successful
+    )
+
+
+def _exhaustion_reason(
+    exhausted_by: str,
+    tool_calls: list[ToolResult],
+    verification: bool,
+) -> str:
+    """Describe why an investigation ended without accepted findings."""
+    if exhausted_by == "deadline":
+        return "Investigation deadline exceeded"
+    if exhausted_by == "required_data":
+        missing = _missing_required_data_tools(tool_calls, verification)
+        return (
+            "Investigation reached its submission reserve without successful "
+            f"required data queries: {', '.join(missing)}"
+        )
+    return "Investigation exhausted its turn budget"
 
 
 def _metric_from_series(series: Any, query_name: str) -> Metric | None:
@@ -1076,6 +1125,12 @@ class PamawasInvestigator:
     # burns turn budget (up to 50/100 turns) and ends with no findings.
     MAX_CONSECUTIVE_REPEATED_TURNS = 3
 
+    # Bound how many times the harness forces a missing data-query tool when
+    # the endpoint ignores tool_choice or keeps producing unsuccessful calls.
+    # Reaching this limit yields an honest system UNKNOWN, never model findings
+    # unsupported by Prometheus/Loki data queries.
+    MAX_REQUIRED_QUERY_FAILURES = 3
+
     # Wall-clock budget reserved at the end of an investigation for the model to
     # write its findings and for them to be persisted.
     #
@@ -1277,9 +1332,13 @@ class PamawasInvestigator:
             "If the Loki selector schema is unknown, call get_loki_labels once. Then request "
             "values for one promising returned label and immediately run the data query. Never "
             "repeat catalogs and never treat catalog output as evidence.\n"
-            "- A full investigation should normally obtain at least one data result from both "
-            "Prometheus and Loki. Skip a source only when it cannot answer a relevant question, "
-            "is unavailable, or no selector can be validated; record that limitation as UNKNOWN.\n"
+            "- A full investigation MUST execute at least one successful query_prometheus and "
+            "one successful query_loki call before submission. Catalog and label-discovery calls "
+            "do not satisfy this requirement. The harness enforces this rule and rejects early "
+            "submissions.\n"
+            "- If a data query fails, correct it using only discovered schema and make a bounded, "
+            "materially different attempt. If a source remains unavailable, do not fabricate "
+            "evidence; the harness will terminate with an honest UNKNOWN.\n"
             "- Do not stop after validating the alert metric. Metrics describe what changed; "
             "logs may explain why. Conversely, a log line without matching telemetry does not "
             "prove it caused the incident.\n\n"
@@ -1328,6 +1387,8 @@ class PamawasInvestigator:
             "FACT. Never claim a source was not checked after its result is already present.\n\n"
             "SUBMISSION:\n"
             "- Use submit_findings; prose alone does not complete the investigation.\n"
+            "- submit_findings is accepted only after successful Prometheus and Loki data "
+            "queries. Do not submit after catalog discovery alone.\n"
             "- Report only substantive findings: the key observed facts, at most one best "
             "cause or hypothesis, important unknowns, and at least one specific recommendation.\n"
             "- Never submit a FACT whose only content is that this incident exists, fired, "
@@ -1368,6 +1429,8 @@ class PamawasInvestigator:
             f"end='{now_iso}').\n"
             "- Call get_prometheus_labels / get_loki_labels first if the label schema is "
             "unknown.\n"
+            "- Label discovery is not evidence. A successful query_prometheus call is "
+            "required before submit_findings is accepted.\n"
             "- DO NOT query historical time ranges from hours ago.\n"
             "- DO NOT investigate past incident history or root causes.\n"
             "- Submit a FACT: 'The target has recovered' if current metrics are healthy, "
@@ -1905,7 +1968,7 @@ class PamawasInvestigator:
                 tool_calls=state.tool_calls,
                 model_provider=self.config.llm_base_url,
                 model_name=self.config.llm_model,
-                prompt_version="pamawas-investigator-v6",
+                prompt_version=PROMPT_VERSION,
                 tool_contract=1,
                 max_tool_calls=self.config.max_tool_calls,
                 service=state.service,
@@ -1958,7 +2021,7 @@ class PamawasInvestigator:
             tool_calls=state.tool_calls,
             model_provider=self.config.llm_base_url,
             model_name=self.config.llm_model,
-            prompt_version="pamawas-investigator-v6",
+            prompt_version=PROMPT_VERSION,
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
             service=state.service,
@@ -2098,7 +2161,7 @@ class PamawasInvestigator:
             tool_calls=[],
             model_provider=self.config.llm_base_url,
             model_name=self.config.llm_model,
-            prompt_version="pamawas-investigator-v6",
+            prompt_version=PROMPT_VERSION,
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
             service=context.affected_services[0] if context.affected_services else None,
@@ -2113,6 +2176,7 @@ class PamawasInvestigator:
         forced_already: bool,
         state: InvestigationState,
         messages: list[dict],
+        verification: bool = False,
     ) -> tuple[bool, bool]:
         """Decide whether this turn must be a forced submission.
 
@@ -2129,12 +2193,56 @@ class PamawasInvestigator:
         )
         if force_submit or forced_already:
             return force_submit, warned
-        if self._escalate_text_patience(incident_id, state, messages):
+        if self._escalate_text_patience(
+            incident_id, state, messages, verification=verification
+        ):
             return True, warned
-        return self._escalate_repeat_patience(incident_id, state, messages), warned
+        return (
+            self._escalate_repeat_patience(
+                incident_id, state, messages, verification=verification
+            ),
+            warned,
+        )
+
+    def _enforce_missing_data_queries(
+        self,
+        incident_id: str,
+        state: InvestigationState,
+        messages: list[dict],
+        reason: str,
+        verification: bool = False,
+    ) -> bool:
+        """Activate the hard data-query gate when required sources are missing."""
+        missing = _missing_required_data_tools(state.tool_calls, verification)
+        if not missing:
+            return False
+
+        state.required_query_enforcement = True
+        logger.warning(
+            "Incident %s cannot submit findings yet; enforcing required data queries: %s",
+            incident_id,
+            ", ".join(missing),
+        )
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    f"{reason} Discovery calls do not count as incident evidence. "
+                    f"Before submission, execute successful data queries with: "
+                    f"{', '.join(missing)}. The harness will reject findings until "
+                    "those queries succeed. Use only schema learned from tool results; "
+                    "do not invent label names or values."
+                ),
+            }
+        )
+        return True
 
     def _escalate_repeat_patience(
-        self, incident_id: str, state: InvestigationState, messages: list[dict]
+        self,
+        incident_id: str,
+        state: InvestigationState,
+        messages: list[dict],
+        verification: bool = False,
     ) -> bool:
         """Force a structured submission once the model repeatedly queries cached data.
 
@@ -2146,6 +2254,15 @@ class PamawasInvestigator:
         Returns True when this turn must be a forced submission.
         """
         if state.consecutive_repeated_turns < self.MAX_CONSECUTIVE_REPEATED_TURNS:
+            return False
+        if self._enforce_missing_data_queries(
+            incident_id=incident_id,
+            state=state,
+            messages=messages,
+            reason="You are repeating discovery instead of querying data.",
+            verification=verification,
+        ):
+            state.consecutive_repeated_turns = 0
             return False
         logger.warning(
             "Incident %s issued %d consecutive turns of repeated tool calls; "
@@ -2167,7 +2284,11 @@ class PamawasInvestigator:
         return True
 
     def _escalate_text_patience(
-        self, incident_id: str, state: InvestigationState, messages: list[dict]
+        self,
+        incident_id: str,
+        state: InvestigationState,
+        messages: list[dict],
+        verification: bool = False,
     ) -> bool:
         """Force a structured submission once the model stops calling tools.
 
@@ -2181,6 +2302,15 @@ class PamawasInvestigator:
         Returns True when this turn must be a forced submission.
         """
         if state.consecutive_text_turns < self.MAX_CONSECUTIVE_TEXT_TURNS:
+            return False
+        if self._enforce_missing_data_queries(
+            incident_id=incident_id,
+            state=state,
+            messages=messages,
+            reason="You stopped before gathering the required data.",
+            verification=verification,
+        ):
+            state.consecutive_text_turns = 0
             return False
         logger.warning(
             "Incident %s replied %d times without a tool call; forcing findings "
@@ -2310,7 +2440,20 @@ class PamawasInvestigator:
                 forced_already=forced_submission_started,
                 state=state,
                 messages=messages,
+                verification=verification,
             )
+            missing_required = _missing_required_data_tools(
+                state.tool_calls, verification
+            )
+            if force_submit and missing_required and time.monotonic() >= explore_deadline:
+                exhausted_by = "required_data"
+                logger.warning(
+                    "Incident %s reached its submission reserve without successful "
+                    "required data queries: %s",
+                    incident_id,
+                    ", ".join(missing_required),
+                )
+                break
             if force_submit:
                 forced_submission_started = True
 
@@ -2359,7 +2502,7 @@ class PamawasInvestigator:
                     tool_calls=state.tool_calls,
                     model_provider=self.config.llm_base_url,
                     model_name=self.config.llm_model,
-                    prompt_version="pamawas-investigator-v6",
+                    prompt_version=PROMPT_VERSION,
                     tool_contract=1,
                     max_tool_calls=self.config.max_tool_calls,
                     service=state.service,
@@ -2370,24 +2513,17 @@ class PamawasInvestigator:
         # budget), synthesize a submission from whatever partial findings and
         # tool results we have.
         if not state.findings:
-            if exhausted_by == "deadline":
-                reason = "Investigation deadline exceeded"
-            else:
-                reason = "Investigation exhausted its turn budget"
+            reason = _exhaustion_reason(
+                exhausted_by, state.tool_calls, verification
+            )
             if state.tool_calls:
-                # Count what actually succeeded, rather than reporting the
-                # status of the last three calls. "query_prometheus: success;
-                # query_loki: success" told a reader nothing about whether the
-                # investigation had learned anything before it ran out of time.
-                succeeded = sum(
-                    1
-                    for tc in state.tool_calls
-                    if not (isinstance(tc.result, dict) and tc.result.get("status") == "error")
+                successful_data_queries = len(_required_data_tools(verification)) - len(
+                    _missing_required_data_tools(state.tool_calls, verification)
                 )
                 content = (
                     f"{reason} without submitting findings. "
-                    f"{succeeded} of {len(state.tool_calls)} tool calls returned "
-                    "data; no conclusion was recorded before the budget ran out."
+                    f"{successful_data_queries} required data queries succeeded; "
+                    "discovery calls were not treated as evidence."
                 )
             else:
                 content = f"{reason} without calling any tools"
@@ -2401,7 +2537,7 @@ class PamawasInvestigator:
             )
 
         increment_findings_by_type(state.findings)
-        if exhausted_by == "deadline":
+        if exhausted_by in ("deadline", "required_data"):
             increment_deadline_exceeded()
         else:
             increment_max_tool_calls_reached()
@@ -2412,13 +2548,96 @@ class PamawasInvestigator:
             tool_calls=state.tool_calls,
             model_provider=self.config.llm_base_url,
             model_name=self.config.llm_model,
-            prompt_version="pamawas-investigator-v6",
+            prompt_version=PROMPT_VERSION,
             tool_contract=1,
             max_tool_calls=self.config.max_tool_calls,
             service=state.service,
         )
 
         return state.findings
+
+    @staticmethod
+    def _tool_definition(tool_name: str, verification: bool) -> dict | None:
+        """Return one tool definition by name."""
+        return next(
+            (
+                tool
+                for tool in ToolRegistry.get_tools(verification=verification)
+                if tool.get("function", {}).get("name") == tool_name
+            ),
+            None,
+        )
+
+    def _reject_submission_without_required_data(
+        self,
+        tool_call,
+        state: InvestigationState,
+        messages: list[dict],
+        verification: bool,
+    ) -> bool:
+        """Reject submit_findings until required data-query tools have succeeded."""
+        missing = _missing_required_data_tools(state.tool_calls, verification)
+        if not missing:
+            return False
+
+        state.required_query_enforcement = True
+        error = (
+            "submit_findings rejected: discovery and incident metadata are not "
+            "evidence. Execute successful data queries with "
+            f"{', '.join(missing)} before submitting findings."
+        )
+        logger.warning(error)
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": tool_call.id,
+                "content": json.dumps({"status": "error", "error": error}),
+            }
+        )
+        return True
+
+    def _record_required_query_failure(
+        self,
+        state: InvestigationState,
+        messages: list[dict],
+        verification: bool,
+    ) -> bool:
+        """Bound forced-query failures; return True when the run must terminate."""
+        missing = _missing_required_data_tools(state.tool_calls, verification)
+        if not missing:
+            state.required_query_enforcement = False
+            state.required_query_failures = 0
+            return False
+
+        state.required_query_enforcement = True
+        state.required_query_failures += 1
+        if state.required_query_failures < self.MAX_REQUIRED_QUERY_FAILURES:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "The required data query did not succeed. Retry with a valid, "
+                        "materially different query using only schema returned by the "
+                        f"tools. Still missing: {', '.join(missing)}."
+                    ),
+                }
+            )
+            return False
+
+        state.findings.append(
+            Finding(
+                type=EvidenceType.UNKNOWN,
+                content=(
+                    "Investigation stopped because required data queries did not "
+                    f"succeed after enforced attempts: {', '.join(missing)}."
+                ),
+                source=EvidenceSource.SYSTEM,
+                source_detail="required data-query enforcement",
+                confidence=0.0,
+            )
+        )
+        state.completed = True
+        return True
 
     async def _handle_investigation_turn(  # noqa: C901
         self,
@@ -2434,11 +2653,33 @@ class PamawasInvestigator:
         """Run a single investigation turn (LLM call + tool handling);
         returns findings if complete."""
         is_final_turn = state.turn_count >= state.max_tool_calls
+        missing_required = _missing_required_data_tools(state.tool_calls, verification)
+        can_start_data_query = (
+            explore_deadline is None or time.monotonic() < explore_deadline
+        )
+        forced_required_query = (
+            missing_required[0]
+            if state.required_query_enforcement
+            and missing_required
+            and can_start_data_query
+            else None
+        )
         # A forced submission is a hard requirement, not a hint: the model is
         # told to call submit_findings and the API refuses anything else, so the
         # turn cannot be spent on another query with no time left to report it.
-        must_submit = is_final_turn or force_submit
-        if force_submit:
+        must_submit = (is_final_turn or force_submit) and forced_required_query is None
+        if forced_required_query is not None:
+            required_tool = self._tool_definition(forced_required_query, verification)
+            tools = (
+                [required_tool]
+                if required_tool is not None
+                else ToolRegistry.get_tools(verification=verification)
+            )
+            tool_choice = {
+                "type": "function",
+                "function": {"name": forced_required_query},
+            }
+        elif force_submit:
             submit_tool = [
                 t
                 for t in ToolRegistry.get_tools(verification=verification)
@@ -2490,6 +2731,7 @@ class PamawasInvestigator:
         # prevent. Treat the reply as the final answer instead.
         if (
             force_submit
+            and forced_required_query is None
             and tool_calls
             and not any(_resolved_tool_name(tc) == "submit_findings" for tc in tool_calls)
         ):
@@ -2504,8 +2746,40 @@ class PamawasInvestigator:
             # no-tool patience budget starts over.
             state.consecutive_text_turns = 0
             has_fresh_tool_call = False
+            forced_required_query_succeeded = False
             for tool_call in tool_calls:
                 function_name, function_args = _resolve_tool_call(tool_call)
+
+                if (
+                    forced_required_query is not None
+                    and function_name != forced_required_query
+                ):
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_call.id,
+                            "content": json.dumps(
+                                {
+                                    "status": "error",
+                                    "error": (
+                                        f"Only {forced_required_query} is allowed until "
+                                        "the required data-query gate is satisfied."
+                                    ),
+                                }
+                            ),
+                        }
+                    )
+                    continue
+
+                if function_name == "submit_findings" and (
+                    self._reject_submission_without_required_data(
+                        tool_call=tool_call,
+                        state=state,
+                        messages=messages,
+                        verification=verification,
+                    )
+                ):
+                    continue
 
                 # The reserve is a wall, not a checkpoint. A single turn may
                 # carry several tool calls and each can take up to the tool
@@ -2537,6 +2811,11 @@ class PamawasInvestigator:
                     tool_call, function_name, function_args, state, messages
                 )
                 if repeated:
+                    required_data_tool = _DISCOVERY_TO_DATA_TOOL.get(function_name)
+                    if required_data_tool in _missing_required_data_tools(
+                        state.tool_calls, verification
+                    ):
+                        state.required_query_enforcement = True
                     # Verification is a single "is the target still down?"
                     # question. A repeated query returns the same data, adds
                     # nothing new, and only wastes budget before the verdict.
@@ -2580,6 +2859,12 @@ class PamawasInvestigator:
                 self._handle_tool_result(
                     tool_call, function_name, function_args, result, tool_start, state, messages
                 )
+                if (
+                    function_name == forced_required_query
+                    and isinstance(result, dict)
+                    and result.get("status") == "success"
+                ):
+                    forced_required_query_succeeded = True
 
                 # Incremental persistence after each non-final tool call
                 # so that a crash or deadline still leaves a terminal run.
@@ -2590,12 +2875,49 @@ class PamawasInvestigator:
                     tool_calls=state.tool_calls,
                     model_provider=self.config.llm_base_url,
                     model_name=self.config.llm_model,
-                    prompt_version="pamawas-investigator-v6",
+                    prompt_version=PROMPT_VERSION,
                     tool_contract=1,
                     max_tool_calls=self.config.max_tool_calls,
                 )
 
                 self._check_max_tools_reached(state, must_submit, messages)
+
+            if forced_required_query is not None:
+                if forced_required_query_succeeded:
+                    state.required_query_failures = 0
+                    still_missing = _missing_required_data_tools(
+                        state.tool_calls, verification
+                    )
+                    state.required_query_enforcement = bool(still_missing)
+                    if still_missing:
+                        messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "The previous required data query succeeded. "
+                                    f"Now execute: {', '.join(still_missing)}."
+                                ),
+                            }
+                        )
+                elif self._record_required_query_failure(
+                    state=state,
+                    messages=messages,
+                    verification=verification,
+                ):
+                    increment_findings_by_type(state.findings)
+                    await self._persist_investigation(
+                        incident_id=incident_id,
+                        request_key_hash=request_key_hash,
+                        findings=state.findings,
+                        tool_calls=state.tool_calls,
+                        model_provider=self.config.llm_base_url,
+                        model_name=self.config.llm_model,
+                        prompt_version=PROMPT_VERSION,
+                        tool_contract=1,
+                        max_tool_calls=self.config.max_tool_calls,
+                        service=state.service,
+                    )
+                    return state.findings
 
             if has_fresh_tool_call:
                 state.consecutive_repeated_turns = 0
@@ -2604,6 +2926,28 @@ class PamawasInvestigator:
             return None
 
         state.consecutive_repeated_turns = 0
+        if forced_required_query is not None or (must_submit and missing_required):
+            state.consecutive_text_turns += 1
+            if self._record_required_query_failure(
+                state=state,
+                messages=messages,
+                verification=verification,
+            ):
+                increment_findings_by_type(state.findings)
+                await self._persist_investigation(
+                    incident_id=incident_id,
+                    request_key_hash=request_key_hash,
+                    findings=state.findings,
+                    tool_calls=state.tool_calls,
+                    model_provider=self.config.llm_base_url,
+                    model_name=self.config.llm_model,
+                    prompt_version=PROMPT_VERSION,
+                    tool_contract=1,
+                    max_tool_calls=self.config.max_tool_calls,
+                    service=state.service,
+                )
+                return state.findings
+            return None
         self._handle_text_response(response, state, must_submit, messages)
         if state.completed:
             increment_findings_by_type(state.findings)
@@ -2614,7 +2958,7 @@ class PamawasInvestigator:
                 tool_calls=state.tool_calls,
                 model_provider=self.config.llm_base_url,
                 model_name=self.config.llm_model,
-                prompt_version="pamawas-investigator-v6",
+                prompt_version=PROMPT_VERSION,
                 tool_contract=1,
                 max_tool_calls=self.config.max_tool_calls,
                 service=state.service,
