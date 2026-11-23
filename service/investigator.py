@@ -3,12 +3,14 @@
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import timezone as tz
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import openai
 import psycopg2
@@ -45,7 +47,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v8"
+PROMPT_VERSION = "pamawas-investigator-v9"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -426,13 +428,41 @@ def _logs_from_tool_calls(
     return entries
 
 
+def _pod_timezone():
+    """Return the pod-configured timezone, with a neutral UTC fallback."""
+    timezone_name = os.getenv("TZ", "UTC")
+    try:
+        return ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError:
+        logger.warning("Invalid TZ %r; formatting investigation evidence in UTC", timezone_name)
+        return UTC
+
+
+def _format_query_timestamp(value: Any) -> str:
+    """Render an RFC3339 query boundary in the pod timezone."""
+    rendered = str(value or "")
+    try:
+        parsed = datetime.fromisoformat(rendered.replace("Z", "+00:00"))
+    except ValueError:
+        return rendered
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(_pod_timezone()).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def _query_window(call: ToolResult) -> str:
+    """Render one tool call's time window using the pod timezone."""
+    arguments = call.arguments if isinstance(call.arguments, dict) else {}
+    start = _format_query_timestamp(arguments.get("start"))
+    end = _format_query_timestamp(arguments.get("end"))
+    return f"{start} to {end}"
+
+
 def _query_source_detail(call: ToolResult, argument_name: str) -> str:
     """Identify one executed data query without assuming deployment labels."""
     arguments = call.arguments if isinstance(call.arguments, dict) else {}
     query = str(arguments.get(argument_name) or "")
-    start = str(arguments.get("start") or "")
-    end = str(arguments.get("end") or "")
-    return f"{call.tool_name}: {query} [{start} to {end}]"
+    return f"{call.tool_name}: {query} [{_query_window(call)}]"
 
 
 def _series_numeric_samples(series: Any) -> list[float]:
@@ -468,7 +498,10 @@ def _prometheus_query_finding(call: ToolResult) -> Finding:
     if not isinstance(series, list) or not series:
         return Finding(
             type=EvidenceType.UNKNOWN,
-            content="Prometheus returned no result series for the executed query.",
+            content=(
+                "Prometheus returned no result series for the executed query "
+                f"from {_query_window(call)}."
+            ),
             source=EvidenceSource.PROMETHEUS,
             source_detail=detail,
             confidence=0.0,
@@ -490,8 +523,8 @@ def _prometheus_query_finding(call: ToolResult) -> Finding:
         )
 
     content = (
-        f"Prometheus returned {len(series)} result series with {len(all_samples)} "
-        f"numeric samples. The observed range was "
+        f"From {_query_window(call)}, Prometheus returned {len(series)} result "
+        f"series with {len(all_samples)} numeric samples. The observed range was "
         f"{_format_observed_number(min(all_samples))} to "
         f"{_format_observed_number(max(all_samples))}."
     )
@@ -525,7 +558,10 @@ def _loki_query_finding(call: ToolResult) -> Finding:
     if line_count == 0:
         return Finding(
             type=EvidenceType.UNKNOWN,
-            content="Loki returned no log entries for the executed query.",
+            content=(
+                "Loki returned no log entries for the executed query from "
+                f"{_query_window(call)}."
+            ),
             source=EvidenceSource.LOKI,
             source_detail=detail,
             confidence=0.0,
@@ -533,8 +569,8 @@ def _loki_query_finding(call: ToolResult) -> Finding:
     return Finding(
         type=EvidenceType.FACT,
         content=(
-            f"Loki returned {line_count} log entries across {len(streams)} "
-            "result streams for the executed query."
+            f"From {_query_window(call)}, Loki returned {line_count} log entries "
+            f"across {len(streams)} result streams for the executed query."
         ),
         source=EvidenceSource.LOKI,
         source_detail=detail,

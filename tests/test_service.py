@@ -1034,8 +1034,9 @@ def test_query_results_persist_without_assuming_data_lake_labels():
     }
 
 
-def test_provider_findings_are_grounded_in_exact_executed_queries():
+def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
     """A cheap model cannot cite invented queries or alert-payload values as telemetry."""
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
     tool_calls = [
         ToolResult(
             tool_name="query_prometheus",
@@ -1100,14 +1101,18 @@ def test_provider_findings_are_grounded_in_exact_executed_queries():
         EvidenceSource.LLM,
     ]
     assert "observed range was 68 to 86.5" in grounded[0].content
+    assert "2026-11-23 18:30:00 WIB" in grounded[0].content
     assert grounded[0].source_detail == (
         "query_prometheus: custom_utilization_expression "
-        "[2026-11-23T11:30:00Z to 2026-11-23T11:45:00Z]"
+        "[2026-11-23 18:30:00 WIB to 2026-11-23 18:45:00 WIB]"
     )
-    assert grounded[1].content == "Loki returned no log entries for the executed query."
+    assert grounded[1].content == (
+        "Loki returned no log entries for the executed query from "
+        "2026-11-23 18:30:00 WIB to 2026-11-23 18:45:00 WIB."
+    )
     assert grounded[1].source_detail == (
         'query_loki: {scope_dimension="alpha-target"} '
-        "[2026-11-23T11:30:00Z to 2026-11-23T11:45:00Z]"
+        "[2026-11-23 18:30:00 WIB to 2026-11-23 18:45:00 WIB]"
     )
     assert all("invented" not in finding.source_detail for finding in grounded)
     assert grounded[2].type is EvidenceType.RECOMMENDATION
