@@ -37,7 +37,7 @@ async def test_loki_recovery_uses_its_own_keys_and_values():
         "2026-11-23T11:45:10+00:00", 100,
     )
     grounded = _ground_findings_in_data_queries([], recovery.calls)
-    assert "worker restarted after timeout" in grounded[0].content
+    assert "Worker restarted after timeout" in grounded[0].content
     assert "metric_job" not in grounded[0].source_detail
 
 
@@ -130,7 +130,7 @@ def test_weak_model_run_recovers_queries_and_keeps_actions(investigator):
     assert any(finding.type == EvidenceType.HYPOTHESIS for finding in findings)
     assert any(finding.type == EvidenceType.RECOMMENDATION for finding in findings)
     assert any("0.85 seconds per second" in finding.content for finding in findings)
-    assert any("worker restarted after timeout" in finding.content for finding in findings)
+    assert any("Worker restarted after timeout" in finding.content for finding in findings)
     assert not any("40500" in finding.content for finding in findings)
 
 
