@@ -437,9 +437,11 @@ def test_investigate_handles_large_tool_result_without_invalid_json(investigator
             tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
         )
     )
-    finding = investigator.investigate("inc")[0]
-    assert finding.type is EvidenceType.UNKNOWN
-    assert "turn budget" in finding.content
+    findings = investigator.investigate("inc")
+    assert findings[0].source is EvidenceSource.PROMETHEUS
+    assert findings[0].type is EvidenceType.FACT
+    assert findings[-1].type is EvidenceType.UNKNOWN
+    assert "turn budget" in findings[-1].content
 
 
 def test_text_only_turns_are_bounded_by_turn_budget(investigator):
@@ -486,6 +488,51 @@ def test_repeated_text_only_turns_force_data_queries_then_stop_unknown(investiga
     )
     assert findings[0].type is EvidenceType.UNKNOWN
     assert "required data queries did not succeed" in findings[0].content
+
+
+def test_required_query_failure_preserves_successful_provider_evidence(investigator):
+    """One failed source must not hide deterministic data from a successful source."""
+    from models import InvestigationState
+
+    state = InvestigationState(
+        incident_id="inc",
+        findings=[],
+        tool_calls=[
+            ToolResult(
+                tool_name="query_prometheus",
+                arguments={"promql": "observed_metric", "start": "s", "end": "e"},
+                result={
+                    "status": "success",
+                    "data": {
+                        "result": [
+                            {
+                                "metric": {"scope": "target"},
+                                "values": [[1, "70"], [2, "85"]],
+                            }
+                        ]
+                    },
+                },
+                duration_ms=1,
+            )
+        ],
+    )
+    messages = []
+
+    for _ in range(investigator.MAX_REQUIRED_QUERY_FAILURES - 1):
+        assert not investigator._record_required_query_failure(
+            state, messages, verification=False
+        )
+    assert investigator._record_required_query_failure(
+        state, messages, verification=False
+    )
+
+    assert [finding.source for finding in state.findings] == [
+        EvidenceSource.PROMETHEUS,
+        EvidenceSource.SYSTEM,
+    ]
+    assert state.findings[0].type is EvidenceType.FACT
+    assert "observed range was 70 to 85" in state.findings[0].content
+    assert "query_loki" in state.findings[1].content
 
 
 def test_text_patience_escalates_only_at_the_limit(investigator):

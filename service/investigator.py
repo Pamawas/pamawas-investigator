@@ -47,7 +47,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v10"
+PROMPT_VERSION = "pamawas-investigator-v11"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -614,6 +614,15 @@ def _ground_findings_in_data_queries(
         for call in loki_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
     )
     return grounded + kept
+
+
+def _ground_partial_data_queries(
+    tool_calls: list[ToolResult], verification: bool
+) -> list[Finding]:
+    """Return deterministic full-investigation evidence gathered before termination."""
+    if verification:
+        return []
+    return _ground_findings_in_data_queries([], tool_calls)
 
 
 def _decode_cached_tool_result(cached: Any) -> dict[str, Any] | None:
@@ -2730,6 +2739,9 @@ class PamawasInvestigator:
             reason = _exhaustion_reason(
                 exhausted_by, state.tool_calls, verification
             )
+            state.findings.extend(
+                _ground_partial_data_queries(state.tool_calls, verification)
+            )
             if state.tool_calls:
                 successful_data_queries = len(_required_data_tools(verification)) - len(
                     _missing_required_data_tools(state.tool_calls, verification)
@@ -2838,6 +2850,13 @@ class PamawasInvestigator:
             )
             return False
 
+        # Keep trustworthy evidence from every provider query that did succeed.
+        # The gate still blocks model-authored conclusions until all required
+        # sources succeed, but one broken source must not hide deterministic
+        # evidence already returned by another source.
+        state.findings = _ground_partial_data_queries(
+            state.tool_calls, verification
+        )
         state.findings.append(
             Finding(
                 type=EvidenceType.UNKNOWN,
