@@ -155,7 +155,7 @@ def test_investigate_returns_context_error(investigator):
         return_value=IncidentContext("x", "x", error="db failed")
     )
     findings = investigator.investigate("x")
-    assert any(finding.type is EvidenceType.UNKNOWN for finding in findings)
+    assert findings[0].type is EvidenceType.UNKNOWN
     assert "db failed" in findings[0].content
 
 

@@ -309,11 +309,12 @@ def _prometheus_metric_candidates(
             "unit": str(item.get("unit") or ""),
         }
 
-    def score(item: dict[str, str]) -> tuple[int, int, int, float]:
+    def score(item: dict[str, str]) -> tuple[int, int, int, int, float]:
         name = item["name"]
         terms = _PROMETHEUS_TERM.findall(name.lower().replace("_", " "))
         weighted_overlap = sum(query_counts[term] for term in set(terms))
         bigram_overlap = len(query_bigrams.intersection(itertools.pairwise(terms)))
+        extra_terms = set(terms) - set(query_terms) - {"seconds", "total"}
         metadata_terms = set(
             _PROMETHEUS_TERM.findall(
                 f"{item['help']} {item['unit']}".lower().replace("_", " ")
@@ -323,7 +324,13 @@ def _prometheus_metric_candidates(
         if rate_like_intent and item["type"].lower() == "counter":
             weighted_overlap += 2
         similarity = SequenceMatcher(None, normalized_query, name.lower()).ratio()
-        return weighted_overlap, bigram_overlap, metadata_overlap, similarity
+        return (
+            weighted_overlap,
+            bigram_overlap,
+            metadata_overlap,
+            -len(extra_terms),
+            similarity,
+        )
 
     normalized = [normalize(item) for item in metric_catalog]
     candidates = {item["name"]: item for item in normalized if item is not None}
@@ -3263,9 +3270,9 @@ class PamawasInvestigator:
             return False
 
         # Keep trustworthy evidence from every provider query that did succeed.
-        # The gate still blocks model-authored conclusions until all required
-        # sources succeed, but one broken source must not hide deterministic
-        # evidence already returned by another source.
+        # A broken source must not hide deterministic evidence already returned
+        # by another source. Causal synthesis remains explicitly labeled and
+        # confidence-capped rather than being promoted to provider fact.
         state.findings = _ground_partial_data_queries(
             state.tool_calls, verification
         )
