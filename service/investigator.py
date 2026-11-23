@@ -1694,30 +1694,87 @@ class PamawasInvestigator:
         state: InvestigationState,
         function_name: str,
     ) -> None:
-        """After 2 repeated tool calls in verification, submit findings as-is.
+        """After 2 repeated tool calls in verification, synthesize findings from cached results.
 
-        The model had two chances to query the live metric; repeating further
-        adds no new information. Preserve whatever evidence was collected so far
-        and close the verification loop so the stale_verification worker can
-        record the verdict.
+        The model had two chances to query the live metric; repeating further adds no new
+        information. We must derive a verdict from the already-fetched data rather than
+        falling back to UNKNOWN and defaulting to "still_down".
         """
         logger.warning(
             "Verification for incident %s exceeded repeat budget on %s; "
-            "submitting gathered findings as final verdict",
+            "synthesizing findings from cached tool results",
             incident_id,
             function_name,
         )
-        # Build whatever findings exist (they were already tracked in state.findings).
-        # If nothing was captured, an UNKNOWN fallback will come from the outer loop.
+
+        # Look across all cached tool results for data we can use
+        prometheus_result = None
+        loki_result = None
+        for sig, cached in state.seen_calls.items():
+            if "query_prometheus" in sig and "up{s" in sig.lower():
+                try:
+                    parsed = json.loads(cached) if isinstance(cached, str) else cached
+                    if isinstance(parsed.get("data"), list) and parsed["data"]:
+                        prometheus_result = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if "query_loki" in sig:
+                try:
+                    parsed = json.loads(cached) if isinstance(cached, str) else cached
+                    if isinstance(parsed.get("data", {}).get("result"), list) and parsed["data"]["result"]:
+                        loki_result = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        # Build a finding from what we observed
+        if prometheus_result:
+            data_points = prometheus_result.get("data", [])
+            if isinstance(data_points, list):
+                values = [p.get("value", [None, None])[1] for p in data_points if isinstance(p.get("value"), list)]
+                if values:
+                    # Extract the last value
+                    last_val = values[-1]
+                    try:
+                        val = float(last_val) if last_val is not None else 0
+                        if val >= 1.0:
+                            finding_content = f"The target is up; up metric value is {val}"
+                        else:
+                            # For non-up values, state explicitly that it's down
+                            finding_content = f"The target is still down; up metric value is {val}"
+                        state.findings.append(
+                            Finding(
+                                type=EvidenceType.FACT,
+                                content=finding_content,
+                                source=EvidenceSource.PROMETHEUS,
+                                confidence=1.0,
+                            )
+                        )
+                    except (ValueError, TypeError):
+                        pass
+
+        if loki_result:
+            result_counts = loki_result.get("data", {}).get("result", [])
+            if result_counts:
+                state.findings.append(
+                    Finding(
+                        type=EvidenceType.FACT,
+                        content=f"Loki returned {len(result_counts)} log entries",
+                        source=EvidenceSource.LOKI,
+                        confidence=0.8,
+                    )
+                )
+
+        # Fallback if we still have no findings
         if not state.findings:
             state.findings.append(
                 Finding(
                     type=EvidenceType.UNKNOWN,
-                    content="No findings recorded before verification closed on repeat budget",
+                    content="Unable to determine target status from cached verification data",
                     source=EvidenceSource.SYSTEM,
                     confidence=0.0,
                 )
             )
+
         # Mark as completed so the loop terminates with a verdict.
         state.completed = True
         await self._persist_investigation(
