@@ -45,7 +45,7 @@ from models import (
     ToolResult,
 )
 from service.daily_summary import write_day_summary as _write_day_summary
-from service.evidence_summary import log_observations, metric_observations
+from service.evidence_summary import log_observations, metric_observations, numeric_points
 from service.persistence import InvestigationPersistence
 from service.query_recovery import QueryRecovery
 from tools import InvestigatorTools, ToolRegistry
@@ -270,22 +270,7 @@ def _prometheus_has_numeric_samples(result: Any) -> bool:
     if not isinstance(series, list):
         return False
 
-    for item in series:
-        if not isinstance(item, dict):
-            continue
-        points = item.get("values")
-        if not isinstance(points, list):
-            point = item.get("value")
-            points = [point] if isinstance(point, list) else []
-        for point in points:
-            if not isinstance(point, list) or len(point) < 2:
-                continue
-            try:
-                float(point[1])
-            except (TypeError, ValueError):
-                continue
-            return True
-    return False
+    return any(numeric_points(item) for item in series)
 
 
 def _prometheus_metric_candidates(
