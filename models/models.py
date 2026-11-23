@@ -152,6 +152,11 @@ class InvestigationState:
     # query. This bounds endpoints that ignore tool_choice or keep emitting
     # invalid calls.
     required_query_failures: int = 0
+    # Provider attempts are bounded per run; an exhausted provider must not
+    # prevent a write-up of evidence returned by the other provider.
+    exhausted_data_tools: set[str] = field(default_factory=set)
+    recovered_data_tools: set[str] = field(default_factory=set)
+    context: IncidentContext | None = None
     completed: bool = False
     # Results already produced in this run, keyed by (tool, arguments). A model
     # that asks the same question again is answered from here instead of paying

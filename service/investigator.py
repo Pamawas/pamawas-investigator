@@ -45,12 +45,14 @@ from models import (
     ToolResult,
 )
 from service.daily_summary import write_day_summary as _write_day_summary
+from service.evidence_summary import log_observations, metric_observations
 from service.persistence import InvestigationPersistence
+from service.query_recovery import QueryRecovery
 from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v12"
+PROMPT_VERSION = "pamawas-investigator-v13"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -259,6 +261,8 @@ def _prometheus_has_numeric_samples(result: Any) -> bool:
     """Return whether a Prometheus response contains usable numeric evidence."""
     if not isinstance(result, dict) or result.get("status") != "success":
         return False
+    if result.get("counter_only"):
+        return False
     data = result.get("data")
     if not isinstance(data, dict):
         return False
@@ -385,6 +389,14 @@ def _missing_required_data_tools(
         for tool_name in _required_data_tools(verification)
         if tool_name not in successful
     )
+
+
+def _pending_data_tools(state: InvestigationState, verification: bool) -> tuple[str, ...]:
+    """Return providers still owed an attempt before the report can be written."""
+    missing = _missing_required_data_tools(state.tool_calls, verification)
+    if verification:
+        return missing
+    return tuple(name for name in missing if name not in state.exhausted_data_tools)
 
 
 def _exhaustion_reason(
@@ -694,6 +706,9 @@ def _prometheus_query_finding(call: ToolResult) -> Finding:
             f"{_format_observed_number(min(latest_samples))} to "
             f"{_format_observed_number(max(latest_samples))}."
         )
+    observations = metric_observations(call.result, _format_query_timestamp)
+    if observations:
+        content = f"From {_query_window(call)}, {observations}"
     return Finding(
         type=EvidenceType.FACT,
         content=content,
@@ -730,7 +745,8 @@ def _loki_query_finding(call: ToolResult) -> Finding:
         type=EvidenceType.FACT,
         content=(
             f"From {_query_window(call)}, Loki returned {line_count} log entries "
-            f"across {len(streams)} result streams for the executed query."
+            f"across {len(streams)} result streams. "
+            + log_observations(streams, _format_query_timestamp)
         ),
         source=EvidenceSource.LOKI,
         source_detail=detail,
@@ -755,7 +771,16 @@ def _normalized_causal_synthesis(
     findings: list[Finding], tool_calls: list[ToolResult]
 ) -> Finding | None:
     """Keep one model causal verdict, clearly labeled and tied to real queries."""
-    candidates = [finding for finding in findings if finding.type in _CAUSAL_FINDING_TYPES]
+    executed_queries = [
+        str(call.arguments.get(argument) or "")
+        for name, argument in (("query_prometheus", "promql"), ("query_loki", "logql"))
+        for call in _successful_tool_calls(tool_calls, name)
+    ]
+    candidates = [
+        finding for finding in findings
+        if finding.type in _CAUSAL_FINDING_TYPES
+        and any(query and query in finding.source_detail for query in executed_queries)
+    ]
     if not candidates:
         return None
     best = max(
@@ -787,69 +812,51 @@ def _has_causal_verdict(findings: list[Finding]) -> bool:
     return False
 
 
-def _loki_fallback_hypothesis(tool_calls: list[ToolResult]) -> Finding | None:
-    """Create a cautious hypothesis from the busiest returned Loki stream."""
-    for call in reversed(_successful_tool_calls(tool_calls, "query_loki")):
-        data = call.result.get("data")
-        streams = data.get("result") if isinstance(data, dict) else None
-        if not isinstance(streams, list):
-            continue
-        usable = [
-            stream
-            for stream in streams
-            if isinstance(stream, dict)
-            and isinstance(stream.get("values"), list)
-            and stream["values"]
-        ]
-        if not usable:
-            continue
-        busiest = max(usable, key=lambda stream: len(stream["values"]))
-        stream_labels = busiest.get("stream")
-        rendered_stream = json.dumps(
-            stream_labels if isinstance(stream_labels, dict) else {},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        line_count = len(busiest["values"])
-        return Finding(
-            type=EvidenceType.HYPOTHESIS,
-            content=(
-                f"Activity in Loki stream {rendered_stream} is a possible contributor: "
-                f"the stream produced {line_count} matching entries during the incident "
-                "window. This is a low-confidence hypothesis because temporal overlap "
-                "alone does not establish causation."
-            ),
-            source=EvidenceSource.LLM,
-            source_detail=f"synthesis from {_query_source_detail(call, 'logql')}",
-            confidence=0.4,
-        )
-    return None
-
-
 def _ensure_causal_verdict(
     findings: list[Finding], tool_calls: list[ToolResult]
 ) -> list[Finding]:
     """Guarantee one explicit causal verdict without fabricating a confirmed cause."""
     if _has_causal_verdict(findings):
         return findings
-    if not any(
-        _successful_tool_calls(tool_calls, tool_name)
-        for tool_name in _FULL_INVESTIGATION_DATA_TOOLS
-    ):
-        return findings
-    fallback = _loki_fallback_hypothesis(tool_calls)
-    if fallback is None:
-        fallback = Finding(
-            type=EvidenceType.UNKNOWN,
-            content=(
-                "The successful data queries did not establish a root cause for this "
-                "incident."
-            ),
-            source=EvidenceSource.SYSTEM,
-            source_detail="causal-verdict enforcement",
-            confidence=0.0,
-        )
+    fallback = Finding(
+        type=EvidenceType.UNKNOWN,
+        content=(
+            "Root cause is unconfirmed. The retrieved observations do not identify "
+            "the responsible workload or demonstrate a causal mechanism."
+        ),
+        source=EvidenceSource.SYSTEM,
+        source_detail="causal-verdict enforcement",
+        confidence=0.0,
+    )
     return [*findings, fallback]
+
+
+def _ensure_actions(
+    findings: list[Finding], tool_calls: list[ToolResult]
+) -> list[Finding]:
+    """Keep operator actions available even when the model or a provider fails."""
+    if any(finding.type == EvidenceType.RECOMMENDATION for finding in findings):
+        return findings
+    telemetry = next((finding for finding in findings if finding.type == EvidenceType.FACT), None)
+    scope = telemetry.source_detail if telemetry else "the incident target and historical window"
+    action = Finding(
+        type=EvidenceType.RECOMMENDATION,
+        content=(
+            "Identify the workloads with the largest change in process/resource usage during "
+            "the queried incident window, and correlate them with the returned error or restart "
+            "events to determine the responsible operation."
+        ),
+        source=EvidenceSource.SYSTEM,
+        source_detail=scope,
+        confidence=1.0,
+    )
+    if not _successful_tool_calls(tool_calls, "query_loki"):
+        action = replace(action, content=(
+            "Check log ingestion and target-to-stream label mapping for the incident window; "
+            "then compare process/resource telemetry for the affected workloads with "
+            "the metric series that changed most."
+        ))
+    return [*findings, action]
 
 
 def _ensure_causal_verdict_for_mode(
@@ -858,7 +865,7 @@ def _ensure_causal_verdict_for_mode(
     """Apply causal-verdict enforcement only to full investigations."""
     if verification:
         return findings
-    return _ensure_causal_verdict(findings, tool_calls)
+    return _ensure_actions(_ensure_causal_verdict(findings, tool_calls), tool_calls)
 
 
 def _ground_findings_in_data_queries(
@@ -874,12 +881,18 @@ def _ground_findings_in_data_queries(
     kept = [
         finding
         for finding in findings
-        if finding.source not in (EvidenceSource.PROMETHEUS, EvidenceSource.LOKI)
+        if (finding.type == EvidenceType.RECOMMENDATION
+            or finding.source not in (EvidenceSource.PROMETHEUS, EvidenceSource.LOKI))
         and finding.type not in _CAUSAL_FINDING_TYPES
     ]
     causal_synthesis = _normalized_causal_synthesis(findings, tool_calls)
     grounded: list[Finding] = []
     prometheus_calls = _successful_tool_calls(tool_calls, "query_prometheus")
+    executed = {str(call.arguments.get("promql", "")) for call in prometheus_calls}
+    prometheus_calls = [
+        call for call in prometheus_calls
+        if f"rate({call.arguments.get('promql', '')}[5m])" not in executed
+    ]
     loki_calls = _successful_tool_calls(tool_calls, "query_loki")
     grounded.extend(
         _prometheus_query_finding(call)
@@ -1810,10 +1823,10 @@ class PamawasInvestigator:
             "If the Loki selector schema is unknown, call get_loki_labels once. Then request "
             "values for one promising returned label and immediately run the data query. Never "
             "repeat catalogs and never treat catalog output as evidence.\n"
-            "- A full investigation MUST execute at least one successful query_prometheus and "
-            "one successful query_loki call before submission. Catalog and label-discovery calls "
-            "do not satisfy this requirement. The harness enforces this rule and rejects early "
-            "submissions.\n"
+            "- A full investigation MUST attempt both query_prometheus and query_loki. "
+            "Successful telemetry queries supply evidence; bounded provider failures supply "
+            "source gaps. Catalog and label discovery never supply incident facts. "
+            "The harness enforces real data queries and bounded retries.\n"
             "- Prometheus HTTP success with zero numeric series is not evidence and does not "
             "satisfy the gate. When the harness returns metric_candidates, retry with an exact "
             "returned metric name and an evidence-appropriate PromQL transformation.\n"
@@ -1822,7 +1835,8 @@ class PamawasInvestigator:
             "fails, retry using the labels and values returned by the harness.\n"
             "- If a data query fails, correct it using only discovered schema and make a bounded, "
             "materially different attempt. If a source remains unavailable, do not fabricate "
-            "evidence; the harness will terminate with an honest UNKNOWN.\n"
+            "evidence; the harness will preserve successful observations and request a "
+            "partial write-up with the source gap reported as UNKNOWN.\n"
             "- Do not stop after validating the alert metric. Metrics describe what changed; "
             "logs may explain why. Conversely, a log line without matching telemetry does not "
             "prove it caused the incident.\n\n"
@@ -1871,13 +1885,16 @@ class PamawasInvestigator:
             "FACT. Never claim a source was not checked after its result is already present.\n\n"
             "SUBMISSION:\n"
             "- Use submit_findings; prose alone does not complete the investigation.\n"
-            "- submit_findings is accepted only after successful Prometheus and Loki data "
-            "queries. Do not submit after catalog discovery alone.\n"
+            "- Submit after both providers have returned data or exhausted bounded attempts. "
+            "A cause can be supported by one provider; evaluate the evidence and mechanism, "
+            "not the count of successful providers. Do not submit after catalog discovery alone.\n"
             "- Every full investigation MUST contain exactly one causal verdict: LIKELY_CAUSE "
             "when the mechanism is strongly supported, HYPOTHESIS when it is plausible but "
             "unconfirmed, or UNKNOWN explicitly stating that the root cause was not established. "
             "A recommendation without a causal verdict is incomplete. Use source=llm for a "
-            "causal synthesis across provider results.\n"
+            "causal synthesis and cite the exact executed query in source_detail. Explain "
+            "the observed metric change or specific log event that supports the mechanism. "
+            "A log count, warning level, or temporal overlap alone is insufficient.\n"
             "- Report only substantive findings: the key observed facts, that one causal "
             "verdict, important unknowns, and at least one specific recommendation.\n"
             "- Never submit a FACT whose only content is that this incident exists, fired, "
@@ -1965,6 +1982,7 @@ class PamawasInvestigator:
                 f"Title: {context.title}\n"
                 f"Status: {context.status}\n"
                 f"Started at: {context.started_at}\n"
+                f"Resolved at: {context.resolved_at or 'not resolved'}\n"
                 f"Severity: {context.severity}\n"
                 f"Affected services: {', '.join(context.affected_services or [])}\n\n"
                 f"Events in this incident:\n"
@@ -2591,11 +2609,12 @@ class PamawasInvestigator:
     ):
         """Handle submit_findings tool call."""
         logger.info("Investigation completed via submit_findings")
+        findings = [*findings, *state.findings]
         findings = [_sanitize_finding(f) for f in findings]
         findings = _drop_trigger_restatements(findings, incident_id)
         if not verification:
             findings = _ground_findings_in_data_queries(findings, state.tool_calls)
-            findings = _ensure_causal_verdict(findings, state.tool_calls)
+            findings = _ensure_causal_verdict_for_mode(findings, state.tool_calls, verification)
         state.findings = findings
         state.completed = True
 
@@ -2852,7 +2871,7 @@ class PamawasInvestigator:
         verification: bool = False,
     ) -> bool:
         """Activate the hard data-query gate when required sources are missing."""
-        missing = _missing_required_data_tools(state.tool_calls, verification)
+        missing = _pending_data_tools(state, verification)
         if not missing:
             return False
 
@@ -3033,6 +3052,7 @@ class PamawasInvestigator:
         verification: bool = False,
     ) -> list[Finding]:
         """Run the bounded investigation tool-calling loop and persist final findings."""
+        state.context = context
         # Build system prompt and initial message
         system_prompt = (
             self._build_verification_prompt(context)
@@ -3081,9 +3101,7 @@ class PamawasInvestigator:
                 messages=messages,
                 verification=verification,
             )
-            missing_required = _missing_required_data_tools(
-                state.tool_calls, verification
-            )
+            missing_required = _pending_data_tools(state, verification)
             if force_submit and missing_required and time.monotonic() >= explore_deadline:
                 exhausted_by = "required_data"
                 logger.warning(
@@ -3133,6 +3151,12 @@ class PamawasInvestigator:
                         source=EvidenceSource.SYSTEM,
                         confidence=0.0,
                     )
+                )
+                state.findings = _ground_partial_data_queries(
+                    state.tool_calls, verification
+                ) + state.findings
+                state.findings = _ensure_causal_verdict_for_mode(
+                    state.findings, state.tool_calls, verification
                 )
                 await self._persist_investigation(
                     incident_id=incident_id,
@@ -3221,7 +3245,7 @@ class PamawasInvestigator:
         verification: bool,
     ) -> bool:
         """Reject submit_findings until required data-query tools have succeeded."""
-        missing = _missing_required_data_tools(state.tool_calls, verification)
+        missing = _pending_data_tools(state, verification)
         if not missing:
             return False
 
@@ -3248,7 +3272,7 @@ class PamawasInvestigator:
         verification: bool,
     ) -> bool:
         """Bound forced-query failures; return True when the run must terminate."""
-        missing = _missing_required_data_tools(state.tool_calls, verification)
+        missing = _pending_data_tools(state, verification)
         if not missing:
             state.required_query_enforcement = False
             state.required_query_failures = 0
@@ -3267,6 +3291,28 @@ class PamawasInvestigator:
                     ),
                 }
             )
+            return False
+
+        if not verification and any(
+            _successful_tool_calls(state.tool_calls, name)
+            for name in _FULL_INVESTIGATION_DATA_TOOLS
+        ):
+            state.exhausted_data_tools.update(missing)
+            state.required_query_enforcement = False
+            state.findings.append(
+                Finding(
+                    type=EvidenceType.UNKNOWN,
+                    content=f"No usable data from {', '.join(missing)} after bounded attempts.",
+                    source=EvidenceSource.SYSTEM,
+                    source_detail="required data-query enforcement",
+                    confidence=0.0,
+                )
+            )
+            messages.append({"role": "user", "content": (
+                "Provider retries are exhausted. Submit a cause assessment and suggested "
+                "actions from the successful query evidence now. Include the source gap "
+                "as UNKNOWN. One provider can support a cause; two are not mandatory."
+            )})
             return False
 
         # Keep trustworthy evidence from every provider query that did succeed.
@@ -3294,6 +3340,54 @@ class PamawasInvestigator:
         state.completed = True
         return True
 
+    async def _recover_data_query(
+        self, name: str, arguments: dict, result: dict,
+        state: InvestigationState, messages: list[dict],
+        explore_deadline: float | None, verification: bool,
+    ) -> None:
+        """Run one bounded recovery pass per provider before asking the model to retry."""
+        if (
+            verification or name not in _FULL_INVESTIGATION_DATA_TOOLS
+            or name in state.recovered_data_tools or state.context is None
+            or not state.context.started_at
+        ):
+            return
+        if name == "query_loki" and result.get("status") == "success":
+            return
+        remaining = 60.0 if explore_deadline is None else explore_deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        state.recovered_data_tools.add(name)
+        recovery = QueryRecovery(self.tools, state.context, self.config.loki_max_log_lines)
+        try:
+            async with asyncio.timeout(min(60.0, remaining)):
+                if name == "query_loki":
+                    await recovery.recover_loki()
+                elif result.get("status") == "success":
+                    await recovery.counter_rate(arguments)
+                else:
+                    candidates = result.get("metric_candidates", [])
+                    await recovery.recover_prometheus(candidates)
+        except (AttributeError, TimeoutError, ValueError) as exc:
+            logger.warning("Bounded %s query recovery ended: %s", name, exc)
+        if recovery.counter_metric:
+            result["counter_only"] = True
+            state.seen_calls[self._call_signature(name, arguments)] = self._truncate_result(result)
+        for call in recovery.calls:
+            state.tool_calls.append(call)
+            state.tool_call_count += 1
+            state.seen_calls[self._call_signature(call.tool_name, call.arguments)] = (
+                self._truncate_result(call.result)
+            )
+            logger.info("Harness recovery tool %s with args %s", call.tool_name, call.arguments)
+        if recovery.calls:
+            summaries = _ground_findings_in_data_queries([], recovery.calls)
+            messages.append({"role": "user", "content": (
+                "The harness executed schema-discovered recovery queries. Use these "
+                "observations and exact queries for the cause assessment and suggested actions:\n"
+                + json.dumps([finding.to_dict() for finding in summaries])
+            )})
+
     async def _handle_investigation_turn(  # noqa: C901
         self,
         incident_id: str,
@@ -3308,7 +3402,8 @@ class PamawasInvestigator:
         """Run a single investigation turn (LLM call + tool handling);
         returns findings if complete."""
         is_final_turn = state.turn_count >= state.max_tool_calls
-        missing_required = _missing_required_data_tools(state.tool_calls, verification)
+        missing_required = _pending_data_tools(state, verification)
+        force_submit = force_submit or bool(state.exhausted_data_tools)
         can_start_data_query = (
             explore_deadline is None or time.monotonic() < explore_deadline
         )
@@ -3467,9 +3562,7 @@ class PamawasInvestigator:
                 )
                 if repeated:
                     required_data_tool = _DISCOVERY_TO_DATA_TOOL.get(function_name)
-                    if required_data_tool in _missing_required_data_tools(
-                        state.tool_calls, verification
-                    ):
+                    if required_data_tool in _pending_data_tools(state, verification):
                         state.required_query_enforcement = True
                     # Verification is a single "is the target still down?"
                     # question. A repeated query returns the same data, adds
@@ -3518,10 +3611,13 @@ class PamawasInvestigator:
                 self._handle_tool_result(
                     tool_call, function_name, function_args, result, tool_start, state, messages
                 )
+                await self._recover_data_query(
+                    function_name, function_args, result, state, messages,
+                    explore_deadline, verification,
+                )
                 if (
                     function_name == forced_required_query
-                    and isinstance(result, dict)
-                    and result.get("status") == "success"
+                    and function_name not in _pending_data_tools(state, verification)
                 ):
                     forced_required_query_succeeded = True
 
@@ -3544,9 +3640,7 @@ class PamawasInvestigator:
             if forced_required_query is not None:
                 if forced_required_query_succeeded:
                     state.required_query_failures = 0
-                    still_missing = _missing_required_data_tools(
-                        state.tool_calls, verification
-                    )
+                    still_missing = _pending_data_tools(state, verification)
                     state.required_query_enforcement = bool(still_missing)
                     if still_missing:
                         messages.append(
@@ -3609,6 +3703,11 @@ class PamawasInvestigator:
             return None
         self._handle_text_response(response, state, must_submit, messages)
         if state.completed:
+            if not verification:
+                state.findings = _ground_findings_in_data_queries(state.findings, state.tool_calls)
+            state.findings = _ensure_causal_verdict_for_mode(
+                state.findings, state.tool_calls, verification
+            )
             increment_findings_by_type(state.findings)
             await self._persist_investigation(
                 incident_id=incident_id,

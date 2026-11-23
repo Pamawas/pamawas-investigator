@@ -427,7 +427,7 @@ def test_investigate_final_text_without_data_becomes_unknown(investigator):
         return_value=response("Possible resource exhaustion")
     )
     findings = investigator.investigate("inc")
-    assert findings == [pytest.approx(findings[0])]
+    assert any(finding.type is EvidenceType.RECOMMENDATION for finding in findings)
     assert findings[0].type is EvidenceType.UNKNOWN
     assert findings[0].confidence == 0.0
     assert "without calling any tools" in findings[0].content
@@ -454,7 +454,7 @@ def test_investigate_handles_large_tool_result_without_invalid_json(investigator
     findings = investigator.investigate("inc")
     assert findings[0].source is EvidenceSource.PROMETHEUS
     assert findings[0].type is EvidenceType.FACT
-    assert findings[-1].type is EvidenceType.UNKNOWN
+    assert any(finding.type is EvidenceType.UNKNOWN for finding in findings)
     assert any("turn budget" in finding.content for finding in findings)
 
 
@@ -536,17 +536,13 @@ def test_required_query_failure_preserves_successful_provider_evidence(investiga
         assert not investigator._record_required_query_failure(
             state, messages, verification=False
         )
-    assert investigator._record_required_query_failure(
+    assert not investigator._record_required_query_failure(
         state, messages, verification=False
     )
-
-    assert [finding.source for finding in state.findings] == [
-        EvidenceSource.PROMETHEUS,
-        EvidenceSource.SYSTEM,
-    ]
-    assert state.findings[0].type is EvidenceType.FACT
-    assert "observed range was 70 to 85" in state.findings[0].content
-    assert "query_loki" in state.findings[1].content
+    assert not state.completed
+    assert state.exhausted_data_tools == {"query_loki"}
+    assert "Submit a cause assessment" in messages[-1]["content"]
+    assert "query_loki" in state.findings[0].content
 
 
 def test_text_patience_escalates_only_at_the_limit(investigator):
@@ -1120,8 +1116,8 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "call get_loki_labels once" in prompt
     assert "Metrics describe what changed; logs may explain why" in prompt
     assert "never treat catalog output as evidence" in prompt
-    assert "MUST execute at least one successful query_prometheus" in prompt
-    assert "The harness enforces this rule and rejects early submissions" in prompt
+    assert "MUST attempt both query_prometheus and query_loki" in prompt
+    assert "A cause can be supported by one provider" in prompt
     assert "zero numeric series is not evidence" in prompt
     assert "zero-entry Loki result is accepted only after" in prompt
     assert "MUST contain exactly one causal verdict" in prompt
@@ -1339,8 +1335,8 @@ def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
     assert grounded[2].type is EvidenceType.RECOMMENDATION
 
 
-def test_missing_model_cause_gets_cautious_schema_neutral_loki_hypothesis():
-    """A weak model cannot finish with only facts and a recommendation."""
+def test_log_count_alone_does_not_get_promoted_to_a_cause():
+    """Matching logs alone do not establish a plausible causal mechanism."""
     from service.investigator import _ensure_causal_verdict
 
     tool_calls = [
@@ -1379,11 +1375,9 @@ def test_missing_model_cause_gets_cautious_schema_neutral_loki_hypothesis():
 
     completed = _ensure_causal_verdict(findings, tool_calls)
 
-    assert completed[-1].type is EvidenceType.HYPOTHESIS
-    assert completed[-1].source is EvidenceSource.LLM
-    assert completed[-1].confidence == 0.4
-    assert '"vendor_component":"network-agent"' in completed[-1].content
-    assert "temporal overlap alone does not establish causation" in completed[-1].content
+    assert completed[-1].type is EvidenceType.UNKNOWN
+    assert completed[-1].confidence == 0.0
+    assert "causal mechanism" in completed[-1].content
 
 
 def test_model_causal_verdict_is_preserved_as_capped_synthesis():
@@ -1407,7 +1401,7 @@ def test_model_causal_verdict_is_preserved_as_capped_synthesis():
             type=EvidenceType.HYPOTHESIS,
             content="A restart may have caused the transient condition.",
             source=EvidenceSource.LOKI,
-            source_detail="invented selector",
+            source_detail='query_loki: {scope="target"} [s to e]',
             confidence=0.95,
         )
     ]
