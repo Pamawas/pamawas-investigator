@@ -48,6 +48,7 @@ from models import (
 )
 from service.daily_summary import write_day_summary as _write_day_summary
 from service.evidence_summary import (
+    alert_observation,
     log_observations,
     metric_observations,
     numeric_points,
@@ -59,7 +60,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v17"
+PROMPT_VERSION = "pamawas-investigator-v18"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -76,6 +77,10 @@ _LOGQL_MATCHER = re.compile(
 _PROMETHEUS_TERM = re.compile(r"[a-z0-9]+")
 _RATE_LIKE_TERMS = {"load", "percent", "ratio", "rate", "usage", "utilization"}
 _CAUSAL_FINDING_TYPES = (EvidenceType.LIKELY_CAUSE, EvidenceType.HYPOTHESIS)
+_PROCESS_ONLY_UNKNOWN_PREFIXES = (
+    "Investigation ended without a stated conclusion",
+    "Investigation ended without a substantive conclusion",
+)
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
@@ -292,6 +297,7 @@ def _prometheus_metric_candidates(
     query_bigrams = set(itertools.pairwise(query_terms))
     normalized_query = "_".join(query_terms)
     rate_like_intent = bool(set(query_terms).intersection(_RATE_LIKE_TERMS))
+    percent_intent = bool({"percent", "percentage", "utilization"}.intersection(query_terms))
 
     def normalize(item: Any) -> dict[str, str] | None:
         if isinstance(item, str) and item.strip():
@@ -305,7 +311,7 @@ def _prometheus_metric_candidates(
             "unit": str(item.get("unit") or ""),
         }
 
-    def score(item: dict[str, str]) -> tuple[int, int, int, int, float]:
+    def score(item: dict[str, str]) -> tuple[int, int, int, int, int, float]:
         name = item["name"]
         terms = _PROMETHEUS_TERM.findall(name.lower().replace("_", " "))
         weighted_overlap = sum(query_counts[term] for term in set(terms))
@@ -317,10 +323,22 @@ def _prometheus_metric_candidates(
             )
         )
         metadata_overlap = sum(query_counts[term] for term in metadata_terms)
-        if rate_like_intent and item["type"].lower() == "counter":
+        if (
+            rate_like_intent
+            and not percent_intent
+            and item["type"].lower() == "counter"
+        ):
             weighted_overlap += 2
+        semantic_match = 0
+        if percent_intent:
+            if (
+                item["unit"].lower() in {"percent", "percentage", "%"}
+                and weighted_overlap > 0
+            ):
+                semantic_match = 3
         similarity = SequenceMatcher(None, normalized_query, name.lower()).ratio()
         return (
+            semantic_match,
             weighted_overlap,
             bigram_overlap,
             metadata_overlap,
@@ -335,7 +353,10 @@ def _prometheus_metric_candidates(
         key=lambda item: (score(item), item["name"]),
         reverse=True,
     )
-    relevant = [item for item in ranked if score(item)[0] > 0]
+    relevant = [
+        item for item in ranked
+        if score(item)[0] > 0 or score(item)[1] > 0
+    ]
     return (relevant or ranked)[:limit]
 
 
@@ -893,32 +914,18 @@ def _drop_provider_contradictions(findings: list[Finding]) -> list[Finding]:
 
 
 def _fact_is_relevant_to_incident(finding: Finding, context: IncidentContext | None) -> bool:
-    """Conservatively decide whether a fact can support a causal hypothesis."""
-    if finding.type != EvidenceType.FACT:
-        return False
-    if context is None:
-        return True
-    title = context.title.lower()
-    detail = (finding.source_detail or "").lower()
-    content = finding.content.lower()
-    if "cpu" in title:
-        return "cpu" in detail or "cpu" in content or "load" in detail
-    if any(token in title for token in ("ceph", "osd", "latency")):
-        return any(token in detail or token in content for token in ("ceph", "osd", "latency"))
-    if "datasource" in title:
-        return any(
-            token in detail or token in content
-            for token in ("datasource", "grafana", "sqlite", "database", "error")
-        )
-    if any(token in title for token in ("down", "unreachable")):
-        return any(token in detail or token in content for token in ("up", "probe", "reach"))
-    return True
+    """Direct current-incident telemetry can support a bounded hypothesis."""
+    return finding.type == EvidenceType.FACT and finding.source in {
+        EvidenceSource.ALERT,
+        EvidenceSource.PROMETHEUS,
+        EvidenceSource.LOKI,
+    }
 
 
 def _fallback_causal_finding(
     findings: list[Finding], tool_calls: list[ToolResult], context: IncidentContext | None
 ) -> Finding:
-    """Create an honest hypothesis when telemetry supports one, otherwise UNKNOWN."""
+    """Return honest uncertainty when no submitted finding names a mechanism."""
     facts = [
         finding for finding in findings
         if _fact_is_relevant_to_incident(finding, context)
@@ -935,30 +942,19 @@ def _fallback_causal_finding(
             confidence=0.0,
         )
 
-    title = (context.title if context else "the incident").lower()
-    if any(token in title for token in ("ceph", "osd", "latency")):
-        mechanism = "storage-path contention or Ceph recovery/backfill activity"
-    elif "cpu" in title:
-        mechanism = "a short-lived workload or I/O burst"
-    elif "datasource" in title:
-        mechanism = "Grafana datasource or database lock contention"
-    elif any(token in title for token in ("down", "unreachable")):
-        mechanism = "a transient target or dependency availability failure"
-    else:
-        mechanism = "a transient resource-contention or dependency event"
-
-    provider_count = len({finding.source for finding in facts})
-    observation = facts[0].content.strip().rstrip(".")
+    observations = " ".join(
+        finding.content.strip().rstrip(".") for finding in facts[:2]
+    )
     return Finding(
-        type=EvidenceType.HYPOTHESIS,
+        type=EvidenceType.UNKNOWN,
         content=(
-            f"The leading hypothesis is {mechanism}. This is supported by the observed "
-            f"pattern: {observation}. The mechanism remains unconfirmed until process, "
-            "device, or dependency telemetry is compared over the same window."
+            "Root cause was not established. The run confirmed these observations: "
+            f"{observations}. None of the retrieved signals demonstrated which component "
+            "initiated the condition."
         ),
-        source=EvidenceSource.LLM,
-        source_detail=f"synthesis from {_causal_query_details(tool_calls)}",
-        confidence=0.45 if provider_count > 1 else 0.35,
+        source=EvidenceSource.SYSTEM,
+        source_detail="causal-verdict enforcement",
+        confidence=0.0,
     )
 
 
@@ -988,17 +984,10 @@ def _ensure_causal_verdict(
                 confidence=min(selected.confidence, 0.55),
             )
     else:
-        fallback = _fallback_causal_finding(findings, tool_calls, context)
-        # A model may answer UNKNOWN merely because one optional provider was
-        # unavailable. When another provider returned an incident-relevant
-        # observation, retain that source gap but prefer the bounded,
-        # confidence-capped hypothesis supported by the available evidence.
-        if fallback.type == EvidenceType.HYPOTHESIS:
-            selected = fallback
-        elif causal_unknowns:
-            selected = causal_unknowns[0]
-        else:
-            selected = fallback
+        # Provider gaps do not decide the causal verdict. If no submitted
+        # hypothesis names an evidence-backed mechanism, the harness records
+        # one honest root-cause UNKNOWN from the complete fact set.
+        selected = _fallback_causal_finding(findings, tool_calls, context)
 
     remaining = [
         finding for finding in findings
@@ -1007,96 +996,36 @@ def _ensure_causal_verdict(
     return [*remaining, selected]
 
 
-def _fallback_hypothesis_action(
-    hypothesis: Finding, context: IncidentContext | None
-) -> Finding:
-    """Create one concrete test tied to a deterministic fallback hypothesis."""
-    title = (context.title if context else "").lower()
-    targets = ", ".join((context.affected_services or [])[:2]) if context else ""
-    target = targets or "the affected target"
-    if any(token in title for token in ("ceph", "osd", "latency")):
-        content = (
-            f"For {target}, compare device I/O latency and queue depth with Ceph "
-            "recovery/backfill and slow-op metrics over the same window as the recorded "
-            "OSD latency spike. If they rise together, reduce recovery pressure or isolate "
-            "the affected disk/network path, then verify latency returns to baseline."
-        )
-    elif "cpu" in title:
-        content = (
-            f"For {target}, compare per-process CPU, load, I/O wait, and workload events over "
-            "the same window as the CPU spike. Identify the process whose increase aligns "
-            "with the metric, mitigate that workload, and verify CPU returns to baseline."
-        )
-    elif "datasource" in title:
-        content = (
-            f"For {target}, compare datasource request latency/errors with database locks, "
-            "connection saturation, and restarts over the same window. Test the component "
-            "whose timeline aligns with the observed failure before changing configuration."
-        )
-    elif any(token in title for token in ("down", "unreachable")):
-        content = (
-            f"For {target}, compare probe failures with target, network, and dependency "
-            "availability over the same window. Test the first component whose state change "
-            "aligns with the outage, then verify the probe remains healthy."
-        )
-    else:
-        content = (
-            f"For {target}, collect one materially distinct resource or dependency signal over "
-            "the same window and test whether it changes with the recorded symptom before "
-            "promoting the hypothesis to a likely cause."
-        )
-    return Finding(
-        type=EvidenceType.RECOMMENDATION,
-        content=content,
-        source=EvidenceSource.SYSTEM,
-        source_detail=hypothesis.source_detail,
-        confidence=1.0,
-    )
-
-
 def _ensure_actions(
     findings: list[Finding], tool_calls: list[ToolResult],
     context: IncidentContext | None = None,
 ) -> list[Finding]:
     """Keep operator actions available even when the model or a provider fails."""
-    fallback_hypothesis = next(
-        (
-            finding for finding in findings
-            if finding.type == EvidenceType.HYPOTHESIS
-            and finding.content.startswith("The leading hypothesis is ")
-        ),
-        None,
-    )
-    if fallback_hypothesis is not None:
-        without_actions = [
-            finding for finding in findings
-            if finding.type != EvidenceType.RECOMMENDATION
-        ]
-        return [
-            *without_actions,
-            _fallback_hypothesis_action(fallback_hypothesis, context),
-        ]
     if any(finding.type == EvidenceType.RECOMMENDATION for finding in findings):
         return findings
-    telemetry = next((finding for finding in findings if finding.type == EvidenceType.FACT), None)
-    scope = telemetry.source_detail if telemetry else "the incident target and historical window"
+    facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
+    scope = "; ".join(
+        dict.fromkeys(finding.source_detail for finding in facts if finding.source_detail)
+    ) or "the incident target and historical window"
+    if facts:
+        content = (
+            "Align the primary alert measurement with each collected related signal over the "
+            "same window. Identify which signal consistently begins first or changes with the "
+            "symptom, inspect the component that owns that signal, and verify the primary "
+            "measurement after mitigation."
+        )
+    else:
+        content = (
+            "Collect one target-scoped primary measurement and at least one distinct resource, "
+            "dependency, or event signal over the same window before changing the system."
+        )
     action = Finding(
         type=EvidenceType.RECOMMENDATION,
-        content=(
-            "Identify the workloads with the largest change in process/resource usage during "
-            "the queried incident window, and correlate them with the returned error or restart "
-            "events to determine the responsible operation."
-        ),
+        content=content,
         source=EvidenceSource.SYSTEM,
         source_detail=scope,
         confidence=1.0,
     )
-    if not _successful_tool_calls(tool_calls, "query_loki"):
-        action = replace(action, content=(
-            "Check log ingestion and target-to-stream label mapping for the incident window; "
-            "then compare process/resource telemetry for the affected workloads with "
-            "the metric series that changed most."
-        ))
     return [*findings, action]
 
 
@@ -1112,6 +1041,21 @@ def _ensure_causal_verdict_for_mode(
         tool_calls,
         context,
     )
+
+
+def _drop_superseded_process_unknowns(findings: list[Finding]) -> list[Finding]:
+    """Remove model-process gaps once finalization produced a causal verdict."""
+    if not _has_causal_verdict(findings):
+        return findings
+    return [
+        finding
+        for finding in findings
+        if not (
+            finding.type == EvidenceType.UNKNOWN
+            and finding.source == EvidenceSource.SYSTEM
+            and finding.content.startswith(_PROCESS_ONLY_UNKNOWN_PREFIXES)
+        )
+    ]
 
 
 def _order_and_link_findings(findings: list[Finding]) -> list[Finding]:
@@ -1158,6 +1102,7 @@ def _finalize_findings(
     finalized = _ensure_causal_verdict_for_mode(
         finalized, tool_calls, verification, context
     )
+    finalized = _drop_superseded_process_unknowns(finalized)
     finalized = _deduplicate_findings(finalized)
     return _order_and_link_findings(finalized) if not verification else finalized
 
@@ -1181,7 +1126,23 @@ def _ground_findings_in_data_queries(
     ]
     causal_synthesis = _normalized_causal_synthesis(findings, tool_calls)
     grounded: list[Finding] = []
+    alert_content, alert_detail = alert_observation(context, _format_query_timestamp)
+    if alert_content:
+        grounded.append(
+            Finding(
+                type=EvidenceType.FACT,
+                content=alert_content,
+                source=EvidenceSource.ALERT,
+                source_detail=alert_detail,
+                confidence=1.0,
+            )
+        )
     prometheus_calls = _successful_tool_calls(tool_calls, "query_prometheus")
+    if alert_content:
+        prometheus_calls = [
+            call for call in prometheus_calls
+            if call.result.get("signal_role") != "recovered_primary"
+        ]
     executed = {str(call.arguments.get("promql", "")) for call in prometheus_calls}
     prometheus_calls = [
         call for call in prometheus_calls
@@ -2183,6 +2144,12 @@ class PamawasInvestigator:
             "- Prometheus HTTP success with zero numeric series is not evidence and does not "
             "satisfy the gate. When the harness returns metric_candidates, retry with an exact "
             "returned metric name and an evidence-appropriate PromQL transformation.\n"
+            "- Preserve measurement semantics and units for every alert type. Report a "
+            "percentage only when the alert/provider supplies one or the executed query has "
+            "an explicit evidence-backed denominator. Transform counters with rate/increase "
+            "and label the derived unit honestly (for example bytes per second, requests per "
+            "second, or operations per second); never relabel an arbitrary counter rate "
+            "as percent.\n"
             "- A zero-entry Loki result is accepted only after the harness validates every "
             "selector label and positive value against Loki's discovered schema. If validation "
             "fails, retry using the labels and values returned by the harness.\n"
@@ -3964,6 +3931,9 @@ class PamawasInvestigator:
                     await recovery.recover_loki()
                 elif result.get("status") == "success":
                     await recovery.counter_rate(arguments)
+                    await recovery.recover_related_prometheus(
+                        primary_expression=str(arguments.get("promql") or "")
+                    )
                 else:
                     candidates = result.get("metric_candidates", [])
                     await recovery.recover_prometheus(candidates)

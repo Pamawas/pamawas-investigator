@@ -16,8 +16,12 @@ _METRIC_NAME = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{")
 _PROMQL_MATCHER = re.compile(
     r'([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|=~)\s*"((?:\\.|[^"\\])*)"'
 )
-_OSD_TARGET = re.compile(r"\bosd[._\s-]*(\d+)\b", re.IGNORECASE)
 _LEVELS = {"warn", "warning", "error", "erro", "info", "debug", "trace", "unknown"}
+_ANNOTATION_MEASUREMENT = re.compile(
+    r"^\s*(?P<number>[-+]?\d[\d,]*(?:\.\d+)?)"
+    r"\s*(?P<unit>[%A-Za-zµ°][%A-Za-z0-9µ°/._ -]*)?\s*$"
+)
+_MEASUREMENT_KEYS = ("value", "current_value", "metric_value", "current")
 
 
 def numeric_points(series: Any) -> list[tuple[float, float]]:
@@ -75,6 +79,100 @@ def human_number(value: float, unit: str = "") -> str:
     return number + ("%" if unit == "%" else f" {unit}" if unit else "")
 
 
+def _payload_annotation_maps(raw_payload: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_payload, dict):
+        return []
+    annotation_maps: list[dict[str, Any]] = []
+    for key in ("annotations", "commonAnnotations", "common_annotations"):
+        value = raw_payload.get(key)
+        if isinstance(value, dict):
+            annotation_maps.append(value)
+    alerts = raw_payload.get("alerts")
+    if isinstance(alerts, list):
+        for alert in alerts:
+            if not isinstance(alert, dict):
+                continue
+            annotations = alert.get("annotations")
+            if isinstance(annotations, dict):
+                annotation_maps.append(annotations)
+    return annotation_maps
+
+
+def _parse_annotation_measurement(value: Any) -> tuple[float, str] | None:
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None
+    match = _ANNOTATION_MEASUREMENT.fullmatch(str(value))
+    if match is None:
+        return None
+    try:
+        number = float(match.group("number").replace(",", ""))
+    except ValueError:
+        return None
+    unit = (match.group("unit") or "").strip()
+    if unit.lower() in {"percent", "percentage", "pct"}:
+        unit = "%"
+    return number, unit
+
+
+def _measurement_from_annotations(raw_payload: Any) -> tuple[float, str] | None:
+    """Extract one explicit measurement without interpreting alert-specific fields."""
+    annotation_maps = _payload_annotation_maps(raw_payload)
+
+    for annotations in annotation_maps:
+        keys = [key for key in _MEASUREMENT_KEYS if key in annotations]
+        keys.extend(sorted(key for key in annotations if key not in keys))
+        for key in keys:
+            measurement = _parse_annotation_measurement(annotations.get(key))
+            if measurement is not None:
+                return measurement
+    return None
+
+
+def alert_observation(
+    context: IncidentContext | None, format_timestamp
+) -> tuple[str, str]:
+    """Summarize explicit firing/resolution measurements from alert payloads."""
+    if context is None:
+        return "", ""
+    observations = []
+    for event in context.events or []:
+        measurement = _measurement_from_annotations(event.get("raw_payload"))
+        if measurement is None:
+            continue
+        value, unit = measurement
+        timestamp = format_timestamp(event.get("timestamp"))
+        short_timestamp = timestamp.split(" ", 1)[-1] if " " in timestamp else timestamp
+        observations.append(
+            {
+                "event_id": str(event.get("id") or "unknown"),
+                "status": str(event.get("status") or "observed").lower(),
+                "timestamp": short_timestamp,
+                "measurement": human_number(value, unit),
+            }
+        )
+    if not observations:
+        return "", ""
+
+    first = observations[0]
+    last = observations[-1]
+    title = context.title or "The alert measurement"
+    if len(observations) == 1:
+        content = (
+            f"Alert payload reported {title} at {first['measurement']} when "
+            f"{first['status']} at {first['timestamp']}."
+        )
+    else:
+        content = (
+            f"Alert payload reported {title} at {first['measurement']} when "
+            f"{first['status']} at {first['timestamp']}; it reported "
+            f"{last['measurement']} when {last['status']} at {last['timestamp']}."
+        )
+    detail = "alert events: " + ", ".join(
+        dict.fromkeys(item["event_id"] for item in observations)
+    )
+    return content, detail
+
+
 def metric_caption(expression: str, metadata: dict, title: str = "") -> str:
     if title:
         return title
@@ -89,14 +187,13 @@ def metric_caption(expression: str, metadata: dict, title: str = "") -> str:
 
 
 def metric_unit(expression: str, metadata: dict) -> str:
-    unit = metadata.get("unit") or ""
-    if unit in ("percent", "percentage"):
+    unit = str(metadata.get("unit") or "").strip()
+    if unit.lower() in ("percent", "percentage"):
         return "%"
-    if not unit:
-        names = _METRIC_NAME.findall(expression)
-        tokens = "_".join(names or [str(metadata.get("name", ""))]).split("_")
-        unit = next((candidate for candidate in ("bytes", "seconds") if candidate in tokens), "")
-    if re.match(r"^\s*100\s*-", expression) and re.search(r"\*\s*100\b", expression):
+    if (
+        re.match(r"^\s*100\s*-", expression)
+        and re.search(r"\*\s*100\b", expression)
+    ) or re.match(r"^\s*100\s*\*\s*\(\s*1\s*-", expression):
         return "%"
     if metadata.get("type") == "counter" and re.search(r"\b(?:i?rate)\s*\(", expression):
         return f"{unit or 'units'} per second"
@@ -133,16 +230,6 @@ def _context_scope_score(
         ):
             score += 5
 
-    osd_match = _OSD_TARGET.search(context.title or "")
-    if osd_match:
-        osd_number = osd_match.group(1)
-        if any(
-            ("osd" in key and value == osd_number)
-            or re.search(rf"\bosd[._-]*{re.escape(osd_number)}\b", value)
-            for key, value in labels.items()
-        ):
-            score += 10
-
     # Only use title tokens that look like concrete identities. Generic words
     # such as "latency", "cpu", and "high" must not scope a series.
     identities = {
@@ -161,8 +248,8 @@ def _series_scope_score(
 
     Prometheus can legitimately return several devices or daemons for a broad
     query. Choosing the two most volatile series then promoted neighbouring
-    OSDs into another OSD's report. Explicit query selectors and stable target
-    identifiers therefore outrank volatility; when no series can be scoped, the
+    components into another target's report. Explicit query selectors and stable
+    target identifiers therefore outrank volatility; when no series can be scoped, the
     caller conservatively falls back to the provider result rather than hiding
     all telemetry.
     """
@@ -302,16 +389,21 @@ def log_observations(
 
 
 def select_metric_queries(calls: list, context: IncidentContext | None, limit: int) -> list:
-    """Keep the primary signal instead of whichever queries happened to run last."""
+    """Keep one primary signal plus bounded, explicitly planned related signals."""
     if not calls:
         return []
     if context is None:
         return calls[:limit]
     words = {word for word in re.findall(r"[a-z0-9]+", context.title.lower()) if len(word) >= 3}
-    relevant = [
+    primary = [
         call for call in calls
+        if call.result.get("signal_role") != "related"
         if words.intersection(re.findall(
             r"[a-z0-9]+", str(call.arguments.get("promql", "")).lower()
         ))
     ]
-    return (relevant or calls[:1])[:limit]
+    if not primary:
+        primary = [call for call in calls if call.result.get("signal_role") != "related"][:1]
+    related = [call for call in calls if call.result.get("signal_role") == "related"]
+    selected = [*primary[:1], *related]
+    return selected[:limit]

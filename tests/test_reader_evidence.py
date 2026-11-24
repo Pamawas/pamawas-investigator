@@ -11,7 +11,7 @@ from models import (
     ToolResult,
 )
 from service.evidence_summary import human_number
-from service.investigator import _ground_findings_in_data_queries
+from service.investigator import _finalize_findings, _ground_findings_in_data_queries
 
 
 def incident():
@@ -140,6 +140,98 @@ def test_numbers_are_readable_without_changing_units_or_tiny_values():
     assert human_number(1048576, "bytes") == "1.00 MiB"
     assert human_number(1048576, "bytes per second") == "1.00 MiB per second"
     assert human_number(0.00000001) == "0.00000001"
+
+
+def test_counter_rate_preserves_provider_declared_unit(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    call = ToolResult(
+        "query_prometheus",
+        {
+            "promql": (
+                'rate(container_cpu_usage_seconds_total{instance="alpha-host"}[5m])'
+            ),
+            "start": "2026-11-23T11:30:00Z",
+            "end": "2026-11-23T11:45:00Z",
+        },
+        {
+            "status": "success",
+            "metric_metadata": {
+                "name": "container_cpu_usage_seconds_total",
+                "type": "counter",
+                "unit": "seconds",
+            },
+            "data": {"result": [{
+                "metric": {"instance": "alpha-host"},
+                "values": [[1795433700, "0.53"], [1795434000, "0.46"]],
+            }]},
+        },
+        1,
+    )
+
+    findings = _ground_findings_in_data_queries([], [call], incident())
+
+    assert findings[0].content == (
+        "CPU peaked at 0.53 seconds per second at 18:35:00 WIB; "
+        "the last queried value was 0.46 seconds per second at 18:40:00 WIB."
+    )
+
+
+def test_alert_payload_preserves_explicit_measurement_for_arbitrary_alert(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    context = IncidentContext(
+        "inc_thermal",
+        "Thermal Saturation",
+        started_at="2026-11-23T11:35:10Z",
+        resolved_at="2026-11-23T11:40:10Z",
+        affected_services=["alpha-host"],
+        events=[
+            {
+                "id": "evt_fire",
+                "timestamp": "2026-11-23T11:35:10Z",
+                "status": "firing",
+                "raw_payload": {"commonAnnotations": {"value": "91.2°C"}},
+            },
+            {
+                "id": "evt_resolve",
+                "timestamp": "2026-11-23T11:40:10Z",
+                "status": "resolved",
+                "raw_payload": {"commonAnnotations": {"value": "70.1°C"}},
+            },
+        ],
+    )
+
+    findings = _ground_findings_in_data_queries([], [], context)
+
+    assert findings[0].source == EvidenceSource.ALERT
+    assert findings[0].content == (
+        "Alert payload reported Thermal Saturation at 91.2 °C when firing at "
+        "18:35:10 WIB; it reported 70.1 °C when resolved at 18:40:10 WIB."
+    )
+    assert findings[0].source_detail == "alert events: evt_fire, evt_resolve"
+
+
+def test_causal_synthesis_removes_superseded_process_only_gap(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    process_gap = Finding(
+        EvidenceType.UNKNOWN,
+        "Investigation ended without a stated conclusion; the model only described its process.",
+        EvidenceSource.SYSTEM,
+        0.0,
+    )
+
+    findings = _finalize_findings(
+        [process_gap], query_calls()[:1], incident(), "inc_reader", False
+    )
+
+    assert any(
+        finding.type == EvidenceType.UNKNOWN and "Root cause was not established" in finding.content
+        for finding in findings
+    )
+    assert not any(
+        finding.type == EvidenceType.UNKNOWN
+        and "without a stated conclusion" in finding.content
+        for finding in findings
+    )
 
 
 def test_evidence_rules_apply_to_another_signal_and_arbitrary_schemas(monkeypatch):

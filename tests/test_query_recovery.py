@@ -107,6 +107,85 @@ async def test_counter_recovery_preserves_rate_query_and_meaningful_observations
     assert "{" not in grounded[0].content
 
 
+@pytest.mark.asyncio
+async def test_recovery_queries_primary_and_two_metadata_ranked_related_signals(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+
+    async def query_range(expression, _start, _end):
+        values_by_expression = {
+            'vendor_compute_utilization{metric_scope="alpha-target"}': (
+                [1795433700, "85.6"], [1795434000, "63.51"]
+            ),
+            'vendor_memory_available_bytes{metric_scope="alpha-target"}': (
+                [1795433700, "2147483648"], [1795434000, "3221225472"]
+            ),
+            'rate(vendor_storage_read_bytes_total{metric_scope="alpha-target"}[5m])': (
+                [1795433700, "1048576"], [1795434000, "524288"]
+            ),
+        }
+        return {
+            "status": "success",
+            "data": {"result": [{
+                "metric": {"metric_scope": "alpha-target"},
+                "values": list(values_by_expression[expression]),
+            }]},
+        }
+
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={
+            "status": "success", "data": ["metric_scope"],
+        }),
+        query_label_values=AsyncMock(return_value={
+            "status": "success", "data": ["alpha-target"],
+        }),
+        query_metric_catalog=AsyncMock(return_value={
+            "status": "success",
+            "data": [
+                {
+                    "name": "vendor_compute_utilization",
+                    "type": "gauge",
+                    "help": "Compute utilization",
+                    "unit": "percent",
+                },
+                {
+                    "name": "vendor_memory_available_bytes",
+                    "type": "gauge",
+                    "help": "Available memory",
+                    "unit": "bytes",
+                },
+                {
+                    "name": "vendor_storage_read_bytes_total",
+                    "type": "counter",
+                    "help": "Bytes read from storage",
+                    "unit": "bytes",
+                },
+            ],
+        }),
+        query_range=AsyncMock(side_effect=query_range),
+    )
+    recovery = QueryRecovery(SimpleNamespace(_prometheus_adapter=adapter), context(), 100)
+
+    await recovery.recover_prometheus([
+        {
+            "name": "vendor_compute_utilization",
+            "type": "gauge",
+            "help": "Compute utilization",
+            "unit": "percent",
+        },
+    ])
+
+    assert [call.args[0] for call in adapter.query_range.await_args_list] == [
+        'vendor_compute_utilization{metric_scope="alpha-target"}',
+        'rate(vendor_storage_read_bytes_total{metric_scope="alpha-target"}[5m])',
+        'vendor_memory_available_bytes{metric_scope="alpha-target"}',
+    ]
+    grounded = _ground_findings_in_data_queries([], recovery.calls, context())
+    contents = " ".join(finding.content for finding in grounded)
+    assert "85.6%" in contents
+    assert "3.00 GiB" in contents
+    assert "1.00 MiB per second" in contents
+
+
 def test_partial_evidence_always_has_actions_and_a_causal_verdict():
     findings = [Finding(
         EvidenceType.UNKNOWN, "Loki unavailable after attempts", EvidenceSource.SYSTEM, 0.0,

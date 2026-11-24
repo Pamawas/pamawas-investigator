@@ -1257,7 +1257,7 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
     )
 
     assert result["status"] == "empty"
-    assert result["metric_candidates"][0]["name"] == "node_cpu_seconds_total"
+    assert result["metric_candidates"][0]["name"] == "mktxp_system_cpu_load"
     assert "does not satisfy the evidence gate" in result["error"]
     assert findings is None
     assert is_final is False
@@ -1708,18 +1708,19 @@ def test_single_provider_fact_outranks_provider_gap_root_cause_unknown():
         findings, tool_calls, verification=False, context=context
     )
 
-    hypotheses = [finding for finding in completed if finding.type is EvidenceType.HYPOTHESIS]
-    assert len(hypotheses) == 1
-    assert hypotheses[0].confidence == 0.35
-    assert "storage-path contention" in hypotheses[0].content
-    assert "query_prometheus" in hypotheses[0].source_detail
-    assert "Ceph OSD latency peaked at 271 ms" in hypotheses[0].content
+    causal_unknowns = [
+        finding for finding in completed
+        if finding.type is EvidenceType.UNKNOWN and "Root cause" in finding.content
+    ]
+    assert len(causal_unknowns) == 1
+    assert causal_unknowns[0].confidence == 0.0
+    assert causal_unknowns[0].source_detail == "causal-verdict enforcement"
+    assert "Ceph OSD latency peaked at 271 ms" in causal_unknowns[0].content
     assert all("Root cause could not" not in finding.content for finding in completed)
     assert any("No usable data from query_loki" in finding.content for finding in completed)
     actions = [finding for finding in completed if finding.type is EvidenceType.RECOMMENDATION]
     assert len(actions) == 1
-    assert "compare device I/O latency and queue depth" in actions[0].content
-    assert "recorded OSD latency spike" in actions[0].content
+    assert actions[0].content == "Inspect logs because no cause was found."
 
 
 def test_model_causal_verdict_is_preserved_as_capped_synthesis():

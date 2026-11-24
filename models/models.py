@@ -43,6 +43,7 @@ class EvidenceSource(StrEnum):
 
     PROMETHEUS = "prometheus"
     LOKI = "loki"
+    ALERT = "alert"
     INCIDENTS = "incidents"
     # The model's own synthesis across the above (correlations, inferences).
     LLM = "llm"
