@@ -527,7 +527,7 @@ class InvestigationPersistence:
                         FROM stale_verifications
                         WHERE status = 'queued'
                           AND next_verify_at <= %s
-                        ORDER BY next_verify_at ASC
+                        ORDER BY next_verify_at ASC, incident_id ASC
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1
                     )
@@ -968,7 +968,7 @@ class InvestigationPersistence:
                     SELECT id FROM investigation_runs
                     WHERE status = 'failed_retryable'
                       AND (next_retry_at IS NULL OR next_retry_at <= now())
-                    ORDER BY next_retry_at NULLS FIRST
+                    ORDER BY next_retry_at NULLS FIRST, id ASC
                     LIMIT %s
                     """,
                     (limit,),

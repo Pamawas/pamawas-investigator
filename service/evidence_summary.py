@@ -116,16 +116,20 @@ def _parse_annotation_measurement(value: Any) -> tuple[float, str] | None:
 
 def _measurement_from_annotations(raw_payload: Any) -> tuple[float, str] | None:
     """Extract one explicit measurement without interpreting alert-specific fields."""
-    annotation_maps = _payload_annotation_maps(raw_payload)
-
-    for annotations in annotation_maps:
-        keys = [key for key in _MEASUREMENT_KEYS if key in annotations]
-        keys.extend(sorted(key for key in annotations if key not in keys))
-        for key in keys:
+    candidates: list[tuple[int, str, str, tuple[float, str]]] = []
+    priority = {key: index for index, key in enumerate(_MEASUREMENT_KEYS)}
+    for annotations in _payload_annotation_maps(raw_payload):
+        canonical_map = json.dumps(annotations, sort_keys=True, default=str)
+        for key in sorted(annotations):
             measurement = _parse_annotation_measurement(annotations.get(key))
             if measurement is not None:
-                return measurement
-    return None
+                candidates.append((
+                    priority.get(key, len(priority)),
+                    key,
+                    canonical_map,
+                    measurement,
+                ))
+    return min(candidates)[-1] if candidates else None
 
 
 def alert_observation(
@@ -135,7 +139,15 @@ def alert_observation(
     if context is None:
         return "", ""
     observations = []
-    for event in context.events or []:
+    events = sorted(
+        context.events or [],
+        key=lambda event: (
+            str(event.get("timestamp") or ""),
+            str(event.get("id") or ""),
+            json.dumps(event.get("raw_payload") or {}, sort_keys=True, default=str),
+        ),
+    )
+    for event in events:
         measurement = _measurement_from_annotations(event.get("raw_payload"))
         if measurement is None:
             continue
@@ -190,11 +202,6 @@ def metric_unit(expression: str, metadata: dict) -> str:
     unit = str(metadata.get("unit") or "").strip()
     if unit.lower() in ("percent", "percentage"):
         return "%"
-    if (
-        re.match(r"^\s*100\s*-", expression)
-        and re.search(r"\*\s*100\b", expression)
-    ) or re.match(r"^\s*100\s*\*\s*\(\s*1\s*-", expression):
-        return "%"
     if metadata.get("type") == "counter" and re.search(r"\b(?:i?rate)\s*\(", expression):
         return f"{unit or 'units'} per second"
     return unit
@@ -230,8 +237,8 @@ def _context_scope_score(
         ):
             score += 5
 
-    # Only use title tokens that look like concrete identities. Generic words
-    # such as "latency", "cpu", and "high" must not scope a series.
+    # Only use title tokens that contain an explicit identifier. Descriptive
+    # alert words must not scope a returned series.
     identities = {
         token.lower()
         for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_.-]*\d+[a-zA-Z0-9_.-]*", context.title or "")
@@ -283,10 +290,10 @@ def metric_observations(
     ]
     if scoped:
         candidates = scoped
-    candidates.sort(
-        key=lambda pair: max(value for _, value in pair[1]) - min(value for _, value in pair[1]),
-        reverse=True,
-    )
+    candidates.sort(key=lambda pair: (
+        -(max(value for _, value in pair[1]) - min(value for _, value in pair[1])),
+        json.dumps(pair[0].get("metric", {}), sort_keys=True, default=str),
+    ))
     label_values: dict[str, set[str]] = {}
     for item, _ in candidates:
         for key, value in item.get("metric", {}).items():
@@ -323,7 +330,10 @@ def log_identity(stream: dict, excluded: set[str]) -> str:
     ]
     if not candidates:
         return "Logs"
-    return max(candidates, key=lambda value: (values[value], "-" in value, len(value)))
+    return max(
+        candidates,
+        key=lambda value: (values[value], "-" in value, len(value), value),
+    )
 
 
 def readable_log_line(line: str) -> str:

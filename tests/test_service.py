@@ -58,7 +58,7 @@ def test_llm_initialization_and_completion(config):
         timeout=60.0,
         tools=[],
         tool_choice="auto",
-        temperature=0.1,
+        temperature=0.0,
         max_tokens=2000,
     )
 

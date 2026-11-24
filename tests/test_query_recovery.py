@@ -83,6 +83,38 @@ async def test_loki_recovery_stops_after_incident_identity_labels_do_not_match()
 
 
 @pytest.mark.asyncio
+async def test_selector_discovers_arbitrary_provider_label_name():
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={
+            "status": "success", "data": ["opaque_dimension"],
+        }),
+        query_label_values=AsyncMock(return_value={
+            "status": "success", "data": ["alpha-target"],
+        }),
+        query_range=AsyncMock(return_value={"status": "success", "data": {"result": []}}),
+    )
+    incident = IncidentContext(
+        "inc_arbitrary",
+        "Arbitrary Alert",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["alpha-target"],
+        events=[{"labels": {"different_source_key": "alpha-target"}}],
+    )
+    recovery = QueryRecovery(SimpleNamespace(_loki_adapter=adapter), incident, 100)
+
+    await recovery.recover_loki()
+
+    adapter.query_label_values.assert_awaited_once_with("opaque_dimension")
+    adapter.query_range.assert_awaited_once_with(
+        '{opaque_dimension="alpha-target"}',
+        "2026-11-24T06:46:00+00:00",
+        "2026-11-24T06:57:00+00:00",
+        100,
+    )
+
+
+@pytest.mark.asyncio
 async def test_counter_recovery_preserves_rate_query_and_meaningful_observations(monkeypatch):
     monkeypatch.setenv("TZ", "Asia/Jakarta")
     adapter = SimpleNamespace(
@@ -176,8 +208,8 @@ async def test_recovery_queries_primary_and_two_metadata_ranked_related_signals(
 
     assert [call.args[0] for call in adapter.query_range.await_args_list] == [
         'vendor_compute_utilization{metric_scope="alpha-target"}',
-        'rate(vendor_storage_read_bytes_total{metric_scope="alpha-target"}[5m])',
         'vendor_memory_available_bytes{metric_scope="alpha-target"}',
+        'rate(vendor_storage_read_bytes_total{metric_scope="alpha-target"}[5m])',
     ]
     grounded = _ground_findings_in_data_queries([], recovery.calls, context())
     contents = " ".join(finding.content for finding in grounded)

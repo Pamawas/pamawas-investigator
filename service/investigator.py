@@ -75,7 +75,6 @@ _LOGQL_MATCHER = re.compile(
     r'([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|=|!=)\s*"((?:\\.|[^"\\])*)"'
 )
 _PROMETHEUS_TERM = re.compile(r"[a-z0-9]+")
-_RATE_LIKE_TERMS = {"load", "percent", "ratio", "rate", "usage", "utilization"}
 _CAUSAL_FINDING_TYPES = (EvidenceType.LIKELY_CAUSE, EvidenceType.HYPOTHESIS)
 _PROCESS_ONLY_UNKNOWN_PREFIXES = (
     "Investigation ended without a stated conclusion",
@@ -296,9 +295,6 @@ def _prometheus_metric_candidates(
     query_counts = Counter(query_terms)
     query_bigrams = set(itertools.pairwise(query_terms))
     normalized_query = "_".join(query_terms)
-    rate_like_intent = bool(set(query_terms).intersection(_RATE_LIKE_TERMS))
-    percent_intent = bool({"percent", "percentage", "utilization"}.intersection(query_terms))
-
     def normalize(item: Any) -> dict[str, str] | None:
         if isinstance(item, str) and item.strip():
             return {"name": item, "type": "unknown", "help": "", "unit": ""}
@@ -311,51 +307,65 @@ def _prometheus_metric_candidates(
             "unit": str(item.get("unit") or ""),
         }
 
-    def score(item: dict[str, str]) -> tuple[int, int, int, int, int, float]:
+    def score(item: dict[str, str]) -> tuple[int, int, int, int, float]:
         name = item["name"]
         terms = _PROMETHEUS_TERM.findall(name.lower().replace("_", " "))
         weighted_overlap = sum(query_counts[term] for term in set(terms))
         bigram_overlap = len(query_bigrams.intersection(itertools.pairwise(terms)))
-        extra_terms = set(terms) - set(query_terms) - {"seconds", "total"}
         metadata_terms = set(
             _PROMETHEUS_TERM.findall(
                 f"{item['help']} {item['unit']}".lower().replace("_", " ")
             )
         )
         metadata_overlap = sum(query_counts[term] for term in metadata_terms)
-        if (
-            rate_like_intent
-            and not percent_intent
-            and item["type"].lower() == "counter"
-        ):
-            weighted_overlap += 2
-        semantic_match = 0
-        if percent_intent:
-            if (
-                item["unit"].lower() in {"percent", "percentage", "%"}
-                and weighted_overlap > 0
-            ):
-                semantic_match = 3
+        covered_terms = len(
+            set(query_terms).intersection({*terms, *metadata_terms})
+        )
         similarity = SequenceMatcher(None, normalized_query, name.lower()).ratio()
         return (
-            semantic_match,
+            weighted_overlap + metadata_overlap,
+            covered_terms,
             weighted_overlap,
             bigram_overlap,
-            metadata_overlap,
-            -len(extra_terms),
             similarity,
         )
 
     normalized = [normalize(item) for item in metric_catalog]
-    candidates = {item["name"]: item for item in normalized if item is not None}
+    candidates: dict[str, dict[str, str]] = {}
+    for item in normalized:
+        if item is None:
+            continue
+        previous = candidates.get(item["name"])
+        quality = (
+            int(item["type"].lower() != "unknown"),
+            int(bool(item["unit"])),
+            int(bool(item["help"])),
+            item["type"],
+            item["unit"],
+            item["help"],
+        )
+        previous_quality = (
+            int(previous["type"].lower() != "unknown"),
+            int(bool(previous["unit"])),
+            int(bool(previous["help"])),
+            previous["type"],
+            previous["unit"],
+            previous["help"],
+        ) if previous is not None else None
+        if previous_quality is None or quality > previous_quality:
+            candidates[item["name"]] = item
+
+    def rank_key(item: dict[str, str]) -> tuple[float | str, ...]:
+        item_score = score(item)
+        return (*(-part for part in item_score), item["name"])
+
     ranked = sorted(
         candidates.values(),
-        key=lambda item: (score(item), item["name"]),
-        reverse=True,
+        key=rank_key,
     )
     relevant = [
         item for item in ranked
-        if score(item)[0] > 0 or score(item)[1] > 0
+        if score(item)[0] > 0
     ]
     return (relevant or ranked)[:limit]
 
@@ -1788,7 +1798,7 @@ class InvestigatorLLM:
                 response = client.chat.completions.create(
                     model=model,
                     messages=messages,
-                    temperature=0.1,  # Low temperature for deterministic output
+                    temperature=0.0,
                     max_tokens=max_tokens,
                     timeout=call_timeout,
                     **optional,
@@ -2024,7 +2034,7 @@ class PamawasInvestigator:
                     FROM events e
                     JOIN incident_events ie ON e.id = ie.event_id
                     WHERE ie.incident_id = %s
-                    ORDER BY e.occurred_at
+                    ORDER BY e.occurred_at, e.id
                 """,
                     (incident_id,),
                 )
@@ -2217,9 +2227,9 @@ class PamawasInvestigator:
             "evidence and mechanism, not the count of successful providers. Do not submit after "
             "catalog discovery alone.\n"
             "- Prefer two distinct observations before a causal verdict. They may come from the "
-            "same provider. If bounded attempts cannot obtain the second observation, state a "
-            "low-confidence hypothesis that quotes the successful observation and recommend the "
-            "specific next measurement that would confirm or reject it.\n"
+            "same provider. If bounded attempts cannot obtain the second observation, do not "
+            "invent a mechanism: submit UNKNOWN for root cause and recommend the specific next "
+            "measurement that could establish or reject one.\n"
             "- Every full investigation MUST contain exactly one causal verdict: LIKELY_CAUSE "
             "when the mechanism is strongly supported, HYPOTHESIS when it is plausible but "
             "unconfirmed, or UNKNOWN explicitly stating that the root cause was not established. "

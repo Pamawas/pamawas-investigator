@@ -26,7 +26,8 @@ def query_calls():
         "query_prometheus",
         {"promql": '100 - (rate(vendor_cpu_seconds_total{tenant_unit="alpha-host"}[5m]) * 100)',
          "start": "2026-11-23T11:00:00Z", "end": "2026-11-23T12:30:00Z"},
-        {"status": "success", "data": {"result": [{
+        {"status": "success", "metric_metadata": {"unit": "percent"},
+         "data": {"result": [{
             "metric": {"tenant_unit": "alpha-host"},
             "values": [[1795432800, "99.9"], [1795433700, "86.5"], [1795434000, "71"]],
         }]}}, 1,
@@ -174,6 +175,36 @@ def test_counter_rate_preserves_provider_declared_unit(monkeypatch):
         "CPU peaked at 0.53 seconds per second at 18:35:00 WIB; "
         "the last queried value was 0.46 seconds per second at 18:40:00 WIB."
     )
+
+
+def test_counter_rate_does_not_infer_unit_from_metric_name(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    call = ToolResult(
+        "query_prometheus",
+        {
+            "promql": 'rate(vendor_payload_bytes_total{scope="alpha-host"}[5m])',
+            "start": "2026-11-23T11:30:00Z",
+            "end": "2026-11-23T11:45:00Z",
+        },
+        {
+            "status": "success",
+            "metric_metadata": {
+                "name": "vendor_payload_bytes_total",
+                "type": "counter",
+                "unit": "",
+            },
+            "data": {"result": [{
+                "metric": {"scope": "alpha-host"},
+                "values": [[1795433700, "2.5"], [1795434000, "1.5"]],
+            }]},
+        },
+        1,
+    )
+
+    findings = _ground_findings_in_data_queries([], [call], incident())
+
+    assert "2.5 units per second" in findings[0].content
+    assert "bytes per second" not in findings[0].content
 
 
 def test_alert_payload_preserves_explicit_measurement_for_arbitrary_alert(monkeypatch):

@@ -160,7 +160,7 @@ class RelatedIncidentsAdapter:
                         i.correlation_version
                     FROM incidents i
                     {where_clause}
-                    ORDER BY i.started_at DESC
+                    ORDER BY i.started_at DESC, i.id DESC
                     LIMIT %s
                 """
                 params.append(max_results)
@@ -282,7 +282,7 @@ class RelatedIncidentsAdapter:
                         i.correlation_version
                     FROM incidents i
                     {where_clause}
-                    ORDER BY i.started_at DESC
+                    ORDER BY i.started_at DESC, i.id DESC
                     LIMIT %s
                 """
                 params.append(max_results)

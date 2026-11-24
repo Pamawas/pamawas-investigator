@@ -15,11 +15,10 @@ logger = logging.getLogger(__name__)
 _METRIC_SELECTOR = re.compile(r"^([a-zA-Z_:][a-zA-Z0-9_:]*)(\{[^{}]*\})?$")
 _METRIC_REFERENCE = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{")
 _TOKEN = re.compile(r"[a-z0-9]+")
-# OpenMetrics-generated families that are not independent signals on their own.
-_NOISY_METRIC_SUFFIXES = ("_bucket", "_created", "_info")
 _RELATED_QUERY_ATTEMPT_LIMIT = 6
 _MAX_RELATED_SIGNALS = 2
 _MAX_SIGNATURE_SIMILARITY = 0.6
+_SELECTOR_LABEL_PROBE_LIMIT = 32
 
 
 def _tokens(value: Any) -> set[str]:
@@ -44,6 +43,33 @@ def _context_terms(context: IncidentContext) -> tuple[set[str], set[str]]:
 
 def _descriptor_tokens(descriptor: dict[str, Any]) -> set[str]:
     return _tokens(f"{descriptor.get('name', '')} {descriptor.get('help', '')}")
+
+
+def _canonical_metric_catalog(catalog: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Resolve duplicate metadata rows independently of provider response order."""
+    selected: dict[str, dict[str, Any]] = {}
+    for descriptor in catalog:
+        if not isinstance(descriptor, dict):
+            continue
+        name = str(descriptor.get("name") or "")
+        if not name:
+            continue
+        candidate_key = (
+            int(bool(descriptor.get("unit"))),
+            int(bool(descriptor.get("help"))),
+            int(bool(descriptor.get("type"))),
+            json.dumps(descriptor, sort_keys=True, default=str),
+        )
+        current = selected.get(name)
+        current_key = (
+            int(bool(current.get("unit"))),
+            int(bool(current.get("help"))),
+            int(bool(current.get("type"))),
+            json.dumps(current, sort_keys=True, default=str),
+        ) if current is not None else None
+        if current_key is None or candidate_key > current_key:
+            selected[name] = descriptor
+    return [selected[name] for name in sorted(selected)]
 
 
 def _common_catalog_terms(catalog: list[dict[str, Any]]) -> set[str]:
@@ -83,24 +109,15 @@ def _related_metric_candidates(
     ranked = []
     for descriptor in catalog:
         name = str(descriptor.get("name") or "")
-        metric_type = str(descriptor.get("type") or "").lower()
-        if (
-            not name
-            or name in excluded_names
-            or metric_type not in {"counter", "gauge"}
-            or any(name.endswith(suffix) for suffix in _NOISY_METRIC_SUFFIXES)
-        ):
+        if not name or name in excluded_names:
             continue
         signature = _signature(descriptor, scope_terms, common_terms)
-        if primary_terms.intersection(signature):
-            continue
         distance = 1.0 - _similarity(signature, primary_signature)
         name_tokens = _tokens(name)
         score = (
             len(name_tokens.intersection(scope_terms)),
             int(bool(descriptor.get("unit"))),
             int(bool(descriptor.get("help"))),
-            int(metric_type == "counter"),
             int(distance * 1000),
         )
         ranked.append((score, name, descriptor, signature))
@@ -147,6 +164,63 @@ def _has_time_variation(result: dict[str, Any]) -> bool:
             if spread > tolerance:
                 return True
     return False
+
+
+def _incident_label_values(context: IncidentContext) -> dict[str, list[str]]:
+    """Return stable, de-duplicated label values from the incident lifecycle."""
+    values_by_key: dict[str, list[str]] = {}
+    events = sorted(
+        context.events or [],
+        key=lambda event: (
+            str(event.get("timestamp") or ""),
+            str(event.get("id") or ""),
+            json.dumps(event.get("labels") or {}, sort_keys=True, default=str),
+        ),
+    )
+    for event in events:
+        labels = event.get("labels")
+        if not isinstance(labels, dict):
+            continue
+        for key, value in labels.items():
+            normalized_key = str(key)
+            normalized_value = str(value)
+            values = values_by_key.setdefault(normalized_key, [])
+            if normalized_value not in values:
+                values.append(normalized_value)
+    return values_by_key
+
+
+def _selector_keys(
+    available: set[str], values_by_key: dict[str, list[str]], identities: list[str]
+) -> list[str]:
+    keys = sorted(
+        available,
+        key=lambda key: (
+            key not in values_by_key,
+            not any(value in identities for value in values_by_key.get(key, [])),
+            key,
+        ),
+    )
+    direct = [key for key in keys if key in values_by_key]
+    # When the provider exposes incident-carried keys, a mismatch means it has
+    # no coverage for this target. Probing unrelated dimensions would turn a
+    # source gap into a broad, misleading query. Only fall back to the complete
+    # discovered schema when there are no shared keys at all.
+    return direct or keys
+
+
+def _matched_selector_value(
+    key: str,
+    response: dict[str, Any],
+    identities: list[str],
+    values_by_key: dict[str, list[str]],
+) -> tuple[str, bool] | None:
+    if response.get("status") != "success" or not isinstance(response.get("data"), list):
+        return None
+    available_values = {str(value) for value in response["data"]}
+    candidates = list(dict.fromkeys([*identities, *values_by_key.get(key, [])]))
+    matched = next((value for value in candidates if value in available_values), None)
+    return (matched, matched in identities) if matched is not None else None
 
 
 def investigation_window(context: IncidentContext) -> tuple[str, str]:
@@ -198,50 +272,37 @@ class QueryRecovery:
             self._selector_cache[provider] = None
             return None
         available = {str(key) for key in catalog["data"]}
-        incident_labels: dict[str, str] = {}
-        for event in self.context.events or []:
-            labels = event.get("labels")
-            if isinstance(labels, dict):
-                incident_labels.update({str(key): str(value) for key, value in labels.items()})
+        incident_label_values = _incident_label_values(self.context)
         identities = list(dict.fromkeys(self.context.affected_services or []))
-        keys = sorted(
-            available,
-            key=lambda key: (
-                key not in incident_labels,
-                incident_labels.get(key) not in identities,
-                identities.index(incident_labels[key])
-                if incident_labels.get(key) in identities else len(identities),
-                key,
-            ),
-        )
-        # Prefer label keys carried by the incident itself. If the provider
-        # does not expose those keys, probe only a small set of identity-like
-        # labels instead of enumerating unrelated dimensions such as boot IDs,
-        # clusters, and filenames. A missing target is a valid source gap.
-        direct_keys = [key for key in keys if key in incident_labels]
-        identity_hints = (
-            "instance", "host", "hostname", "service", "service_name",
-            "job", "pod", "container", "unit", "node", "device", "scope",
-        )
-        candidate_keys = direct_keys or [
-            key for key in keys
-            if any(hint in key.lower() for hint in identity_hints)
-        ]
-        for key in candidate_keys[:4]:
+        # Prefer keys carried by the incident, then probe the discovered schema
+        # in lexical order. No deployment-specific label vocabulary is baked in.
+        candidate_keys = _selector_keys(available, incident_label_values, identities)
+        fallback_matches: list[tuple[int, int, str, str]] = []
+        for key in candidate_keys[:_SELECTOR_LABEL_PROBE_LIMIT]:
             response = await self.call(
                 f"get_{provider}_labels", {"label": key}, adapter.query_label_values, key
             )
-            if response.get("status") != "success" or not isinstance(response.get("data"), list):
+            matched_value = _matched_selector_value(
+                key, response, identities, incident_label_values
+            )
+            if matched_value is None:
                 continue
-            values = {str(value) for value in response["data"]}
-            candidates = [*identities]
-            if key in incident_labels:
-                candidates.append(incident_labels[key])
-            matched = next((value for value in candidates if value in values), None)
-            if matched is not None:
+            matched, is_identity = matched_value
+            if is_identity:
                 selector = "{" + key + "=" + json.dumps(matched) + "}"
                 self._selector_cache[provider] = selector
                 return selector
+            fallback_matches.append((
+                -sum(matched in values for values in incident_label_values.values()),
+                -len(matched),
+                key,
+                matched,
+            ))
+        if fallback_matches:
+            _, _, key, matched = min(fallback_matches)
+            selector = "{" + key + "=" + json.dumps(matched) + "}"
+            self._selector_cache[provider] = selector
+            return selector
         self._selector_cache[provider] = None
         return None
 
@@ -253,7 +314,9 @@ class QueryRecovery:
             "get_prometheus_metadata", {}, adapter.query_metric_catalog
         )
         data = response.get("data")
-        self._metric_catalog = data if isinstance(data, list) else []
+        self._metric_catalog = (
+            _canonical_metric_catalog(data) if isinstance(data, list) else []
+        )
         return self._metric_catalog
 
     async def _query_metric(
