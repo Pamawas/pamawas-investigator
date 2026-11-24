@@ -4,6 +4,7 @@
 import asyncio
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -419,7 +420,7 @@ def _get_run_status(run_id: str) -> str | None:
         if conn is not None:
             try:
                 conn.rollback()
-            except psycopg2.Error, AttributeError:
+            except (psycopg2.Error, AttributeError):
                 pass
         return None
     finally:
@@ -760,6 +761,55 @@ async def _investigation_retry_scheduler(tick_seconds: float):
         await asyncio.sleep(tick_seconds)
 
 
+async def _prepare_stale_verification_run(
+    incident_id: str, attached_run_id: str | None
+) -> tuple[str, str]:
+    """Create a new verification run or recover the key for an attached run."""
+    if investigator is None or not investigator.persistence:
+        raise RuntimeError("investigator persistence unavailable")
+
+    run_id = attached_run_id
+    if run_id is None:
+        request_key_hash = f"verification:{incident_id}:{uuid.uuid4().hex}"
+        run_id, _ = await asyncio.to_thread(
+            investigator.persistence.create_investigation_run,
+            incident_id=incident_id,
+            request_key_hash=request_key_hash,
+            model_provider=investigator.config.llm_base_url,
+            model_name=investigator.config.llm_model,
+            prompt_version=PROMPT_VERSION,
+            tool_contract=1,
+            max_tool_calls=investigator.config.verify_max_tool_calls,
+            run_kind="verification",
+        )
+        attached = await asyncio.to_thread(
+            investigator.persistence.attach_stale_verification_run,
+            incident_id,
+            run_id,
+        )
+        if not attached:
+            await asyncio.to_thread(
+                investigator.persistence.mark_run_failed,
+                run_id,
+                "verification_attachment_failed",
+            )
+            raise RuntimeError("failed to attach unique verification run")
+    else:
+        request_key_hash = await asyncio.to_thread(
+            investigator.persistence.get_run_request_key,
+            run_id,
+        )
+        if not request_key_hash:
+            raise RuntimeError("verification run has no request key")
+
+    await asyncio.to_thread(
+        investigator.persistence.update_run_status,
+        run_id,
+        "running",
+    )
+    return run_id, request_key_hash
+
+
 async def _stale_verification_worker():
     """Claim queued stale_verifications rows, run verify_incident(), write verdict back.
 
@@ -784,27 +834,41 @@ async def _stale_verification_worker():
             continue
 
         try:
-            incident_id = await asyncio.to_thread(
+            claimed = await asyncio.to_thread(
                 investigator.persistence.claim_next_stale_verification
             )
-            if incident_id is None:
+            if claimed is None:
                 await asyncio.sleep(poll_seconds)
                 continue
 
+            incident_id, attached_run_id = claimed
+            run_id, request_key_hash = await _prepare_stale_verification_run(
+                incident_id, attached_run_id
+            )
+
             increment_stale_verification_claimed()
-            log.info("stale_verification_claimed", incident_id=incident_id)
+            log.info(
+                "stale_verification_claimed",
+                incident_id=incident_id,
+                run_id=run_id,
+            )
 
             import time as _time
 
             start = _time.monotonic()
             try:
-                result = await investigator.verify_incident(incident_id)
+                result = await investigator.verify_incident(
+                    incident_id,
+                    request_key_hash=request_key_hash,
+                    run_id=run_id,
+                )
                 verdict = result.get("verdict", "still_down") if result else "still_down"
                 reason = result.get("reason", "") if result else "verify_incident returned None"
                 duration = _time.monotonic() - start
                 await asyncio.to_thread(
                     investigator.persistence.complete_stale_verification,
                     incident_id,
+                    run_id,
                     verdict,
                     reason,
                 )
@@ -813,6 +877,7 @@ async def _stale_verification_worker():
                 log.info(
                     "stale_verification_completed",
                     incident_id=incident_id,
+                    run_id=run_id,
                     verdict=verdict,
                     duration_seconds=round(duration, 2),
                 )
@@ -822,11 +887,18 @@ async def _stale_verification_worker():
                 log.error(
                     "stale_verification_failed",
                     incident_id=incident_id,
+                    run_id=run_id,
                     error=str(e),
+                )
+                await asyncio.to_thread(
+                    investigator.persistence.mark_run_failed,
+                    run_id,
+                    str(e)[:256],
                 )
                 await asyncio.to_thread(
                     investigator.persistence.fail_stale_verification,
                     incident_id,
+                    run_id,
                     str(e)[:256],
                 )
                 increment_stale_verification_failed()

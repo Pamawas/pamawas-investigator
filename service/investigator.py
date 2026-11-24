@@ -7,12 +7,14 @@ import logging
 import os
 import re
 import time
+import uuid
 from collections import Counter
 from dataclasses import replace
 from datetime import datetime, timedelta
 from datetime import timezone as tz
 from difflib import SequenceMatcher
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import openai
@@ -57,7 +59,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v14"
+PROMPT_VERSION = "pamawas-investigator-v15"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -698,18 +700,19 @@ def _causal_query_details(tool_calls: list[ToolResult]) -> str:
 def _normalized_causal_synthesis(
     findings: list[Finding], tool_calls: list[ToolResult]
 ) -> Finding | None:
-    """Keep one model causal verdict, clearly labeled and tied to real queries."""
-    executed_queries = [
-        str(call.arguments.get(argument) or "")
-        for name, argument in (("query_prometheus", "promql"), ("query_loki", "logql"))
-        for call in _successful_tool_calls(tool_calls, name)
-    ]
+    """Keep one model causal verdict and rewrite provenance to real queries.
+
+    Requiring the model to copy an exact PromQL/LogQL string into
+    ``source_detail`` discarded otherwise useful hypotheses. The harness owns
+    provenance, so it attaches the actual executed queries after validating
+    that usable provider data exists.
+    """
     candidates = [
         finding for finding in findings
         if finding.type in _CAUSAL_FINDING_TYPES
-        and any(query and query in finding.source_detail for query in executed_queries)
+        and not _finding_claims_no_provider_data(finding)
     ]
-    if not candidates:
+    if not candidates or not _causal_query_details(tool_calls):
         return None
     best = max(
         candidates,
@@ -740,23 +743,202 @@ def _has_causal_verdict(findings: list[Finding]) -> bool:
     return False
 
 
-def _ensure_causal_verdict(
-    findings: list[Finding], tool_calls: list[ToolResult]
-) -> list[Finding]:
-    """Guarantee one explicit causal verdict without fabricating a confirmed cause."""
-    if _has_causal_verdict(findings):
-        return findings
-    fallback = Finding(
-        type=EvidenceType.UNKNOWN,
-        content=(
-            "Root cause is unconfirmed. The retrieved observations do not identify "
-            "the responsible workload or demonstrate a causal mechanism."
-        ),
-        source=EvidenceSource.SYSTEM,
-        source_detail="causal-verdict enforcement",
-        confidence=0.0,
+def _is_root_cause_unknown(finding: Finding) -> bool:
+    """Return whether an UNKNOWN is the run's causal verdict, not a source gap."""
+    if finding.type != EvidenceType.UNKNOWN:
+        return False
+    content = finding.content.lower()
+    return any(marker in content for marker in ("root cause", "causal", "cause is"))
+
+
+def _finding_claims_no_provider_data(finding: Finding) -> bool:
+    """Detect broad no-data claims that can contradict grounded provider facts."""
+    content = " ".join((finding.content or "").lower().split())
+    markers = (
+        "no prometheus",
+        "prometheus data queries did not return",
+        "prometheus series and no loki",
+        "no telemetry",
+        "no successful data",
+        "no usable series",
+        "no time-series data",
+        "no metric data",
+        "both returned empty",
+        "both returned failed",
+        "no matching log events",
+        "no usable data from query_loki",
+        "no loki log entries",
     )
-    return [*findings, fallback]
+    return any(marker in content for marker in markers)
+
+
+def _canonical_finding_text(text: str) -> str:
+    """Normalize prose enough to collapse repeated observations."""
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def _deduplicate_findings(findings: list[Finding]) -> list[Finding]:
+    """Collapse exact and near-identical rows while preserving the best claim."""
+    kept: list[Finding] = []
+    for finding in findings:
+        canonical = _canonical_finding_text(finding.content)
+        duplicate_at = None
+        for index, existing in enumerate(kept):
+            if finding.type != existing.type or finding.source != existing.source:
+                continue
+            other = _canonical_finding_text(existing.content)
+            if canonical == other or (
+                canonical and other and SequenceMatcher(None, canonical, other).ratio() >= 0.96
+            ):
+                duplicate_at = index
+                break
+        if duplicate_at is None:
+            kept.append(finding)
+            continue
+        existing = kept[duplicate_at]
+        if finding.confidence > existing.confidence:
+            kept[duplicate_at] = finding
+        logger.warning("Discarding duplicate %s finding: %s", finding.type, finding.content[:160])
+    return kept
+
+
+def _drop_provider_contradictions(findings: list[Finding]) -> list[Finding]:
+    """Remove no-data claims contradicted by usable facts in the same run."""
+    has_prometheus_fact = any(
+        finding.type == EvidenceType.FACT and finding.source == EvidenceSource.PROMETHEUS
+        for finding in findings
+    )
+    has_loki_fact = any(
+        finding.type == EvidenceType.FACT and finding.source == EvidenceSource.LOKI
+        for finding in findings
+    )
+    kept: list[Finding] = []
+    for finding in findings:
+        if finding.type != EvidenceType.UNKNOWN or not _finding_claims_no_provider_data(finding):
+            kept.append(finding)
+            continue
+        lowered = finding.content.lower()
+        contradicts_prometheus = has_prometheus_fact and any(
+            marker in lowered
+            for marker in ("prometheus", "metric", "telemetry", "time-series", "both returned")
+        )
+        contradicts_loki = has_loki_fact and any(
+            marker in lowered for marker in ("loki", "log events", "log entries", "both returned")
+        )
+        if contradicts_prometheus or contradicts_loki:
+            logger.warning(
+                "Discarding provider no-data claim contradicted by grounded facts: %s",
+                finding.content[:200],
+            )
+            continue
+        kept.append(finding)
+    return kept
+
+
+def _fact_is_relevant_to_incident(finding: Finding, context: IncidentContext | None) -> bool:
+    """Conservatively decide whether a fact can support a causal hypothesis."""
+    if finding.type != EvidenceType.FACT:
+        return False
+    if context is None:
+        return True
+    title = context.title.lower()
+    detail = (finding.source_detail or "").lower()
+    content = finding.content.lower()
+    if "cpu" in title:
+        return "cpu" in detail or "cpu" in content or "load" in detail
+    if any(token in title for token in ("ceph", "osd", "latency")):
+        return any(token in detail or token in content for token in ("ceph", "osd", "latency"))
+    if "datasource" in title:
+        return any(
+            token in detail or token in content
+            for token in ("datasource", "grafana", "sqlite", "database", "error")
+        )
+    if any(token in title for token in ("down", "unreachable")):
+        return any(token in detail or token in content for token in ("up", "probe", "reach"))
+    return True
+
+
+def _fallback_causal_finding(
+    findings: list[Finding], tool_calls: list[ToolResult], context: IncidentContext | None
+) -> Finding:
+    """Create an honest hypothesis when telemetry supports one, otherwise UNKNOWN."""
+    facts = [
+        finding for finding in findings
+        if _fact_is_relevant_to_incident(finding, context)
+    ]
+    if not facts:
+        return Finding(
+            type=EvidenceType.UNKNOWN,
+            content=(
+                "Root cause is unconfirmed. The retrieved observations do not identify "
+                "a responsible component or support a plausible causal mechanism."
+            ),
+            source=EvidenceSource.SYSTEM,
+            source_detail="causal-verdict enforcement",
+            confidence=0.0,
+        )
+
+    title = (context.title if context else "the incident").lower()
+    if any(token in title for token in ("ceph", "osd", "latency")):
+        mechanism = "storage-path contention or Ceph recovery/backfill activity"
+    elif "cpu" in title:
+        mechanism = "a short-lived workload or I/O burst"
+    elif "datasource" in title:
+        mechanism = "Grafana datasource or database lock contention"
+    elif any(token in title for token in ("down", "unreachable")):
+        mechanism = "a transient target or dependency availability failure"
+    else:
+        mechanism = "a transient resource-contention or dependency event"
+
+    provider_count = len({finding.source for finding in facts})
+    return Finding(
+        type=EvidenceType.HYPOTHESIS,
+        content=(
+            f"The leading hypothesis is {mechanism}. The observed telemetry supports "
+            "this as plausible, but the available process, device, or dependency evidence "
+            "does not yet confirm the responsible mechanism."
+        ),
+        source=EvidenceSource.LLM,
+        source_detail=f"synthesis from {_causal_query_details(tool_calls)}",
+        confidence=0.45 if provider_count > 1 else 0.35,
+    )
+
+
+def _ensure_causal_verdict(
+    findings: list[Finding], tool_calls: list[ToolResult], context: IncidentContext | None = None
+) -> list[Finding]:
+    """Guarantee exactly one explicit, evidence-bounded causal verdict."""
+    candidates = [finding for finding in findings if finding.type in _CAUSAL_FINDING_TYPES]
+    causal_unknowns = [finding for finding in findings if _is_root_cause_unknown(finding)]
+    facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
+
+    selected: Finding
+    if candidates:
+        selected = max(
+            candidates,
+            key=lambda finding: (
+                finding.type == EvidenceType.LIKELY_CAUSE,
+                finding.confidence,
+            ),
+        )
+        # A likely cause needs corroboration. One observation can support a
+        # hypothesis, but not a strongly worded mechanism verdict.
+        if selected.type == EvidenceType.LIKELY_CAUSE and len(facts) < 2:
+            selected = replace(
+                selected,
+                type=EvidenceType.HYPOTHESIS,
+                confidence=min(selected.confidence, 0.55),
+            )
+    elif causal_unknowns:
+        selected = causal_unknowns[0]
+    else:
+        selected = _fallback_causal_finding(findings, tool_calls, context)
+
+    remaining = [
+        finding for finding in findings
+        if finding not in candidates and finding not in causal_unknowns
+    ]
+    return [*remaining, selected]
 
 
 def _ensure_actions(
@@ -788,12 +970,61 @@ def _ensure_actions(
 
 
 def _ensure_causal_verdict_for_mode(
-    findings: list[Finding], tool_calls: list[ToolResult], verification: bool
+    findings: list[Finding], tool_calls: list[ToolResult], verification: bool,
+    context: IncidentContext | None = None,
 ) -> list[Finding]:
     """Apply causal-verdict enforcement only to full investigations."""
     if verification:
         return findings
-    return _ensure_actions(_ensure_causal_verdict(findings, tool_calls), tool_calls)
+    return _ensure_actions(_ensure_causal_verdict(findings, tool_calls, context), tool_calls)
+
+
+def _order_and_link_findings(findings: list[Finding]) -> list[Finding]:
+    """Put findings in reader order and create durable evidence relationships."""
+    facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
+    causal = [
+        finding for finding in findings
+        if finding.type in _CAUSAL_FINDING_TYPES or _is_root_cause_unknown(finding)
+    ][:1]
+    unknowns = [
+        finding for finding in findings
+        if finding.type == EvidenceType.UNKNOWN and not _is_root_cause_unknown(finding)
+    ]
+    recommendations = [
+        finding for finding in findings if finding.type == EvidenceType.RECOMMENDATION
+    ]
+    ordered = [*facts, *causal, *unknowns, *recommendations]
+    fact_indexes = list(range(len(facts)))
+    causal_index = len(facts) if causal else None
+    linked: list[Finding] = []
+    for index, finding in enumerate(ordered):
+        supports = list(finding.supports_evidence)
+        if index == causal_index and not supports:
+            supports = fact_indexes
+        elif finding.type == EvidenceType.RECOMMENDATION and not supports:
+            supports = [causal_index] if causal_index is not None else fact_indexes
+        linked.append(replace(finding, supports_evidence=supports))
+    return linked
+
+
+def _finalize_findings(
+    findings: list[Finding],
+    tool_calls: list[ToolResult],
+    context: IncidentContext | None,
+    incident_id: str,
+    verification: bool,
+) -> list[Finding]:
+    """Apply all validation once before any terminal evidence is persisted."""
+    finalized = [_sanitize_finding(finding) for finding in findings]
+    finalized = _drop_trigger_restatements(finalized, incident_id)
+    if not verification:
+        finalized = _ground_findings_in_data_queries(finalized, tool_calls, context)
+    finalized = _drop_provider_contradictions(_deduplicate_findings(finalized))
+    finalized = _ensure_causal_verdict_for_mode(
+        finalized, tool_calls, verification, context
+    )
+    finalized = _deduplicate_findings(finalized)
+    return _order_and_link_findings(finalized) if not verification else finalized
 
 
 def _ground_findings_in_data_queries(
@@ -1240,6 +1471,7 @@ class InvestigatorLLM:
     RATE_LIMIT_BACKOFF_SECONDS = 30.0
 
     def __init__(self, config: Config):
+        config.validate()
         # Floor for a single request, from LLM_REQUEST_TIMEOUT_SECONDS. It is a
         # floor rather than a cap: `_call_timeout` gives each attempt a share of
         # the remaining investigation budget, so a slow free endpoint is allowed
@@ -1247,21 +1479,25 @@ class InvestigatorLLM:
         # is what made every call time out.
         self.request_timeout = float(getattr(config, "llm_request_timeout_seconds", 0) or 60.0)
 
-        # Build ordered endpoint list from plural env vars only.
+        # Build one aligned ordered endpoint list. Plural configuration is
+        # validated strictly; when it is absent, the legacy single-endpoint
+        # settings remain the documented fallback.
         endpoints: list[tuple[str, str | None, str | None]] = []
         if config.llm_base_urls:
-            keys = config.llm_api_keys or []
-            models = config.llm_models or []
-            for i, url in enumerate(config.llm_base_urls):
-                endpoints.append(
-                    (
-                        url,
-                        keys[i] if i < len(keys) else None,
-                        models[i] if i < len(models) else None,
-                    )
+            endpoints = list(
+                zip(
+                    config.llm_base_urls,
+                    config.llm_api_keys or [],
+                    config.llm_models or [],
+                    strict=True,
                 )
+            )
+        else:
+            endpoints = [(config.llm_base_url, config.llm_api_key, config.llm_model)]
 
-        self.endpoints = endpoints
+        self.endpoints: list[tuple[str, str | None, str | None]] = []
+        self.endpoint_labels: list[str] = []
+        self.quarantined_endpoints: set[int] = set()
         # Each endpoint gets its own OpenAI client. Endpoints without a
         # configured API key are skipped with a warning so the service can
         # still start when LLM credentials are missing (investigations will
@@ -1274,9 +1510,13 @@ class InvestigatorLLM:
                     OpenAI(base_url=url, api_key=key or "", timeout=self.request_timeout)
                 )
                 self.models.append(model or config.llm_model)
+                self.endpoints.append((url, key, model))
+                self.endpoint_labels.append(self._endpoint_identity(url))
             except openai.OpenAIError as e:
                 logger.warning(
-                    "Skipping LLM endpoint %s: missing or invalid credentials (%s)", url, e
+                    "Skipping LLM endpoint %s: missing or invalid credentials (%s)",
+                    self._endpoint_identity(url),
+                    e,
                 )
 
         if not self.clients:
@@ -1284,6 +1524,24 @@ class InvestigatorLLM:
                 "No LLM endpoints with valid credentials configured; "
                 "investigations will fail until an API key is provided"
             )
+
+    @staticmethod
+    def _endpoint_identity(url: str) -> str:
+        """Return a log-safe endpoint identity with credentials/query removed."""
+        try:
+            parsed = urlsplit(url)
+            host = parsed.hostname or "unknown-host"
+            if parsed.port is not None:
+                host = f"{host}:{parsed.port}"
+            path = parsed.path.rstrip("/")
+            return f"{host}{path}" if path else host
+        except (TypeError, ValueError):
+            return "invalid-endpoint"
+
+    @staticmethod
+    def _is_terminal_endpoint_error(error: Exception) -> bool:
+        """Return whether retrying this endpoint cannot repair its configuration."""
+        return isinstance(error, openai.APIStatusError) and error.status_code == 404
 
     def _is_retryable(self, error: Exception) -> bool:
         """Return True for transient errors worth retrying / failing over."""
@@ -1452,6 +1710,15 @@ class InvestigatorLLM:
                 TimeoutError,
             ) as e:
                 last_error = e
+                if self._is_terminal_endpoint_error(e):
+                    self.quarantined_endpoints.add(endpoint_index)
+                    logger.error(
+                        "Quarantining LLM %s after terminal HTTP 404; later turns will "
+                        "skip this endpoint (session=%s)",
+                        endpoint_label,
+                        session,
+                    )
+                    break
                 if self._should_fail_over(
                     e, endpoint_index, attempt, call_timeout, endpoint_label, session
                 ):
@@ -1506,8 +1773,17 @@ class InvestigatorLLM:
         started = _time.monotonic()
 
         last_error: Exception | None = None
+        attempted_endpoint = False
         for idx, (client, model) in enumerate(zip(self.clients, self.models)):
-            endpoint_label = f"endpoint {idx + 1}/{len(self.endpoints)}"
+            if idx in self.quarantined_endpoints:
+                continue
+            attempted_endpoint = True
+            identity = (
+                self.endpoint_labels[idx]
+                if idx < len(self.endpoint_labels)
+                else f"endpoint-{idx + 1}"
+            )
+            endpoint_label = f"endpoint {idx + 1}/{len(self.clients)} ({identity})"
             message, err = self._call_endpoint(
                 client=client,
                 model=model,
@@ -1528,6 +1804,8 @@ class InvestigatorLLM:
         # All endpoints exhausted.
         if last_error is not None:
             raise last_error
+        if not attempted_endpoint and self.quarantined_endpoints:
+            raise RuntimeError("All configured LLM endpoints are quarantined")
         raise RuntimeError("LLM call failed after all endpoints exhausted")  # pragma: no cover
 
 
@@ -1926,6 +2204,165 @@ class PamawasInvestigator:
                 "tools to gather evidence and form hypotheses."
             ),
         }
+
+    @staticmethod
+    def _checkpoint_object(value: Any, fallback: Any) -> Any:
+        """Normalize JSONB values returned by psycopg2 or lightweight fakes."""
+        if value is None:
+            return fallback
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except (json.JSONDecodeError, TypeError):
+                return fallback
+        return value
+
+    def _hydrate_state_from_checkpoint(
+        self,
+        state: InvestigationState,
+        expected_run_kind: str,
+    ) -> str | None:
+        """Reconstruct bounded state for a retry of the same persisted run."""
+        if not self.persistence or not state.request_key_hash:
+            return None
+        checkpoint = self.persistence.load_run_checkpoint(
+            state.incident_id, state.request_key_hash
+        )
+        if not isinstance(checkpoint, dict):
+            return None
+
+        run_kind = str(checkpoint.get("run_kind") or "investigation")
+        if run_kind != expected_run_kind:
+            raise RuntimeError(
+                f"Run kind mismatch for {state.incident_id}: expected "
+                f"{expected_run_kind}, found {run_kind}"
+            )
+        checkpoint_run_id = str(checkpoint.get("run_id") or "")
+        if state.run_id and checkpoint_run_id and state.run_id != checkpoint_run_id:
+            raise RuntimeError(
+                f"Run ID mismatch for {state.incident_id}: expected {state.run_id}, "
+                f"found {checkpoint_run_id}"
+            )
+        state.run_id = checkpoint_run_id or state.run_id
+        state.run_kind = run_kind
+
+        restored_tools: list[ToolResult] = []
+        for row in checkpoint.get("tool_executions") or []:
+            if not isinstance(row, (list, tuple)) or len(row) < 5:
+                continue
+            _, tool_name, raw_arguments, raw_result, duration_ms = row[:5]
+            arguments = self._checkpoint_object(raw_arguments, {})
+            result = self._checkpoint_object(raw_result, {})
+            restored_tools.append(
+                ToolResult(
+                    tool_name=str(tool_name),
+                    arguments=arguments if isinstance(arguments, dict) else {},
+                    result=result if isinstance(result, dict) else {"summary": result},
+                    duration_ms=float(duration_ms or 0),
+                )
+            )
+
+        restored_findings = self._restore_checkpoint_findings(
+            checkpoint.get("evidence") or [], state.run_id
+        )
+
+        state.tool_calls = restored_tools
+        state.findings = restored_findings
+        state.tool_call_count = len(restored_tools)
+        # LLM turns are not persisted because raw conversation transcripts are
+        # deliberately excluded. Count each restored tool execution as one
+        # consumed turn: conservative, bounded, and never resets a retry to a
+        # fresh budget after substantial work was already completed.
+        state.turn_count = min(len(restored_tools), state.max_tool_calls)
+        for call in restored_tools:
+            signature = self._call_signature(call.tool_name, call.arguments)
+            state.seen_calls[signature] = self._truncate_result(call.result)
+            state.seen_call_counts.setdefault(signature, 0)
+
+        state.resumed_from_checkpoint = bool(restored_tools or restored_findings)
+        status = str(checkpoint.get("status") or "")
+        state.completed = status == "completed"
+        if state.resumed_from_checkpoint:
+            logger.info(
+                "Reconstructed run %s with %d tool execution(s) and %d finding(s)",
+                state.run_id,
+                len(restored_tools),
+                len(restored_findings),
+            )
+        return status or None
+
+    @staticmethod
+    def _restore_checkpoint_findings(
+        raw_rows: list[Any], run_id: str | None
+    ) -> list[Finding]:
+        """Restore finding relationships from durable evidence IDs to indexes."""
+        rows = [
+            row
+            for row in raw_rows
+            if isinstance(row, (list, tuple)) and len(row) >= 9
+        ]
+        rows.sort(key=lambda row: int(row[8]))
+        indexes = {str(row[0]): index for index, row in enumerate(rows)}
+        restored: list[Finding] = []
+        for row in rows:
+            try:
+                restored.append(
+                    Finding(
+                        type=EvidenceType(str(row[1])),
+                        content=str(row[2]),
+                        source=EvidenceSource(str(row[3])),
+                        source_detail=str(row[4] or ""),
+                        confidence=float(row[5]),
+                        supports_evidence=[
+                            indexes[str(evidence_id)]
+                            for evidence_id in (row[6] or [])
+                            if str(evidence_id) in indexes
+                        ],
+                        contradicts_evidence=[
+                            indexes[str(evidence_id)]
+                            for evidence_id in (row[7] or [])
+                            if str(evidence_id) in indexes
+                        ],
+                    )
+                )
+            except (TypeError, ValueError):
+                logger.warning("Skipping invalid checkpoint evidence for run %s", run_id)
+        return restored
+
+    def _build_resume_message(self, state: InvestigationState) -> dict:
+        """Build the compact conversation checkpoint supplied on a resumed turn."""
+        tools = [
+            {
+                "sequence": index,
+                "tool": call.tool_name,
+                "arguments_redacted": call.arguments,
+                "result_summary": call.result,
+            }
+            for index, call in enumerate(state.tool_calls)
+        ]
+        findings = [finding.to_dict() for finding in state.findings]
+        checkpoint = self._truncate_context(
+            json.dumps(
+                {"prior_tool_executions": tools, "prior_validated_findings": findings},
+                default=str,
+                sort_keys=True,
+            ),
+            self.config.truncation_limit,
+        )
+        return {
+            "role": "user",
+            "content": (
+                "Resume the SAME persisted investigation attempt. Raw prompts and raw "
+                "provider responses are intentionally not retained. Use this redacted, "
+                "bounded checkpoint as prior conversation state; do not repeat identical "
+                "queries and do not assume details absent from the summaries.\n\n"
+                f"{checkpoint}"
+            ),
+        }
+
+    def _resume_messages(self, state: InvestigationState) -> list[dict]:
+        """Return the optional reconstructed context without branching in the loop."""
+        return [self._build_resume_message(state)] if state.resumed_from_checkpoint else []
 
     def write_day_summary(self, facts: dict) -> str:
         """Write the daily report's prose summary from the given facts.
@@ -2545,11 +2982,9 @@ class PamawasInvestigator:
         """Handle submit_findings tool call."""
         logger.info("Investigation completed via submit_findings")
         findings = [*findings, *state.findings]
-        findings = [_sanitize_finding(f) for f in findings]
-        findings = _drop_trigger_restatements(findings, incident_id)
-        if not verification:
-            findings = _ground_findings_in_data_queries(findings, state.tool_calls, state.context)
-            findings = _ensure_causal_verdict_for_mode(findings, state.tool_calls, verification)
+        findings = _finalize_findings(
+            findings, state.tool_calls, state.context, incident_id, verification
+        )
         state.findings = findings
         state.completed = True
 
@@ -2563,8 +2998,9 @@ class PamawasInvestigator:
                 model_name=self.config.llm_model,
                 prompt_version=PROMPT_VERSION,
                 tool_contract=1,
-                max_tool_calls=self.config.max_tool_calls,
+                max_tool_calls=state.max_tool_calls,
                 service=state.service,
+                run_kind=state.run_kind,
             )
 
     async def _close_verification_on_repeat_budget(
@@ -2607,6 +3043,9 @@ class PamawasInvestigator:
 
         # Mark as completed so the loop terminates with a verdict.
         state.completed = True
+        state.findings = _finalize_findings(
+            state.findings, state.tool_calls, state.context, incident_id, True
+        )
         await self._persist_investigation(
             incident_id=incident_id,
             request_key_hash=request_key_hash,
@@ -2616,15 +3055,14 @@ class PamawasInvestigator:
             model_name=self.config.llm_model,
             prompt_version=PROMPT_VERSION,
             tool_contract=1,
-            max_tool_calls=self.config.max_tool_calls,
+            max_tool_calls=state.max_tool_calls,
             service=state.service,
+            run_kind=state.run_kind,
         )
 
     async def investigate_async(
         self, incident_id: str, request_key_hash: str = ""
     ) -> list[Finding]:
-        """Run the bounded investigation loop; every terminal path persists
-        the run and its evidence."""
         """Run the bounded investigation loop; every terminal path persists
         the run and its evidence.
 
@@ -2655,8 +3093,12 @@ class PamawasInvestigator:
             tool_calls=[],
             max_tool_calls=self.config.max_tool_calls,
             request_key_hash=request_key_hash,
+            run_kind="investigation",
             service=context.affected_services[0] if context.affected_services else None,
         )
+        checkpoint_status = self._hydrate_state_from_checkpoint(state, "investigation")
+        if checkpoint_status == "completed":
+            return state.findings
 
         return await self._run_investigation_loop(
             incident_id=incident_id,
@@ -2666,7 +3108,12 @@ class PamawasInvestigator:
             deadline=deadline,
         )
 
-    async def verify_incident(self, incident_id: str) -> dict[str, Any]:
+    async def verify_incident(
+        self,
+        incident_id: str,
+        request_key_hash: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
         """Return a verdict on whether an incident is still actually down.
 
         This audits a stale-open incident: the Scheduler discovered an incident
@@ -2678,12 +3125,29 @@ class PamawasInvestigator:
         an error — keeps it open. Returns a dict with verdict, a one-line
         reason drawn from the highest-confidence finding, and the findings.
         """
+        request_key_hash = request_key_hash or (
+            f"verification:{incident_id}:{uuid.uuid4().hex}"
+        )
         context = self._get_incident_context(incident_id)
         if hasattr(context, "error") and context.error:
+            findings = self._handle_error_context(context)
+            await self._persist_investigation(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                findings=findings,
+                tool_calls=[],
+                model_provider=self.config.llm_base_url,
+                model_name=self.config.llm_model,
+                prompt_version=PROMPT_VERSION,
+                tool_contract=1,
+                max_tool_calls=self.config.verify_max_tool_calls,
+                service=(context.affected_services or [None])[0],
+                run_kind="verification",
+            )
             return {
                 "verdict": "still_down",
                 "reason": context.error,
-                "findings": [f.to_dict() for f in self._handle_error_context(context)],
+                "findings": [f.to_dict() for f in findings],
             }
 
         state = InvestigationState(
@@ -2693,19 +3157,25 @@ class PamawasInvestigator:
             # A verification is one question, not a full investigation. Keep the
             # budget small so it checks the target's availability and stops.
             max_tool_calls=self.config.verify_max_tool_calls,
-            request_key_hash="verification",
+            request_key_hash=request_key_hash,
+            run_id=run_id,
+            run_kind="verification",
             service=context.affected_services[0] if context.affected_services else None,
         )
+        checkpoint_status = self._hydrate_state_from_checkpoint(state, "verification")
 
-        deadline = time.monotonic() + self.config.verify_timeout_seconds
-        findings = await self._run_investigation_loop(
-            incident_id=incident_id,
-            request_key_hash=f"verification:{incident_id}",
-            state=state,
-            context=context,
-            deadline=deadline,
-            verification=True,
-        )
+        if checkpoint_status == "completed":
+            findings = state.findings
+        else:
+            deadline = time.monotonic() + self.config.verify_timeout_seconds
+            findings = await self._run_investigation_loop(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                state=state,
+                context=context,
+                deadline=deadline,
+                verification=True,
+            )
 
         # Highest-confidence evidence drives the reason. A positive recovery
         # claim closes the incident; the default is still_down so an inconclusive
@@ -2746,7 +3216,9 @@ class PamawasInvestigator:
         context: IncidentContext,
     ) -> list[Finding]:
         """Persist an error-context finding and return the findings."""
-        findings = self._handle_error_context(context)
+        findings = _finalize_findings(
+            self._handle_error_context(context), [], context, incident_id, False
+        )
         await self._persist_investigation(
             incident_id=incident_id,
             request_key_hash=request_key_hash,
@@ -2999,6 +3471,7 @@ class PamawasInvestigator:
         )
 
         messages = [{"role": "system", "content": system_prompt}, initial_message]
+        messages.extend(self._resume_messages(state))
 
         # Investigation loop. Bounded on TURNS (LLM calls), not tool calls: a
         # turn may issue zero tool calls (a prose reply), and if only tool calls
@@ -3087,11 +3560,12 @@ class PamawasInvestigator:
                         confidence=0.0,
                     )
                 )
-                state.findings = _ground_partial_data_queries(
-                    state.tool_calls, verification, state.context
-                ) + state.findings
-                state.findings = _ensure_causal_verdict_for_mode(
-                    state.findings, state.tool_calls, verification
+                state.findings = _finalize_findings(
+                    state.findings,
+                    state.tool_calls,
+                    state.context,
+                    incident_id,
+                    verification,
                 )
                 await self._persist_investigation(
                     incident_id=incident_id,
@@ -3102,8 +3576,9 @@ class PamawasInvestigator:
                     model_name=self.config.llm_model,
                     prompt_version=PROMPT_VERSION,
                     tool_contract=1,
-                    max_tool_calls=self.config.max_tool_calls,
+                    max_tool_calls=state.max_tool_calls,
                     service=state.service,
+                    run_kind=state.run_kind,
                 )
                 return state.findings
 
@@ -3137,8 +3612,12 @@ class PamawasInvestigator:
                 )
             )
 
-        state.findings = _ensure_causal_verdict_for_mode(
-            state.findings, state.tool_calls, verification
+        state.findings = _finalize_findings(
+            state.findings,
+            state.tool_calls,
+            state.context,
+            incident_id,
+            verification,
         )
         increment_findings_by_type(state.findings)
         if exhausted_by in ("deadline", "required_data"):
@@ -3154,8 +3633,9 @@ class PamawasInvestigator:
             model_name=self.config.llm_model,
             prompt_version=PROMPT_VERSION,
             tool_contract=1,
-            max_tool_calls=self.config.max_tool_calls,
+            max_tool_calls=state.max_tool_calls,
             service=state.service,
+            run_kind=state.run_kind,
         )
 
         return state.findings
@@ -3269,8 +3749,12 @@ class PamawasInvestigator:
                 confidence=0.0,
             )
         )
-        state.findings = _ensure_causal_verdict_for_mode(
-            state.findings, state.tool_calls, verification
+        state.findings = _finalize_findings(
+            state.findings,
+            state.tool_calls,
+            state.context,
+            state.incident_id,
+            verification,
         )
         state.completed = True
         return True
@@ -3567,7 +4051,8 @@ class PamawasInvestigator:
                     model_name=self.config.llm_model,
                     prompt_version=PROMPT_VERSION,
                     tool_contract=1,
-                    max_tool_calls=self.config.max_tool_calls,
+                    max_tool_calls=state.max_tool_calls,
+                    run_kind=state.run_kind,
                 )
 
                 self._check_max_tools_reached(state, must_submit, messages)
@@ -3602,8 +4087,9 @@ class PamawasInvestigator:
                         model_name=self.config.llm_model,
                         prompt_version=PROMPT_VERSION,
                         tool_contract=1,
-                        max_tool_calls=self.config.max_tool_calls,
+                        max_tool_calls=state.max_tool_calls,
                         service=state.service,
+                        run_kind=state.run_kind,
                     )
                     return state.findings
 
@@ -3631,19 +4117,20 @@ class PamawasInvestigator:
                     model_name=self.config.llm_model,
                     prompt_version=PROMPT_VERSION,
                     tool_contract=1,
-                    max_tool_calls=self.config.max_tool_calls,
+                    max_tool_calls=state.max_tool_calls,
                     service=state.service,
+                    run_kind=state.run_kind,
                 )
                 return state.findings
             return None
         self._handle_text_response(response, state, must_submit, messages)
         if state.completed:
-            if not verification:
-                state.findings = _ground_findings_in_data_queries(
-                    state.findings, state.tool_calls, state.context
-                )
-            state.findings = _ensure_causal_verdict_for_mode(
-                state.findings, state.tool_calls, verification
+            state.findings = _finalize_findings(
+                state.findings,
+                state.tool_calls,
+                state.context,
+                incident_id,
+                verification,
             )
             increment_findings_by_type(state.findings)
             await self._persist_investigation(
@@ -3655,8 +4142,9 @@ class PamawasInvestigator:
                 model_name=self.config.llm_model,
                 prompt_version=PROMPT_VERSION,
                 tool_contract=1,
-                max_tool_calls=self.config.max_tool_calls,
+                max_tool_calls=state.max_tool_calls,
                 service=state.service,
+                run_kind=state.run_kind,
             )
             return state.findings
         return None
@@ -3673,6 +4161,7 @@ class PamawasInvestigator:
         tool_contract: int,
         max_tool_calls: int,
         service: str | None = None,
+        run_kind: str = "investigation",
     ):
         """Persist investigation run, tool executions, and evidence in a
         transaction (includes enrichment)."""
@@ -3690,6 +4179,7 @@ class PamawasInvestigator:
                 prompt_version=prompt_version,
                 tool_contract=tool_contract,
                 max_tool_calls=max_tool_calls,
+                run_kind=run_kind,
             )
 
             # Update status to running
@@ -3733,6 +4223,7 @@ class PamawasInvestigator:
                 findings=findings,
                 metrics=enriched_metrics,
                 logs=enriched_logs,
+                replace_existing=True,
             )
 
             # Mark run as completed
@@ -3769,6 +4260,7 @@ class PamawasInvestigator:
         prompt_version: str,
         tool_contract: int,
         max_tool_calls: int,
+        run_kind: str = "investigation",
     ):
         """Persist investigation incrementally after each tool call; upserts
         run and appends tool executions/evidence."""
@@ -3785,6 +4277,7 @@ class PamawasInvestigator:
                 prompt_version=prompt_version,
                 tool_contract=tool_contract,
                 max_tool_calls=max_tool_calls,
+                run_kind=run_kind,
             )
 
             # Mark the run as running. Not only when it was just created: the

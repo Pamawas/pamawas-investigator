@@ -169,7 +169,7 @@ class PrometheusFetcher(MetricsFetcher):
                 if isinstance(value_data, list) and len(value_data) >= 2:
                     try:
                         value = float(value_data[1])
-                    except ValueError, TypeError:
+                    except (ValueError, TypeError):
                         value = 0.0
 
             labels = {k: v for k, v in item.get("labels", {}).items() if k != "__name__"}

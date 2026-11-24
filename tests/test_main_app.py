@@ -545,15 +545,22 @@ def test_post_verifications_queues_async_run():
 @pytest.mark.asyncio
 async def test_stale_verification_worker_claims_and_completes(monkeypatch):
     """The async worker claims a queued verification, calls verify_incident, and completes."""
-    claimed = ["inc-stale-1"]
+    claimed = [("inc-stale-1", "irun-stale-1")]
     completed = []
 
     class FakePersistence:
         def claim_next_stale_verification(self):
             return claimed.pop(0) if claimed else None
 
-        def complete_stale_verification(self, incident_id, verdict, reason):
-            completed.append((incident_id, verdict, reason))
+        def get_run_request_key(self, run_id):
+            assert run_id == "irun-stale-1"
+            return "verification:inc-stale-1:attempt-1"
+
+        def update_run_status(self, run_id, status):
+            assert (run_id, status) == ("irun-stale-1", "running")
+
+        def complete_stale_verification(self, incident_id, run_id, verdict, reason):
+            completed.append((incident_id, run_id, verdict, reason))
             # Raise CancelledError to stop worker
             raise asyncio.CancelledError
 
@@ -568,5 +575,57 @@ async def test_stale_verification_worker_claims_and_completes(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await main._stale_verification_worker()
 
-    assert completed == [("inc-stale-1", "recovered", "probe HTTP 200")]
-    fake_investigator.verify_incident.assert_awaited_once_with("inc-stale-1")
+    assert completed == [
+        ("inc-stale-1", "irun-stale-1", "recovered", "probe HTTP 200")
+    ]
+    fake_investigator.verify_incident.assert_awaited_once_with(
+        "inc-stale-1",
+        request_key_hash="verification:inc-stale-1:attempt-1",
+        run_id="irun-stale-1",
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_scheduled_verifications_create_two_unique_runs(monkeypatch):
+    claims = [("inc-stale-2", None), ("inc-stale-2", None)]
+    created = []
+    completed = []
+
+    class FakePersistence:
+        def claim_next_stale_verification(self):
+            return claims.pop(0) if claims else None
+
+        def create_investigation_run(self, **kwargs):
+            created.append(kwargs)
+            return f"irun-{len(created)}", True
+
+        def attach_stale_verification_run(self, incident_id, run_id):
+            return True
+
+        def update_run_status(self, run_id, status):
+            return None
+
+        def complete_stale_verification(self, incident_id, run_id, verdict, reason):
+            completed.append((incident_id, run_id))
+            if len(completed) == 2:
+                raise asyncio.CancelledError
+            return True
+
+    fake_investigator = MagicMock()
+    fake_investigator.persistence = FakePersistence()
+    fake_investigator.config = SimpleNamespace(
+        llm_base_url="https://llm/v1",
+        llm_model="model",
+        verify_max_tool_calls=6,
+    )
+    fake_investigator.verify_incident = AsyncMock(
+        return_value={"verdict": "still_down", "reason": "still failing"}
+    )
+    monkeypatch.setattr(main, "investigator", fake_investigator)
+
+    with pytest.raises(asyncio.CancelledError):
+        await main._stale_verification_worker()
+
+    assert [item["run_kind"] for item in created] == ["verification", "verification"]
+    assert created[0]["request_key_hash"] != created[1]["request_key_hash"]
+    assert completed == [("inc-stale-2", "irun-1"), ("inc-stale-2", "irun-2")]

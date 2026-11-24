@@ -13,6 +13,10 @@ _TIMESTAMP_PREFIX = re.compile(r"^\s*\d{4}-\d{2}-\d{2}T\S+\s+")
 _LEVEL_PREFIX = re.compile(r"^(?:WARN|ERRO|ERROR|INFO|DEBUG|TRACE|FATAL)\s+", re.IGNORECASE)
 _CODE_PREFIX = re.compile(r"^(?:\[[^\]]+\]\s*)?[\w./-]+\.[a-zA-Z]+:\d+:?\s*")
 _METRIC_NAME = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{")
+_PROMQL_MATCHER = re.compile(
+    r'([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|=~)\s*"((?:\\.|[^"\\])*)"'
+)
+_OSD_TARGET = re.compile(r"\bosd[._\s-]*(\d+)\b", re.IGNORECASE)
 _LEVELS = {"warn", "warning", "error", "erro", "info", "debug", "trace", "unknown"}
 
 
@@ -99,6 +103,76 @@ def metric_unit(expression: str, metadata: dict) -> str:
     return unit
 
 
+def _selector_scope_score(labels: dict[str, str], expression: str) -> int:
+    score = 0
+    for key, operator, raw_value in _PROMQL_MATCHER.findall(expression or ""):
+        if operator != "=":
+            continue
+        try:
+            value = str(json.loads(f'"{raw_value}"')).lower()
+        except (json.JSONDecodeError, TypeError):
+            value = raw_value.lower()
+        if labels.get(key.lower()) == value:
+            score += 6
+    return score
+
+
+def _context_scope_score(
+    labels: dict[str, str], context: IncidentContext | None
+) -> int:
+    if context is None:
+        return 0
+    values = list(labels.values())
+    score = 0
+
+    for target in context.affected_services or []:
+        normalized = str(target).strip().lower()
+        if normalized and any(
+            normalized == value or normalized in value or value in normalized
+            for value in values
+        ):
+            score += 5
+
+    osd_match = _OSD_TARGET.search(context.title or "")
+    if osd_match:
+        osd_number = osd_match.group(1)
+        if any(
+            ("osd" in key and value == osd_number)
+            or re.search(rf"\bosd[._-]*{re.escape(osd_number)}\b", value)
+            for key, value in labels.items()
+        ):
+            score += 10
+
+    # Only use title tokens that look like concrete identities. Generic words
+    # such as "latency", "cpu", and "high" must not scope a series.
+    identities = {
+        token.lower()
+        for token in re.findall(r"[a-zA-Z][a-zA-Z0-9_.-]*\d+[a-zA-Z0-9_.-]*", context.title or "")
+    }
+    if any(identity in value for identity in identities for value in values):
+        score += 4
+    return score
+
+
+def _series_scope_score(
+    item: dict, expression: str, context: IncidentContext | None
+) -> int:
+    """Score whether a returned series belongs to the incident target.
+
+    Prometheus can legitimately return several devices or daemons for a broad
+    query. Choosing the two most volatile series then promoted neighbouring
+    OSDs into another OSD's report. Explicit query selectors and stable target
+    identifiers therefore outrank volatility; when no series can be scoped, the
+    caller conservatively falls back to the provider result rather than hiding
+    all telemetry.
+    """
+    raw_labels = item.get("metric", {}) if isinstance(item, dict) else {}
+    labels = {str(key).lower(): str(value).lower() for key, value in raw_labels.items()}
+    return _selector_scope_score(labels, expression) + _context_scope_score(
+        labels, context
+    )
+
+
 def metric_observations(
     result: dict, format_timestamp, expression: str = "",
     context: IncidentContext | None = None,
@@ -115,6 +189,13 @@ def metric_observations(
             candidates.append((item, points))
     if not candidates:
         return ""
+    scoped = [
+        pair
+        for pair in candidates
+        if _series_scope_score(pair[0], expression, context) > 0
+    ]
+    if scoped:
+        candidates = scoped
     candidates.sort(
         key=lambda pair: max(value for _, value in pair[1]) - min(value for _, value in pair[1]),
         reverse=True,

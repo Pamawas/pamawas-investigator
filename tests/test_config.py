@@ -57,3 +57,15 @@ def test_from_env_rejects_non_numeric_port(monkeypatch):
     monkeypatch.setenv("PORT", "invalid")
     with pytest.raises(ValueError):
         Config.from_env()
+
+
+def test_plural_llm_configuration_must_be_aligned():
+    config = Config(
+        database_url="postgres://db",
+        llm_base_urls=["https://one/v1", "https://two/v1"],
+        llm_api_keys=["key-one"],
+        llm_models=["model-one", "model-two"],
+    )
+
+    with pytest.raises(ValueError, match="LLM_API_KEYS must contain exactly 2"):
+        config.validate()

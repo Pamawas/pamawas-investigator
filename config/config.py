@@ -217,3 +217,31 @@ class Config:
 
         if self.port > 65535:
             raise ValueError(f"PORT must be <= 65535, got {self.port}")
+
+        self._validate_llm_configuration()
+
+    def _validate_llm_configuration(self) -> None:
+        """Validate the positional URL/key/model endpoint contract."""
+
+        plural_lists = {
+            "LLM_BASE_URLS": self.llm_base_urls,
+            "LLM_API_KEYS": self.llm_api_keys,
+            "LLM_MODELS": self.llm_models,
+        }
+        if any(values is not None for values in plural_lists.values()):
+            if not self.llm_base_urls:
+                raise ValueError(
+                    "LLM_BASE_URLS must be set when LLM_API_KEYS or LLM_MODELS is set"
+                )
+            expected = len(self.llm_base_urls)
+            for env_var, values in plural_lists.items():
+                if values is None or len(values) != expected:
+                    actual = 0 if values is None else len(values)
+                    raise ValueError(
+                        f"{env_var} must contain exactly {expected} item(s) to align "
+                        f"with LLM_BASE_URLS, got {actual}"
+                    )
+            if any(not value.strip() for value in self.llm_base_urls):
+                raise ValueError("LLM_BASE_URLS entries must not be empty")
+            if any(not value.strip() for value in self.llm_models or []):
+                raise ValueError("LLM_MODELS entries must not be empty")

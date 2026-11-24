@@ -3,6 +3,7 @@
 These tests cover the persistence layer directly, including edge cases and rollback behavior.
 """
 
+import json
 from unittest.mock import MagicMock, patch
 
 import psycopg2
@@ -581,6 +582,7 @@ class TestPoolInitializationIsThreadSafe:
 # ---------------------------------------------------------------------------
 
 INCIDENT_ID_SV = "inc-sv-001"
+RUN_ID_SV = "irun-sv-001"
 
 
 class TestClaimNextStaleVerification:
@@ -597,9 +599,9 @@ class TestClaimNextStaleVerification:
 
         assert result is None
 
-    def test_returns_incident_id_when_row_claimed(self, mock_pool):
+    def test_returns_incident_and_run_id_when_row_claimed(self, mock_pool):
         mock_pool, mock_conn, mock_cursor = mock_pool
-        mock_cursor.fetchone.return_value = (INCIDENT_ID_SV,)
+        mock_cursor.fetchone.return_value = (INCIDENT_ID_SV, RUN_ID_SV)
         mock_cursor.rowcount = 1
 
         with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
@@ -607,7 +609,7 @@ class TestClaimNextStaleVerification:
                 pers = InvestigationPersistence(database_url="test://url")
                 result = pers.claim_next_stale_verification()
 
-        assert result == INCIDENT_ID_SV
+        assert result == (INCIDENT_ID_SV, RUN_ID_SV)
         mock_conn.commit.assert_called()
 
     def test_returns_none_on_db_error(self, mock_pool):
@@ -633,7 +635,7 @@ class TestCompleteStaleVerification:
             with patch.object(InvestigationPersistence, "_put_connection"):
                 pers = InvestigationPersistence(database_url="test://url")
                 result = pers.complete_stale_verification(
-                    INCIDENT_ID_SV, "recovered", "service back up"
+                    INCIDENT_ID_SV, RUN_ID_SV, "recovered", "service back up"
                 )
 
         assert result is True
@@ -648,7 +650,7 @@ class TestCompleteStaleVerification:
             with patch.object(InvestigationPersistence, "_put_connection"):
                 pers = InvestigationPersistence(database_url="test://url")
                 result = pers.complete_stale_verification(
-                    INCIDENT_ID_SV, "still_down", "metrics still elevated"
+                    INCIDENT_ID_SV, RUN_ID_SV, "still_down", "metrics still elevated"
                 )
 
         assert result is False
@@ -660,7 +662,9 @@ class TestCompleteStaleVerification:
         with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
             with patch.object(InvestigationPersistence, "_put_connection"):
                 pers = InvestigationPersistence(database_url="test://url")
-                result = pers.complete_stale_verification(INCIDENT_ID_SV, "still_down", "")
+                result = pers.complete_stale_verification(
+                    INCIDENT_ID_SV, RUN_ID_SV, "still_down", ""
+                )
 
         assert result is False
 
@@ -675,7 +679,9 @@ class TestFailStaleVerification:
         with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
             with patch.object(InvestigationPersistence, "_put_connection"):
                 pers = InvestigationPersistence(database_url="test://url")
-                result = pers.fail_stale_verification(INCIDENT_ID_SV, "LLM timeout")
+                result = pers.fail_stale_verification(
+                    INCIDENT_ID_SV, RUN_ID_SV, "LLM timeout"
+                )
 
         assert result is True
         mock_conn.commit.assert_called()
@@ -687,7 +693,9 @@ class TestFailStaleVerification:
         with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
             with patch.object(InvestigationPersistence, "_put_connection"):
                 pers = InvestigationPersistence(database_url="test://url")
-                result = pers.fail_stale_verification(INCIDENT_ID_SV, "timeout")
+                result = pers.fail_stale_verification(
+                    INCIDENT_ID_SV, RUN_ID_SV, "timeout"
+                )
 
         assert result is False
 
@@ -698,9 +706,30 @@ class TestFailStaleVerification:
         with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
             with patch.object(InvestigationPersistence, "_put_connection"):
                 pers = InvestigationPersistence(database_url="test://url")
-                result = pers.fail_stale_verification(INCIDENT_ID_SV, None)
+                result = pers.fail_stale_verification(INCIDENT_ID_SV, RUN_ID_SV, None)
 
         assert result is True
+
+
+def test_result_summary_is_bounded_for_resume_state():
+    pers = InvestigationPersistence(database_url="test://url")
+    result = {
+        "status": "success",
+        "data": {
+            "result": [
+                {
+                    "metric": {"instance": f"node-{index}"},
+                    "values": [[sample, "1"] for sample in range(1000)],
+                }
+                for index in range(100)
+            ]
+        },
+    }
+
+    summary = pers._summarize_result(result)
+
+    assert len(json.dumps(summary).encode("utf-8")) <= pers.MAX_RESULT_SUMMARY_BYTES
+    assert summary["status"] == "success"
 
 
 class TestRequeueExpiredStaleRunning:

@@ -122,3 +122,47 @@ def test_evidence_rules_apply_to_another_signal_and_arbitrary_schemas(monkeypatc
         "gateway-worker at 18:36:45 WIB: Upstream request failed after timeout."
     )
     assert not any("CPU" in finding.content or "{" in finding.content for finding in first)
+
+
+def test_metric_observation_excludes_neighbouring_osds(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    context = IncidentContext(
+        "inc_osd_4",
+        "Ceph OSD osd.4 latency",
+        started_at="2026-11-23T11:35:10Z",
+        resolved_at="2026-11-23T11:40:10Z",
+        affected_services=["ceph-osd.4"],
+    )
+    calls = [
+        ToolResult(
+            "query_prometheus",
+            {
+                "promql": "ceph_osd_apply_latency_ms",
+                "start": "2026-11-23T11:30:00Z",
+                "end": "2026-11-23T11:45:00Z",
+            },
+            {
+                "status": "success",
+                "metric_metadata": {"unit": "ms"},
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"ceph_daemon": "osd.2", "osd": "2"},
+                            "values": [[1795433700, "9000"], [1795434000, "8000"]],
+                        },
+                        {
+                            "metric": {"ceph_daemon": "osd.4", "osd": "4"},
+                            "values": [[1795433700, "120"], [1795434000, "30"]],
+                        },
+                    ]
+                },
+            },
+            1,
+        )
+    ]
+
+    findings = _ground_findings_in_data_queries([], calls, context)
+
+    assert len(findings) == 1
+    assert "osd.4" in findings[0].content
+    assert "9,000" not in findings[0].content

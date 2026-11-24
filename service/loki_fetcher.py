@@ -150,13 +150,13 @@ class LokiFetcher(LogsFetcher):
         """
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-        except ValueError, AttributeError:
+        except (ValueError, AttributeError):
             end_dt = datetime.now(tz=timezone.utc)
 
         if start:
             try:
                 start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
-            except ValueError, AttributeError:
+            except (ValueError, AttributeError):
                 start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
         else:
             start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
@@ -228,7 +228,7 @@ class LokiFetcher(LogsFetcher):
                 try:
                     ts = float(value[0])
                     line = str(value[1])
-                except ValueError, TypeError:
+                except (ValueError, TypeError):
                     continue
 
                 # Get stream name from labels

@@ -36,6 +36,7 @@ class InvestigationRun:
     prompt_version: str
     tool_contract: int
     max_tool_calls: int
+    run_kind: str = "investigation"
     started_at: datetime | None = None
     completed_at: datetime | None = None
     safe_error_code: str | None = None
@@ -58,6 +59,8 @@ class ToolExecution:
 
 class InvestigationPersistence:
     """Handles persistence of investigation runs, tool executions, and evidence."""
+
+    MAX_RESULT_SUMMARY_BYTES = 64 * 1024
 
     def __init__(self, database_url: str):
         self.database_url = database_url
@@ -123,6 +126,7 @@ class InvestigationPersistence:
         prompt_version: str,
         tool_contract: int,
         max_tool_calls: int,
+        run_kind: str = "investigation",
     ) -> tuple[str, bool]:
         """Create or get existing investigation run; returns (run_id, created_new)."""
         conn = self._get_connection()
@@ -136,9 +140,9 @@ class InvestigationPersistence:
                     INSERT INTO investigation_runs (
                         id, incident_id, request_key_hash, status,
                         model_provider, model_name, prompt_version,
-                        tool_contract, max_tool_calls,
+                        tool_contract, max_tool_calls, run_kind,
                         started_at, created_at, updated_at
-                    ) VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, 'queued', %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (incident_id, request_key_hash) DO NOTHING
                     RETURNING id
                     """,
@@ -151,6 +155,7 @@ class InvestigationPersistence:
                         prompt_version,
                         tool_contract,
                         max_tool_calls,
+                        run_kind,
                         now,
                         now,
                         now,
@@ -184,6 +189,99 @@ class InvestigationPersistence:
             raise
         finally:
             self._put_connection(conn)
+
+    def load_run_checkpoint(
+        self, incident_id: str, request_key_hash: str
+    ) -> dict[str, Any] | None:
+        """Load bounded persisted state used to resume one logical run.
+
+        Raw prompts and provider responses are deliberately not stored. The
+        checkpoint contains only redacted tool arguments, bounded result
+        summaries, and already validated findings.
+        """
+        conn = None
+        try:
+            conn = self._get_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, status, run_kind
+                    FROM investigation_runs
+                    WHERE incident_id = %s AND request_key_hash = %s
+                    """,
+                    (incident_id, request_key_hash),
+                )
+                run = cursor.fetchone()
+                if not run:
+                    conn.commit()
+                    return None
+
+                cursor.execute(
+                    """
+                    SELECT sequence_no, tool_name, arguments_redacted,
+                           result_summary, duration_ms
+                    FROM tool_executions
+                    WHERE run_id = %s
+                    ORDER BY sequence_no
+                    """,
+                    (run[0],),
+                )
+                tools = cursor.fetchall()
+                cursor.execute(
+                    """
+                    SELECT id, type, content, source, source_detail, confidence,
+                           supports_evidence, contradicts_evidence, ordinal
+                    FROM evidence
+                    WHERE run_id = %s
+                    ORDER BY ordinal
+                    """,
+                    (run[0],),
+                )
+                evidence = cursor.fetchall()
+            conn.commit()
+            return {
+                "run_id": run[0],
+                "status": run[1],
+                "run_kind": run[2],
+                "tool_executions": tools,
+                "evidence": evidence,
+            }
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to load run checkpoint: %s", e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return None
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def get_run_request_key(self, run_id: str) -> str | None:
+        """Return the idempotency key for a persisted run."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    "SELECT request_key_hash FROM investigation_runs WHERE id = %s",
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+            conn.commit()
+            return row[0] if row else None
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error("Failed to load request key for run %s: %s", run_id, e)
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return None
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
 
     def requeue_stale_running(self, stale_after_seconds: float) -> int:
         """Return runs abandoned by a dead worker to the queue.
@@ -290,6 +388,7 @@ class InvestigationPersistence:
                     WHERE r.id = (
                         SELECT id FROM investigation_runs
                         WHERE status = 'queued'
+                          AND run_kind = 'investigation'
                         ORDER BY started_at, id
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1
@@ -341,6 +440,38 @@ class InvestigationPersistence:
                             WHEN stale_verifications.status IN ('completed', 'failed') THEN 'queued'
                             ELSE stale_verifications.status
                         END,
+                        run_id = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.run_id
+                        END,
+                        attempts = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN 0
+                            ELSE stale_verifications.attempts
+                        END,
+                        lease_expires_at = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.lease_expires_at
+                        END,
+                        verdict = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.verdict
+                        END,
+                        reason = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.reason
+                        END,
+                        verified_at = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.verified_at
+                        END,
+                        reported_at = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.reported_at
+                        END,
+                        safe_error_code = CASE
+                            WHEN stale_verifications.status IN ('completed', 'failed') THEN NULL
+                            ELSE stale_verifications.safe_error_code
+                        END,
                         next_verify_at = CASE
                             WHEN stale_verifications.status IN ('completed', 'failed')
                                 THEN EXCLUDED.next_verify_at
@@ -372,8 +503,8 @@ class InvestigationPersistence:
             if conn is not None:
                 self._put_connection(conn)
 
-    def claim_next_stale_verification(self) -> str | None:
-        """Atomically claim one queued stale_verifications row; return incident_id or None.
+    def claim_next_stale_verification(self) -> tuple[str, str | None] | None:
+        """Atomically claim one queued verification and return incident/run IDs.
 
         Uses FOR UPDATE SKIP LOCKED so multiple async workers can poll
         simultaneously without racing for the same row.  Returns None if no
@@ -400,7 +531,7 @@ class InvestigationPersistence:
                         FOR UPDATE SKIP LOCKED
                         LIMIT 1
                     )
-                    RETURNING incident_id
+                    RETURNING incident_id, run_id
                     """,
                     (lease_expires, now, now),
                 )
@@ -411,7 +542,7 @@ class InvestigationPersistence:
             conn.commit()
             incident_id = row[0]
             logger.info("Claimed stale_verifications row for incident %s", incident_id)
-            return incident_id
+            return incident_id, row[1]
         except (psycopg2.Error, RuntimeError) as e:
             logger.error("Failed to claim stale_verifications row: %s", e)
             if conn is not None:
@@ -424,7 +555,46 @@ class InvestigationPersistence:
             if conn is not None:
                 self._put_connection(conn)
 
-    def complete_stale_verification(self, incident_id: str, verdict: str, reason: str) -> bool:
+    def attach_stale_verification_run(self, incident_id: str, run_id: str) -> bool:
+        """Attach the unique run created for the currently leased verification."""
+        conn = None
+        try:
+            conn = self._get_connection()
+            now = datetime.now(UTC)
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE stale_verifications
+                    SET run_id = %s, updated_at = %s
+                    WHERE incident_id = %s
+                      AND status = 'running'
+                      AND run_id IS NULL
+                    """,
+                    (run_id, now, incident_id),
+                )
+                updated = cursor.rowcount > 0
+            conn.commit()
+            return updated
+        except (psycopg2.Error, RuntimeError) as e:
+            logger.error(
+                "Failed to attach verification run %s to incident %s: %s",
+                run_id,
+                incident_id,
+                e,
+            )
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except psycopg2.Error:
+                    pass
+            return False
+        finally:
+            if conn is not None:
+                self._put_connection(conn)
+
+    def complete_stale_verification(
+        self, incident_id: str, run_id: str, verdict: str, reason: str
+    ) -> bool:
         """Mark a stale_verifications row completed with verdict + reason.
 
         Only transitions from 'running' to prevent overwriting a row that was
@@ -446,8 +616,9 @@ class InvestigationPersistence:
                         updated_at = %s
                     WHERE incident_id = %s
                       AND status = 'running'
+                      AND run_id = %s
                     """,
-                    (verdict, reason, now, now, incident_id),
+                    (verdict, reason, now, now, incident_id, run_id),
                 )
                 updated = cursor.rowcount > 0
             conn.commit()
@@ -474,7 +645,9 @@ class InvestigationPersistence:
             if conn is not None:
                 self._put_connection(conn)
 
-    def fail_stale_verification(self, incident_id: str, error: str | None) -> bool:
+    def fail_stale_verification(
+        self, incident_id: str, run_id: str, error: str | None
+    ) -> bool:
         """Mark a stale_verifications row as failed.
 
         Conservative: a failed or inconclusive verification is treated as
@@ -494,8 +667,9 @@ class InvestigationPersistence:
                         updated_at = %s
                     WHERE incident_id = %s
                       AND status = 'running'
+                      AND run_id = %s
                     """,
-                    (error, now, incident_id),
+                    (error, now, incident_id, run_id),
                 )
                 updated = cursor.rowcount > 0
             conn.commit()
@@ -929,6 +1103,7 @@ class InvestigationPersistence:
         findings: list[Finding],
         metrics: list[Metric] | None = None,
         logs: list[LogEntry] | None = None,
+        replace_existing: bool = False,
     ) -> list[str]:
         """Insert evidence records for all findings in a transaction; returns evidence IDs."""
         conn = self._get_connection()
@@ -941,16 +1116,34 @@ class InvestigationPersistence:
 
         try:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    "SELECT COALESCE(MAX(ordinal), -1) FROM evidence WHERE run_id = %s",
-                    (run_id,),
-                )
-                row = cursor.fetchone()
-                start_ordinal = (row[0] if row else -1) + 1
+                if replace_existing:
+                    cursor.execute("DELETE FROM evidence WHERE run_id = %s", (run_id,))
+                    start_ordinal = 0
+                else:
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(ordinal), -1) FROM evidence WHERE run_id = %s",
+                        (run_id,),
+                    )
+                    row = cursor.fetchone()
+                    start_ordinal = (row[0] if row else -1) + 1
+
+                evidence_ids = [
+                    f"evd_{uuid.uuid4().hex[:26].upper()}" for _ in findings
+                ]
 
                 for i, finding in enumerate(findings):
                     ordinal = start_ordinal + i
-                    evidence_id = f"evd_{uuid.uuid4().hex[:26].upper()}"
+                    evidence_id = evidence_ids[i]
+                    supports = [
+                        evidence_ids[index]
+                        for index in finding.supports_evidence
+                        if 0 <= index < len(evidence_ids) and index != i
+                    ]
+                    contradicts = [
+                        evidence_ids[index]
+                        for index in finding.contradicts_evidence
+                        if 0 <= index < len(evidence_ids) and index != i
+                    ]
                     cursor.execute(
                         """
                         INSERT INTO evidence (
@@ -976,8 +1169,8 @@ class InvestigationPersistence:
                             finding.source.value,
                             finding.source_detail,
                             finding.confidence,
-                            [],
-                            [],  # supports/contradicts empty for MVP
+                            supports,
+                            contradicts,
                             ordinal,
                             now,
                             metrics_json,
@@ -986,7 +1179,6 @@ class InvestigationPersistence:
                             now,
                         ),
                     )
-                    evidence_ids.append(evidence_id)
 
                 conn.commit()
                 logger.info(f"Inserted {len(evidence_ids)} evidence records for run {run_id}")
@@ -1009,8 +1201,53 @@ class InvestigationPersistence:
                 redacted[k] = v
         return redacted
 
+    @classmethod
+    def _bound_summary_value(
+        cls,
+        value: Any,
+        *,
+        list_limit: int,
+        string_limit: int,
+        depth: int = 0,
+    ) -> Any:
+        """Bound nested provider output while preserving representative data."""
+        if depth >= 6:
+            return "<max-depth>"
+        if isinstance(value, str):
+            if len(value) <= string_limit:
+                return value
+            return value[:string_limit] + "…<truncated>"
+        if isinstance(value, list):
+            bounded = [
+                cls._bound_summary_value(
+                    item,
+                    list_limit=list_limit,
+                    string_limit=string_limit,
+                    depth=depth + 1,
+                )
+                for item in value[:list_limit]
+            ]
+            if len(value) > list_limit:
+                bounded.append(f"<{len(value) - list_limit} more item(s)>")
+            return bounded
+        if isinstance(value, dict):
+            items = list(value.items())
+            bounded = {
+                str(key): cls._bound_summary_value(
+                    item,
+                    list_limit=list_limit,
+                    string_limit=string_limit,
+                    depth=depth + 1,
+                )
+                for key, item in items[:50]
+            }
+            if len(items) > 50:
+                bounded["_truncated_keys"] = len(items) - 50
+            return bounded
+        return value
+
     def _summarize_result(self, result: dict[str, Any]) -> dict[str, Any]:
-        """Create a bounded summary of tool result."""
+        """Create a bounded summary of tool result for durable resume state."""
         summary = {}
         for k, v in result.items():
             if k in ("status", "error", "data", "result"):
@@ -1020,7 +1257,24 @@ class InvestigationPersistence:
             elif isinstance(v, (list, dict)):
                 # Truncate large structures
                 summary[k] = f"<{type(v).__name__} len={len(v)}>"
-        return summary
+        bounded = self._bound_summary_value(
+            summary, list_limit=25, string_limit=2000
+        )
+        if len(json.dumps(bounded, default=str).encode("utf-8")) <= self.MAX_RESULT_SUMMARY_BYTES:
+            return bounded
+        bounded = self._bound_summary_value(
+            summary, list_limit=5, string_limit=500
+        )
+        if len(json.dumps(bounded, default=str).encode("utf-8")) <= self.MAX_RESULT_SUMMARY_BYTES:
+            return bounded
+        return {
+            "status": result.get("status"),
+            "error": self._bound_summary_value(
+                result.get("error", ""), list_limit=1, string_limit=500
+            ),
+            "truncated": True,
+            "summary": "Provider result exceeded the durable checkpoint limit.",
+        }
 
     def _hash_result(self, result: dict[str, Any]) -> str:
         """Create a hash of the result for deduplication."""

@@ -61,6 +61,10 @@ class Finding:
     # Exact query, stream selector, or incident identifier the finding rests on.
     # The source alone says which system answered; this says what was asked.
     source_detail: str = ""
+    # Zero-based indexes into the final validated finding list. Persistence
+    # resolves these indexes to durable evidence IDs after IDs are allocated.
+    supports_evidence: list[int] = field(default_factory=list)
+    contradicts_evidence: list[int] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -70,6 +74,8 @@ class Finding:
             "source": self.source.value,
             "source_detail": self.source_detail,
             "confidence": self.confidence,
+            "supports_evidence": self.supports_evidence,
+            "contradicts_evidence": self.contradicts_evidence,
         }
 
     @classmethod
@@ -81,6 +87,8 @@ class Finding:
             source=EvidenceSource(data["source"]),
             confidence=data["confidence"],
             source_detail=data.get("source_detail", ""),
+            supports_evidence=list(data.get("supports_evidence") or []),
+            contradicts_evidence=list(data.get("contradicts_evidence") or []),
         )
 
 
@@ -172,6 +180,9 @@ class InvestigationState:
     seen_call_counts: dict[str, int] = field(default_factory=dict)
     error: str | None = None
     request_key_hash: str | None = None
+    run_id: str | None = None
+    run_kind: str = "investigation"
+    resumed_from_checkpoint: bool = False
     # Legacy affected-target hint retained for request compatibility. It is not
     # mapped onto any Prometheus or Loki label without schema validation.
     service: str | None = None

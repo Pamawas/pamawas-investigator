@@ -6,11 +6,19 @@ import httpx
 import openai
 import pytest
 
-from models import EvidenceSource, EvidenceType, Finding, IncidentContext, ToolResult
+from models import (
+    EvidenceSource,
+    EvidenceType,
+    Finding,
+    IncidentContext,
+    InvestigationState,
+    ToolResult,
+)
 from service.investigator import (
     InvestigatorLLM,
     PamawasInvestigator,
     _drop_trigger_restatements,
+    _finalize_findings,
     _ground_findings_in_data_queries,
     _logs_from_tool_calls,
     _metrics_from_tool_calls,
@@ -81,6 +89,189 @@ def test_llm_failover_to_next_endpoint_when_first_is_unavailable(config):
     # Endpoint 1 exhausted its retries (called MAX_RETRIES times), then endpoint 2 succeeded.
     assert client1.chat.completions.create.call_count == llm.MAX_RETRIES
     assert client2.chat.completions.create.call_count == 1
+
+
+def test_llm_quarantines_terminal_404_endpoint(config):
+    config.llm_base_urls = ["https://bad.example/v1", "https://good.example/v1"]
+    config.llm_api_keys = ["bad-key", "good-key"]
+    config.llm_models = ["missing-deployment", "healthy-model"]
+
+    not_found_response = httpx.Response(
+        404,
+        request=httpx.Request("POST", "https://bad.example/v1/chat/completions"),
+    )
+    not_found = openai.APIStatusError(
+        message="DeploymentNotFound",
+        response=not_found_response,
+        body={"code": "DeploymentNotFound"},
+    )
+    bad = MagicMock()
+    bad.chat.completions.create.side_effect = not_found
+    good = MagicMock()
+    good.chat.completions.create.return_value.choices = [
+        SimpleNamespace(message=response("healthy"))
+    ]
+
+    with patch("service.investigator.OpenAI", side_effect=[bad, good]):
+        llm = InvestigatorLLM(config)
+
+    assert llm.chat_completion([{"role": "user", "content": "first"}]).content == "healthy"
+    assert llm.chat_completion([{"role": "user", "content": "second"}]).content == "healthy"
+    assert bad.chat.completions.create.call_count == 1
+    assert good.chat.completions.create.call_count == 2
+    assert llm.quarantined_endpoints == {0}
+
+
+def test_checkpoint_reconstructs_tool_cache_findings_and_resume_message(investigator):
+    investigator.config.truncation_limit = 4096
+    checkpoint = {
+        "run_id": "irun_resume",
+        "status": "running",
+        "run_kind": "investigation",
+        "tool_executions": [
+            (
+                0,
+                "query_prometheus",
+                {"promql": 'up{instance="node-a"}', "start": "s", "end": "e"},
+                {"status": "success", "data": {"result": [{"value": [1, "1"]}]}},
+                12,
+            )
+        ],
+        "evidence": [
+            (
+                "evd_1",
+                "hypothesis",
+                "A transient reachability failure is plausible.",
+                "llm",
+                "synthesis from query_prometheus",
+                0.4,
+                [],
+                [],
+                0,
+            )
+        ],
+    }
+    investigator.persistence = MagicMock()
+    investigator.persistence.load_run_checkpoint.return_value = checkpoint
+    state = InvestigationState(
+        incident_id="inc_resume",
+        findings=[],
+        tool_calls=[],
+        max_tool_calls=5,
+        request_key_hash="request-key",
+    )
+
+    status = investigator._hydrate_state_from_checkpoint(state, "investigation")
+
+    assert status == "running"
+    assert state.run_id == "irun_resume"
+    assert state.tool_call_count == 1
+    assert state.turn_count == 1
+    assert state.resumed_from_checkpoint is True
+    assert state.findings[0].type is EvidenceType.HYPOTHESIS
+    signature = investigator._call_signature(
+        "query_prometheus",
+        {"promql": 'up{instance="node-a"}', "start": "s", "end": "e"},
+    )
+    assert signature in state.seen_calls
+    resume = investigator._build_resume_message(state)["content"]
+    assert "SAME persisted investigation attempt" in resume
+    assert "node-a" in resume
+    assert "prior_validated_findings" in resume
+
+
+def test_finalizer_deduplicates_contradictions_and_links_one_hypothesis():
+    context = IncidentContext(
+        "inc_cpu",
+        "High CPU on node-a",
+        started_at="2026-11-23T11:35:00Z",
+        resolved_at="2026-11-23T11:40:00Z",
+        affected_services=["node-a"],
+    )
+    calls = [
+        ToolResult(
+            "query_prometheus",
+            {
+                "promql": 'cpu_usage{instance="node-a"}',
+                "start": "2026-11-23T11:30:00Z",
+                "end": "2026-11-23T11:45:00Z",
+            },
+            {
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"instance": "node-a"},
+                            "values": [[1795433700, "92"], [1795434000, "60"]],
+                        }
+                    ]
+                },
+            },
+            1,
+        )
+    ]
+    submitted = [
+        Finding(EvidenceType.UNKNOWN, "No metric data was returned.", EvidenceSource.SYSTEM, 0),
+        Finding(
+            EvidenceType.HYPOTHESIS,
+            "A short-lived workload burst may have caused the CPU spike.",
+            EvidenceSource.LLM,
+            0.6,
+        ),
+        Finding(
+            EvidenceType.HYPOTHESIS,
+            "A short lived workload burst may have caused the CPU spike",
+            EvidenceSource.LLM,
+            0.5,
+        ),
+    ]
+
+    finalized = _finalize_findings(submitted, calls, context, context.incident_id, False)
+
+    causal = [
+        finding
+        for finding in finalized
+        if finding.type in (EvidenceType.HYPOTHESIS, EvidenceType.LIKELY_CAUSE)
+    ]
+    assert len(causal) == 1
+    assert not any("no metric data" in finding.content.lower() for finding in finalized)
+    causal_index = finalized.index(causal[0])
+    assert causal[0].supports_evidence == [0]
+    recommendations = [
+        finding for finding in finalized if finding.type is EvidenceType.RECOMMENDATION
+    ]
+    assert recommendations
+    assert recommendations[0].supports_evidence == [causal_index]
+
+
+@pytest.mark.asyncio
+async def test_terminal_persistence_replaces_partial_evidence_and_keeps_run_kind(investigator):
+    investigator.persistence = MagicMock()
+    investigator.persistence.create_investigation_run.return_value = ("irun_1", False)
+    finding = Finding(
+        EvidenceType.UNKNOWN,
+        "Unable to confirm current health.",
+        EvidenceSource.SYSTEM,
+        0.0,
+    )
+
+    await investigator._persist_investigation(
+        incident_id="inc_1",
+        request_key_hash="verification:inc_1:attempt",
+        findings=[finding],
+        tool_calls=[],
+        model_provider="https://llm/v1",
+        model_name="model",
+        prompt_version="v15",
+        tool_contract=1,
+        max_tool_calls=6,
+        run_kind="verification",
+    )
+
+    create_kwargs = investigator.persistence.create_investigation_run.call_args.kwargs
+    evidence_kwargs = investigator.persistence.insert_evidence.call_args.kwargs
+    assert create_kwargs["run_kind"] == "verification"
+    assert evidence_kwargs["replace_existing"] is True
 
 
 def test_connect_db_success_and_failure(config):
@@ -156,7 +347,7 @@ def test_investigate_returns_context_error(investigator):
     )
     findings = investigator.investigate("x")
     assert findings[0].type is EvidenceType.UNKNOWN
-    assert "db failed" in findings[0].content
+    assert any("db failed" in finding.content for finding in findings)
 
 
 def test_investigate_executes_tool_then_submits_findings(investigator):
@@ -431,15 +622,15 @@ def test_investigate_final_text_without_data_becomes_unknown(investigator):
     assert any(finding.type is EvidenceType.RECOMMENDATION for finding in findings)
     assert findings[0].type is EvidenceType.UNKNOWN
     assert findings[0].confidence == 0.0
-    assert "without calling any tools" in findings[0].content
+    assert any("without calling any tools" in finding.content for finding in findings)
 
 
 def test_investigate_returns_unknown_when_llm_raises(investigator):
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
     investigator.llm.chat_completion = MagicMock(side_effect=RuntimeError("LLM unavailable"))
-    finding = investigator.investigate("inc")[0]
-    assert finding.type is EvidenceType.UNKNOWN
-    assert "LLM unavailable" in finding.content
+    findings = investigator.investigate("inc")
+    assert findings[0].type is EvidenceType.UNKNOWN
+    assert any("LLM unavailable" in finding.content for finding in findings)
 
 
 def test_investigate_handles_large_tool_result_without_invalid_json(investigator):
@@ -476,7 +667,7 @@ def test_text_only_turns_are_bounded_by_turn_budget(investigator):
     assert investigator.llm.chat_completion.call_count == 3
     # Prose cannot bypass the required Prometheus/Loki data-query gate.
     assert findings[0].type is EvidenceType.UNKNOWN
-    assert "without calling any tools" in findings[0].content
+    assert any("without calling any tools" in finding.content for finding in findings)
 
 
 def test_repeated_text_only_turns_force_data_queries_then_stop_unknown(investigator):
@@ -502,7 +693,10 @@ def test_repeated_text_only_turns_force_data_queries_then_stop_unknown(investiga
         + investigator.MAX_REQUIRED_QUERY_FAILURES
     )
     assert findings[0].type is EvidenceType.UNKNOWN
-    assert "required data queries did not succeed" in findings[0].content
+    assert any(
+        "required data queries did not succeed" in finding.content
+        for finding in findings
+    )
 
 
 def test_required_query_failure_preserves_successful_provider_evidence(investigator):
