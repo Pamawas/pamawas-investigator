@@ -59,7 +59,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v15"
+PROMPT_VERSION = "pamawas-investigator-v16"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -364,23 +364,50 @@ def _required_data_tools(verification: bool = False) -> tuple[str, ...]:
 def _missing_required_data_tools(
     tool_calls: list[ToolResult], verification: bool = False
 ) -> tuple[str, ...]:
-    """Return required data queries that have not completed successfully."""
-    successful = {
-        call.tool_name
-        for call in tool_calls
-        if call.tool_name in _required_data_tools(verification)
-        and isinstance(call.result, dict)
-        and call.result.get("status") == "success"
-        and (
-            call.tool_name != "query_prometheus"
-            or _prometheus_has_numeric_samples(call.result)
+    """Return data queries still needed before findings may be accepted.
+
+    A full investigation needs usable evidence from at least one relevant
+    telemetry provider, not successful coverage from every provider. It should
+    gather two distinct data observations when possible so the alert signal is
+    not mistaken for its own cause. Those observations may both come from the
+    same provider. Verification remains Prometheus-specific.
+    """
+    successful: list[ToolResult] = []
+    seen: set[tuple[str, str]] = set()
+    for call in tool_calls:
+        if not (
+            call.tool_name in _required_data_tools(verification)
+            and isinstance(call.result, dict)
+            and call.result.get("status") == "success"
+            and (
+                call.tool_name != "query_prometheus"
+                or _prometheus_has_numeric_samples(call.result)
+            )
+        ):
+            continue
+        signature = (
+            call.tool_name,
+            json.dumps(call.arguments, sort_keys=True, default=str),
         )
-    }
-    return tuple(
-        tool_name
-        for tool_name in _required_data_tools(verification)
-        if tool_name not in successful
-    )
+        if signature in seen:
+            continue
+        seen.add(signature)
+        successful.append(call)
+
+    if verification:
+        successful_names = {call.tool_name for call in successful}
+        return tuple(
+            tool_name
+            for tool_name in _required_data_tools(True)
+            if tool_name not in successful_names
+        )
+    if len(successful) >= 2:
+        return ()
+    if successful:
+        # Ask the provider that already has target coverage for one distinct
+        # causal query instead of forcing an unrelated provider to succeed.
+        return (successful[-1].tool_name,)
+    return _FULL_INVESTIGATION_DATA_TOOLS
 
 
 def _pending_data_tools(state: InvestigationState, verification: bool) -> tuple[str, ...]:
@@ -891,12 +918,13 @@ def _fallback_causal_finding(
         mechanism = "a transient resource-contention or dependency event"
 
     provider_count = len({finding.source for finding in facts})
+    observation = facts[0].content.strip().rstrip(".")
     return Finding(
         type=EvidenceType.HYPOTHESIS,
         content=(
-            f"The leading hypothesis is {mechanism}. The observed telemetry supports "
-            "this as plausible, but the available process, device, or dependency evidence "
-            "does not yet confirm the responsible mechanism."
+            f"The leading hypothesis is {mechanism}. This is supported by the observed "
+            f"pattern: {observation}. The mechanism remains unconfirmed until process, "
+            "device, or dependency telemetry is compared over the same window."
         ),
         source=EvidenceSource.LLM,
         source_detail=f"synthesis from {_causal_query_details(tool_calls)}",
@@ -929,10 +957,18 @@ def _ensure_causal_verdict(
                 type=EvidenceType.HYPOTHESIS,
                 confidence=min(selected.confidence, 0.55),
             )
-    elif causal_unknowns:
-        selected = causal_unknowns[0]
     else:
-        selected = _fallback_causal_finding(findings, tool_calls, context)
+        fallback = _fallback_causal_finding(findings, tool_calls, context)
+        # A model may answer UNKNOWN merely because one optional provider was
+        # unavailable. When another provider returned an incident-relevant
+        # observation, retain that source gap but prefer the bounded,
+        # confidence-capped hypothesis supported by the available evidence.
+        if fallback.type == EvidenceType.HYPOTHESIS:
+            selected = fallback
+        elif causal_unknowns:
+            selected = causal_unknowns[0]
+        else:
+            selected = fallback
 
     remaining = [
         finding for finding in findings
@@ -941,10 +977,75 @@ def _ensure_causal_verdict(
     return [*remaining, selected]
 
 
+def _fallback_hypothesis_action(
+    hypothesis: Finding, context: IncidentContext | None
+) -> Finding:
+    """Create one concrete test tied to a deterministic fallback hypothesis."""
+    title = (context.title if context else "").lower()
+    targets = ", ".join((context.affected_services or [])[:2]) if context else ""
+    target = targets or "the affected target"
+    if any(token in title for token in ("ceph", "osd", "latency")):
+        content = (
+            f"For {target}, compare device I/O latency and queue depth with Ceph "
+            "recovery/backfill and slow-op metrics over the same window as the recorded "
+            "OSD latency spike. If they rise together, reduce recovery pressure or isolate "
+            "the affected disk/network path, then verify latency returns to baseline."
+        )
+    elif "cpu" in title:
+        content = (
+            f"For {target}, compare per-process CPU, load, I/O wait, and workload events over "
+            "the same window as the CPU spike. Identify the process whose increase aligns "
+            "with the metric, mitigate that workload, and verify CPU returns to baseline."
+        )
+    elif "datasource" in title:
+        content = (
+            f"For {target}, compare datasource request latency/errors with database locks, "
+            "connection saturation, and restarts over the same window. Test the component "
+            "whose timeline aligns with the observed failure before changing configuration."
+        )
+    elif any(token in title for token in ("down", "unreachable")):
+        content = (
+            f"For {target}, compare probe failures with target, network, and dependency "
+            "availability over the same window. Test the first component whose state change "
+            "aligns with the outage, then verify the probe remains healthy."
+        )
+    else:
+        content = (
+            f"For {target}, collect one materially distinct resource or dependency signal over "
+            "the same window and test whether it changes with the recorded symptom before "
+            "promoting the hypothesis to a likely cause."
+        )
+    return Finding(
+        type=EvidenceType.RECOMMENDATION,
+        content=content,
+        source=EvidenceSource.SYSTEM,
+        source_detail=hypothesis.source_detail,
+        confidence=1.0,
+    )
+
+
 def _ensure_actions(
-    findings: list[Finding], tool_calls: list[ToolResult]
+    findings: list[Finding], tool_calls: list[ToolResult],
+    context: IncidentContext | None = None,
 ) -> list[Finding]:
     """Keep operator actions available even when the model or a provider fails."""
+    fallback_hypothesis = next(
+        (
+            finding for finding in findings
+            if finding.type == EvidenceType.HYPOTHESIS
+            and finding.content.startswith("The leading hypothesis is ")
+        ),
+        None,
+    )
+    if fallback_hypothesis is not None:
+        without_actions = [
+            finding for finding in findings
+            if finding.type != EvidenceType.RECOMMENDATION
+        ]
+        return [
+            *without_actions,
+            _fallback_hypothesis_action(fallback_hypothesis, context),
+        ]
     if any(finding.type == EvidenceType.RECOMMENDATION for finding in findings):
         return findings
     telemetry = next((finding for finding in findings if finding.type == EvidenceType.FACT), None)
@@ -976,7 +1077,11 @@ def _ensure_causal_verdict_for_mode(
     """Apply causal-verdict enforcement only to full investigations."""
     if verification:
         return findings
-    return _ensure_actions(_ensure_causal_verdict(findings, tool_calls, context), tool_calls)
+    return _ensure_actions(
+        _ensure_causal_verdict(findings, tool_calls, context),
+        tool_calls,
+        context,
+    )
 
 
 def _order_and_link_findings(findings: list[Finding]) -> list[Finding]:
@@ -2031,10 +2136,15 @@ class PamawasInvestigator:
             "If the Loki selector schema is unknown, call get_loki_labels once. Then request "
             "values for one promising returned label and immediately run the data query. Never "
             "repeat catalogs and never treat catalog output as evidence.\n"
-            "- A full investigation MUST attempt both query_prometheus and query_loki. "
-            "Successful telemetry queries supply evidence; bounded provider failures supply "
-            "source gaps. Catalog and label discovery never supply incident facts. "
-            "The harness enforces real data queries and bounded retries.\n"
+            "- A full investigation MUST obtain usable evidence from at least one relevant "
+            "provider. Attempt the other provider only when it can answer a distinct causal "
+            "question and its discovered schema covers the incident target. Some targets have "
+            "metrics without logs or logs without metrics; absence from one provider is a source "
+            "gap, not a reason to discard evidence from the other. Catalog and label discovery "
+            "never supply incident facts.\n"
+            "- The alert's primary metric or log confirms the symptom, not its cause. After that "
+            "first observation, use the same provider or another relevant provider for at least "
+            "one materially distinct causal query when available.\n"
             "- Prometheus HTTP success with zero numeric series is not evidence and does not "
             "satisfy the gate. When the harness returns metric_candidates, retry with an exact "
             "returned metric name and an evidence-appropriate PromQL transformation.\n"
@@ -2054,9 +2164,10 @@ class PamawasInvestigator:
             "2. Identify the smallest set of unresolved questions needed to explain the "
             "incident. Consider the primary signal, correlated symptoms, dependencies, "
             "recent changes when a change source exists, and recurrence when history matters.\n"
-            "3. Query Prometheus for the primary signal and its timeline. Query Loki for "
-            "explanatory or contradictory events in the same window. Query related incidents "
-            "when recurrence changes the operator action.\n"
+            "3. Query the provider that carries the primary signal and its timeline. Use the "
+            "other provider for explanatory or contradictory evidence only when it has relevant "
+            "target coverage. Query related incidents when recurrence changes the operator "
+            "action.\n"
             "4. Use the alert's original identifiers, expression, and time window when available. "
             "When a backend schema is unknown, perform one bounded discovery pass, validate "
             "a candidate key and value, then run the data query. Never invent schema.\n"
@@ -2098,9 +2209,15 @@ class PamawasInvestigator:
             "FACT. Never claim a source was not checked after its result is already present.\n\n"
             "SUBMISSION:\n"
             "- Use submit_findings; prose alone does not complete the investigation.\n"
-            "- Submit after both providers have returned data or exhausted bounded attempts. "
-            "A cause can be supported by one provider; evaluate the evidence and mechanism, "
-            "not the count of successful providers. Do not submit after catalog discovery alone.\n"
+            "- Submit after at least one relevant provider has returned usable data. If another "
+            "provider was attempted but lacks target coverage or exhausts bounded attempts, record "
+            "that source gap and continue. A cause can be supported by one provider; evaluate the "
+            "evidence and mechanism, not the count of successful providers. Do not submit after "
+            "catalog discovery alone.\n"
+            "- Prefer two distinct observations before a causal verdict. They may come from the "
+            "same provider. If bounded attempts cannot obtain the second observation, state a "
+            "low-confidence hypothesis that quotes the successful observation and recommend the "
+            "specific next measurement that would confirm or reject it.\n"
             "- Every full investigation MUST contain exactly one causal verdict: LIKELY_CAUSE "
             "when the mechanism is strongly supported, HYPOTHESIS when it is plausible but "
             "unconfirmed, or UNKNOWN explicitly stating that the root cause was not established. "
@@ -2610,6 +2727,18 @@ class PamawasInvestigator:
                         {
                             "status": "error",
                             "error": "query_loki requires logql, start, end",
+                        },
+                        None,
+                        False,
+                    )
+                if _LOGQL_SELECTOR.search(str(logql)) is None:
+                    return (
+                        {
+                            "status": "error",
+                            "error": (
+                                "query_loki requires a LogQL stream selector such as "
+                                "{job=\"...\"}; do not send PromQL or a metric expression"
+                            ),
                         },
                         None,
                         False,
@@ -3706,6 +3835,22 @@ class PamawasInvestigator:
                     ),
                 }
             )
+            return False
+
+        if not verification and all(
+            _successful_tool_calls(state.tool_calls, name) for name in missing
+        ):
+            # The provider already returned usable primary evidence; only the
+            # additional, materially distinct causal query failed. Waive the
+            # second-observation preference without falsely claiming that the
+            # provider itself was unavailable.
+            state.exhausted_data_tools.update(missing)
+            state.required_query_enforcement = False
+            messages.append({"role": "user", "content": (
+                "Additional distinct query attempts are exhausted. Submit a low-confidence "
+                "cause assessment and a concrete test based on the successful observation. "
+                "Do not claim the successful provider returned no data."
+            )})
             return False
 
         if not verification and any(

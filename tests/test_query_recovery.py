@@ -42,6 +42,47 @@ async def test_loki_recovery_uses_its_own_keys_and_values():
 
 
 @pytest.mark.asyncio
+async def test_loki_recovery_stops_after_incident_identity_labels_do_not_match():
+    """Missing Loki target coverage does not trigger unrelated label enumeration."""
+    async def label_values(label):
+        values = {
+            "instance": ["armbian-2", "koba-labs"],
+            "job": ["system_journal", "kube_logs"],
+        }
+        return {"status": "success", "data": values[label]}
+
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={
+            "status": "success",
+            "data": ["boot_id", "cluster", "filename", "instance", "job"],
+        }),
+        query_label_values=AsyncMock(side_effect=label_values),
+        query_range=AsyncMock(),
+    )
+    incident = IncidentContext(
+        "inc_ceph",
+        "Ceph OSD High Latency",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["10.1.1.4:9283", "osd.1"],
+        events=[{"labels": {
+            "instance": "10.1.1.4:9283",
+            "job": "proxmox_ceph",
+            "ceph_daemon": "osd.1",
+        }}],
+    )
+    recovery = QueryRecovery(SimpleNamespace(_loki_adapter=adapter), incident, 100)
+
+    await recovery.recover_loki()
+
+    assert [call.args[0] for call in adapter.query_label_values.await_args_list] == [
+        "instance",
+        "job",
+    ]
+    adapter.query_range.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_counter_recovery_preserves_rate_query_and_meaningful_observations(monkeypatch):
     monkeypatch.setenv("TZ", "Asia/Jakarta")
     adapter = SimpleNamespace(

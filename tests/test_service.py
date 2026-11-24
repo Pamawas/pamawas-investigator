@@ -421,8 +421,8 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     assert investigator.llm.chat_completion.call_count == 3
 
 
-def test_early_submission_is_rejected_until_both_data_queries_succeed(investigator):
-    """Metadata or discovery alone can never complete a full investigation."""
+def test_early_submission_is_rejected_until_one_data_query_succeeds(investigator):
+    """Discovery alone cannot complete a run; one relevant provider can."""
     investigator.config.max_tool_calls = 4
     investigator._get_incident_context = MagicMock(
         return_value=IncidentContext("inc", "Outage")
@@ -448,6 +448,7 @@ def test_early_submission_is_rejected_until_both_data_queries_succeed(investigat
     )
 
     choices = []
+    forced_prometheus_calls = 0
 
     def complete(
         messages,
@@ -457,6 +458,7 @@ def test_early_submission_is_rejected_until_both_data_queries_succeed(investigat
         session="",
         budget_seconds=None,
     ):
+        nonlocal forced_prometheus_calls
         choices.append(tool_choice)
         forced_name = (
             tool_choice.get("function", {}).get("name")
@@ -464,11 +466,16 @@ def test_early_submission_is_rejected_until_both_data_queries_succeed(investigat
             else None
         )
         if forced_name == "query_prometheus":
+            forced_prometheus_calls += 1
             return response(
                 tool_calls=[
                     tool_call(
                         "query_prometheus",
-                        {"promql": "metric_from_discovered_schema", "start": "s", "end": "e"},
+                        {
+                            "promql": f"metric_from_discovered_schema_{forced_prometheus_calls}",
+                            "start": "s",
+                            "end": "e",
+                        },
                     )
                 ]
             )
@@ -510,9 +517,10 @@ def test_early_submission_is_rejected_until_both_data_queries_succeed(investigat
         for choice in choices
         if isinstance(choice, dict)
     ]
-    assert forced_names == ["query_prometheus", "query_loki", "submit_findings"]
-    assert investigator.tools._prometheus_adapter.query_range.await_count == 1
-    assert investigator.tools._loki_adapter.query_range.await_count == 1
+    assert forced_names[0] == "query_prometheus"
+    assert "query_loki" not in forced_names
+    assert investigator.tools._prometheus_adapter.query_range.await_count == 2
+    assert investigator.tools._loki_adapter.query_range.await_count == 0
 
 
 def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
@@ -542,6 +550,7 @@ def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
     )
 
     auto_turn = 0
+    forced_prometheus_calls = 0
 
     def complete(
         messages,
@@ -551,18 +560,23 @@ def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
         session="",
         budget_seconds=None,
     ):
-        nonlocal auto_turn
+        nonlocal auto_turn, forced_prometheus_calls
         forced_name = (
             tool_choice.get("function", {}).get("name")
             if isinstance(tool_choice, dict)
             else None
         )
         if forced_name == "query_prometheus":
+            forced_prometheus_calls += 1
             return response(
                 tool_calls=[
                     tool_call(
                         "query_prometheus",
-                        {"promql": "validated_metric", "start": "s", "end": "e"},
+                        {
+                            "promql": f"validated_metric_{forced_prometheus_calls}",
+                            "start": "s",
+                            "end": "e",
+                        },
                     )
                 ]
             )
@@ -608,8 +622,8 @@ def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
     findings = investigator.investigate("inc")
 
     assert any(finding.type is EvidenceType.UNKNOWN for finding in findings)
-    assert investigator.tools._prometheus_adapter.query_range.await_count == 1
-    assert investigator.tools._loki_adapter.query_range.await_count == 1
+    assert investigator.tools._prometheus_adapter.query_range.await_count == 2
+    assert investigator.tools._loki_adapter.query_range.await_count == 0
 
 
 def test_investigate_final_text_without_data_becomes_unknown(investigator):
@@ -699,8 +713,8 @@ def test_repeated_text_only_turns_force_data_queries_then_stop_unknown(investiga
     )
 
 
-def test_required_query_failure_preserves_successful_provider_evidence(investigator):
-    """One failed source must not hide deterministic data from a successful source."""
+def test_single_provider_can_finish_when_second_distinct_query_is_exhausted(investigator):
+    """One usable source survives when an additional causal query cannot be obtained."""
     from models import InvestigationState
 
     state = InvestigationState(
@@ -727,17 +741,15 @@ def test_required_query_failure_preserves_successful_provider_evidence(investiga
     )
     messages = []
 
-    for _ in range(investigator.MAX_REQUIRED_QUERY_FAILURES - 1):
+    for _ in range(investigator.MAX_REQUIRED_QUERY_FAILURES):
         assert not investigator._record_required_query_failure(
             state, messages, verification=False
         )
-    assert not investigator._record_required_query_failure(
-        state, messages, verification=False
-    )
     assert not state.completed
-    assert state.exhausted_data_tools == {"query_loki"}
-    assert "Submit a cause assessment" in messages[-1]["content"]
-    assert "query_loki" in state.findings[0].content
+    assert not state.required_query_enforcement
+    assert state.exhausted_data_tools == {"query_prometheus"}
+    assert "Additional distinct query attempts are exhausted" in messages[-1]["content"]
+    assert state.findings == []
 
 
 def test_text_patience_escalates_only_at_the_limit(investigator):
@@ -1137,6 +1149,27 @@ async def test_execute_tool_repairs_weak_model_logql_syntax_and_limit(investigat
 
 
 @pytest.mark.asyncio
+async def test_execute_tool_rejects_promql_sent_to_loki(investigator):
+    """A metric expression is not retried against the logs backend."""
+    investigator.tools._loki_adapter.query_range = AsyncMock()
+
+    result, findings, is_final = await investigator._execute_tool(
+        "query_loki",
+        {
+            "logql": "sum by (ceph_daemon) (rate(ceph_osd_latency_ms[1m]))",
+            "start": "2026-11-24T06:45:00Z",
+            "end": "2026-11-24T07:00:00Z",
+        },
+    )
+
+    assert result["status"] == "error"
+    assert "requires a LogQL stream selector" in result["error"]
+    assert findings is None
+    assert is_final is False
+    investigator.tools._loki_adapter.query_range.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(investigator):
     """HTTP 200 with zero series must trigger schema-neutral metric discovery."""
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
@@ -1312,7 +1345,9 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "call get_loki_labels once" in prompt
     assert "Metrics describe what changed; logs may explain why" in prompt
     assert "never treat catalog output as evidence" in prompt
-    assert "MUST attempt both query_prometheus and query_loki" in prompt
+    assert "MUST obtain usable evidence from at least one relevant provider" in prompt
+    assert "metrics without logs or logs without metrics" in prompt
+    assert "at least one materially distinct causal query" in prompt
     assert "A cause can be supported by one provider" in prompt
     assert "zero numeric series is not evidence" in prompt
     assert "zero-entry Loki result is accepted only after" in prompt
@@ -1321,8 +1356,8 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "The current incident is the investigation premise, not a finding" in prompt
     assert "Restating the triggering alert is not a finding" in prompt
     assert "DECISION PROCEDURE" in prompt
-    assert "Query Prometheus for the primary signal and its timeline" in prompt
-    assert "Query Loki for explanatory or contradictory events" in prompt
+    assert "Query the provider that carries the primary signal" in prompt
+    assert "only when it has relevant target coverage" in prompt
     assert "Query related incidents when recurrence changes the operator action" in prompt
     assert "perform one bounded discovery pass" in prompt
     assert "TOOL DISCIPLINE" in prompt
@@ -1577,6 +1612,83 @@ def test_log_count_alone_does_not_get_promoted_to_a_cause():
     assert completed[-1].type is EvidenceType.UNKNOWN
     assert completed[-1].confidence == 0.0
     assert "causal mechanism" in completed[-1].content
+
+
+def test_single_provider_fact_outranks_provider_gap_root_cause_unknown():
+    """Missing Loki coverage lowers confidence but does not erase a Prometheus hypothesis."""
+    from service.investigator import _ensure_causal_verdict_for_mode
+
+    tool_calls = [
+        ToolResult(
+            tool_name="query_prometheus",
+            arguments={
+                "promql": 'ceph_osd_apply_latency_ms{ceph_daemon="osd.1"}',
+                "start": "s",
+                "end": "e",
+            },
+            result={
+                "status": "success",
+                "data": {
+                    "result": [
+                        {
+                            "metric": {"ceph_daemon": "osd.1"},
+                            "values": [[1, "68"], [2, "271"]],
+                        }
+                    ]
+                },
+            },
+            duration_ms=1,
+        )
+    ]
+    findings = [
+        Finding(
+            type=EvidenceType.FACT,
+            content="Ceph OSD latency peaked at 271 ms.",
+            source=EvidenceSource.PROMETHEUS,
+            source_detail='query_prometheus: ceph_osd_apply_latency_ms{ceph_daemon="osd.1"}',
+            confidence=1.0,
+        ),
+        Finding(
+            type=EvidenceType.UNKNOWN,
+            content="Root cause could not be determined because Loki had no matching target.",
+            source=EvidenceSource.SYSTEM,
+            confidence=0.0,
+        ),
+        Finding(
+            type=EvidenceType.UNKNOWN,
+            content="No usable data from query_loki after bounded attempts.",
+            source=EvidenceSource.SYSTEM,
+            confidence=0.0,
+        ),
+        Finding(
+            type=EvidenceType.RECOMMENDATION,
+            content="Inspect logs because no cause was found.",
+            source=EvidenceSource.LLM,
+            confidence=0.5,
+        ),
+    ]
+    context = IncidentContext(
+        "inc_ceph",
+        "Ceph OSD High Latency",
+        affected_services=["10.1.1.4:9283", "proxmox_ceph"],
+    )
+
+    completed = _ensure_causal_verdict_for_mode(
+        findings, tool_calls, verification=False, context=context
+    )
+
+    hypotheses = [finding for finding in completed if finding.type is EvidenceType.HYPOTHESIS]
+    assert len(hypotheses) == 1
+    assert hypotheses[0].confidence == 0.35
+    assert "storage-path contention" in hypotheses[0].content
+    assert "query_prometheus" in hypotheses[0].source_detail
+    assert "Ceph OSD latency peaked at 271 ms" in hypotheses[0].content
+    assert all("Root cause could not" not in finding.content for finding in completed)
+    assert any("No usable data from query_loki" in finding.content for finding in completed)
+    actions = [finding for finding in completed if finding.type is EvidenceType.RECOMMENDATION]
+    assert len(actions) == 1
+    assert "compare device I/O latency and queue depth" in actions[0].content
+    assert "recorded OSD latency spike" in actions[0].content
 
 
 def test_model_causal_verdict_is_preserved_as_capped_synthesis():

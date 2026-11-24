@@ -74,7 +74,20 @@ class QueryRecovery:
                 key,
             ),
         )
-        for key in keys[:8]:
+        # Prefer label keys carried by the incident itself. If the provider
+        # does not expose those keys, probe only a small set of identity-like
+        # labels instead of enumerating unrelated dimensions such as boot IDs,
+        # clusters, and filenames. A missing target is a valid source gap.
+        direct_keys = [key for key in keys if key in incident_labels]
+        identity_hints = (
+            "instance", "host", "hostname", "service", "service_name",
+            "job", "pod", "container", "unit", "node", "device", "scope",
+        )
+        candidate_keys = direct_keys or [
+            key for key in keys
+            if any(hint in key.lower() for hint in identity_hints)
+        ]
+        for key in candidate_keys[:4]:
             response = await self.call(
                 f"get_{provider}_labels", {"label": key}, adapter.query_label_values, key
             )
