@@ -59,7 +59,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v16"
+PROMPT_VERSION = "pamawas-investigator-v17"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -356,6 +356,39 @@ def _successful_tool_calls(
     ]
 
 
+def _data_query_identity(call: ToolResult) -> tuple[str, str]:
+    """Identify a telemetry signal independently of its requested time range."""
+    argument = "promql" if call.tool_name == "query_prometheus" else "logql"
+    expression = " ".join(str(call.arguments.get(argument, "")).split())
+    return call.tool_name, expression
+
+
+def _representative_distinct_query_calls(
+    calls: list[ToolResult], argument: str
+) -> list[ToolResult]:
+    """Keep one useful timeline per expression, preferring the widest window."""
+    order: list[str] = []
+    selected: dict[str, tuple[float, ToolResult]] = {}
+    for call in calls:
+        expression = " ".join(str(call.arguments.get(argument, "")).split())
+        try:
+            start = datetime.fromisoformat(
+                str(call.arguments.get("start", "")).replace("Z", "+00:00")
+            )
+            end = datetime.fromisoformat(
+                str(call.arguments.get("end", "")).replace("Z", "+00:00")
+            )
+            span = max(0.0, (end - start).total_seconds())
+        except (TypeError, ValueError):
+            span = 0.0
+        if expression not in selected:
+            order.append(expression)
+        previous = selected.get(expression)
+        if previous is None or span >= previous[0]:
+            selected[expression] = (span, call)
+    return [selected[expression][1] for expression in order]
+
+
 def _required_data_tools(verification: bool = False) -> tuple[str, ...]:
     """Return data-query tools required before findings may be accepted."""
     return _VERIFICATION_DATA_TOOLS if verification else _FULL_INVESTIGATION_DATA_TOOLS
@@ -385,10 +418,7 @@ def _missing_required_data_tools(
             )
         ):
             continue
-        signature = (
-            call.tool_name,
-            json.dumps(call.arguments, sort_keys=True, default=str),
-        )
+        signature = _data_query_identity(call)
         if signature in seen:
             continue
         seen.add(signature)
@@ -1157,6 +1187,9 @@ def _ground_findings_in_data_queries(
         call for call in prometheus_calls
         if f"rate({call.arguments.get('promql', '')}[5m])" not in executed
     ]
+    prometheus_calls = _representative_distinct_query_calls(
+        prometheus_calls, "promql"
+    )
     loki_calls = _successful_tool_calls(tool_calls, "query_loki")
     grounded.extend(
         _prometheus_query_finding(call, context)
@@ -2144,7 +2177,9 @@ class PamawasInvestigator:
             "never supply incident facts.\n"
             "- The alert's primary metric or log confirms the symptom, not its cause. After that "
             "first observation, use the same provider or another relevant provider for at least "
-            "one materially distinct causal query when available.\n"
+            "one materially distinct causal query when available. Changing only the time range "
+            "of the same expression refines its timeline but does not create a second causal "
+            "signal.\n"
             "- Prometheus HTTP success with zero numeric series is not evidence and does not "
             "satisfy the gate. When the harness returns metric_candidates, retry with an exact "
             "returned metric name and an evidence-appropriate PromQL transformation.\n"

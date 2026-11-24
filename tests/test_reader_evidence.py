@@ -65,6 +65,57 @@ def test_report_evidence_preserves_primary_signal_and_reads_as_observations(monk
     assert 'vendor_scope="alpha-host"' in findings[1].source_detail
 
 
+def test_same_metric_windows_render_one_wide_timeline(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    expression = (
+        'ceph_osd_apply_latency_ms{ceph_daemon="osd.1", '
+        'instance="10.1.1.4:9283", job="proxmox_ceph"}'
+    )
+    wide = ToolResult(
+        "query_prometheus",
+        {
+            "promql": expression,
+            "start": "2026-11-24T06:45:00Z",
+            "end": "2026-11-24T07:00:00Z",
+        },
+        {"status": "success", "data": {"result": [{
+            "metric": {"ceph_daemon": "osd.1", "instance": "10.1.1.4:9283"},
+            "values": [[1795502880, "271"], [1795503420, "68"]],
+        }]}},
+        1,
+    )
+    incident_window = ToolResult(
+        "query_prometheus",
+        {
+            "promql": expression,
+            "start": "2026-11-24T06:50:00Z",
+            "end": "2026-11-24T06:53:00Z",
+        },
+        {"status": "success", "data": {"result": [{
+            "metric": {"ceph_daemon": "osd.1", "instance": "10.1.1.4:9283"},
+            "values": [[1795503000, "215"], [1795503180, "84"]],
+        }]}},
+        1,
+    )
+    context = IncidentContext(
+        "inc_ceph",
+        "Ceph OSD High Latency",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["10.1.1.4:9283", "proxmox_ceph"],
+    )
+
+    findings = _ground_findings_in_data_queries(
+        [], [wide, incident_window], context
+    )
+
+    assert len(findings) == 1
+    assert "peaked at 271" in findings[0].content
+    assert "last queried value was 68" in findings[0].content
+    assert "13:45:00 WIB" in findings[0].source_detail
+    assert "14:00:00 WIB" in findings[0].source_detail
+
+
 @pytest.mark.asyncio
 async def test_reader_ready_evidence_is_passed_to_persistence(investigator, monkeypatch):
     monkeypatch.setenv("TZ", "Asia/Jakarta")

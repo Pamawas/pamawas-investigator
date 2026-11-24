@@ -752,6 +752,37 @@ def test_single_provider_can_finish_when_second_distinct_query_is_exhausted(inve
     assert state.findings == []
 
 
+def test_same_expression_with_different_windows_is_one_causal_signal():
+    """Baseline/tail windows refine a timeline but do not become independent evidence."""
+    from service.investigator import _missing_required_data_tools
+
+    def call(promql, start, end):
+        return ToolResult(
+            tool_name="query_prometheus",
+            arguments={"promql": promql, "start": start, "end": end},
+            result={
+                "status": "success",
+                "data": {"result": [{"values": [[1, "1"], [2, "2"]]}]},
+            },
+            duration_ms=1,
+        )
+
+    primary = 'ceph_osd_apply_latency_ms{ceph_daemon="osd.1"}'
+    calls = [
+        call(primary, "2026-11-24T06:45:00Z", "2026-11-24T07:00:00Z"),
+        call(primary, "2026-11-24T06:50:00Z", "2026-11-24T06:53:00Z"),
+    ]
+
+    assert _missing_required_data_tools(calls) == ("query_prometheus",)
+
+    calls.append(call(
+        'ceph_osd_op_w_latency_sum{ceph_daemon="osd.1"}',
+        "2026-11-24T06:50:00Z",
+        "2026-11-24T06:53:00Z",
+    ))
+    assert _missing_required_data_tools(calls) == ()
+
+
 def test_text_patience_escalates_only_at_the_limit(investigator):
     """A single prose turn is not escalated; the limit is what forces it."""
     from models import InvestigationState
