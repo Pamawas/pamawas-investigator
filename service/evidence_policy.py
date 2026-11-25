@@ -75,6 +75,7 @@ _GENERIC_TERMS = frozenset(
         "results",
         "second",
         "seconds",
+        "service",
         "signal",
         "signals",
         "system",
@@ -128,14 +129,18 @@ def _meaningful_terms(text: str) -> set[str]:
     }
 
 
-def _target_terms(context: IncidentContext | None) -> set[str]:
+def _premise_terms(context: IncidentContext | None) -> set[str]:
     if context is None:
         return set()
-    return {
+    terms = _meaningful_terms(context.title)
+    terms.update(
+        {
         term
         for target in context.affected_services or []
         for term in _meaningful_terms(str(target))
-    }
+        }
+    )
+    return terms
 
 
 def _observation_identity(finding: Finding) -> tuple[str, str]:
@@ -179,8 +184,8 @@ class EvidencePolicy:
             "Recovery, temporal overlap, an empty query, or provider availability alone is "
             "not a mechanism.\n"
             "- A cause can be supported by one provider. Cite the observed signal terms that "
-            "connect each supporting fact to the mechanism; target identity alone is scope, "
-            "not causal support.\n"
+            "connect each supporting fact to the mechanism; the incident title and target "
+            "identity are premise/scope, not causal support.\n"
         )
 
     def support(
@@ -190,7 +195,7 @@ class EvidencePolicy:
         context: IncidentContext | None = None,
     ) -> CausalSupport:
         """Return distinct facts semantically connected to the candidate mechanism."""
-        ignored = _target_terms(context)
+        ignored = _premise_terms(context)
         mechanism_terms = _meaningful_terms(candidate.content) - ignored
         if not mechanism_terms:
             return CausalSupport((), frozenset())

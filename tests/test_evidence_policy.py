@@ -56,6 +56,34 @@ def test_target_identity_alone_is_scope_not_mechanism_support():
     assert EVIDENCE_POLICY.validate(candidate, facts, context) is None
 
 
+def test_incident_title_terms_alone_are_not_mechanism_support():
+    context = IncidentContext(
+        "inc_generic",
+        "Vendor service request latency",
+        affected_services=["alpha-target"],
+    )
+    facts = [
+        fact(
+            "Vendor service request latency reached five seconds.",
+            EvidenceSource.PROMETHEUS,
+            "query: vendor_request_latency",
+        ),
+        fact(
+            "Vendor service request bytes changed during the incident.",
+            EvidenceSource.PROMETHEUS,
+            "query: vendor_request_bytes",
+        ),
+    ]
+    candidate = Finding(
+        EvidenceType.LIKELY_CAUSE,
+        "A traffic spike overwhelmed the vendor service and caused request latency.",
+        EvidenceSource.LLM,
+        0.9,
+    )
+
+    assert EVIDENCE_POLICY.validate(candidate, facts, context) is None
+
+
 def test_descriptive_condition_labels_do_not_erase_mechanism_terms():
     context = IncidentContext(
         "inc_generic",
@@ -106,4 +134,4 @@ def test_prompt_contract_is_rendered_from_enforced_policy_values():
     assert EVIDENCE_POLICY.version in contract
     assert f"at least {EVIDENCE_POLICY.likely_cause_min_facts}" in contract
     assert "same provider or different providers" in contract
-    assert "target identity alone is scope" in contract
+    assert "incident title and target identity" in contract

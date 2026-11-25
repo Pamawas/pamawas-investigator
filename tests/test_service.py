@@ -184,7 +184,7 @@ def test_checkpoint_reconstructs_tool_cache_findings_and_resume_message(investig
     assert "prior_validated_findings" in resume
 
 
-def test_finalizer_deduplicates_contradictions_and_links_one_hypothesis():
+def test_finalizer_rejects_unsupported_hypothesis_and_links_unknown():
     context = IncidentContext(
         "inc_cpu",
         "High CPU on node-a",
@@ -232,15 +232,20 @@ def test_finalizer_deduplicates_contradictions_and_links_one_hypothesis():
 
     finalized = _finalize_findings(submitted, calls, context, context.incident_id, False)
 
-    causal = [
+    unsupported = [
         finding
         for finding in finalized
         if finding.type in (EvidenceType.HYPOTHESIS, EvidenceType.LIKELY_CAUSE)
     ]
-    assert len(causal) == 1
+    assert unsupported == []
     assert not any("no metric data" in finding.content.lower() for finding in finalized)
-    causal_index = finalized.index(causal[0])
-    assert causal[0].supports_evidence == [0]
+    causal = next(
+        finding
+        for finding in finalized
+        if finding.type is EvidenceType.UNKNOWN and "Root cause" in finding.content
+    )
+    causal_index = finalized.index(causal)
+    assert causal.supports_evidence == [0]
     recommendations = [
         finding for finding in finalized if finding.type is EvidenceType.RECOMMENDATION
     ]
