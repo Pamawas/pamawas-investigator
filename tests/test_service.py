@@ -644,7 +644,11 @@ def test_investigate_returns_unknown_when_llm_raises(investigator):
     investigator.llm.chat_completion = MagicMock(side_effect=RuntimeError("LLM unavailable"))
     findings = investigator.investigate("inc")
     assert findings[0].type is EvidenceType.UNKNOWN
-    assert any("LLM unavailable" in finding.content for finding in findings)
+    assert not any("LLM unavailable" in finding.content for finding in findings)
+    assert any(
+        finding.source_detail == "internal error class: RuntimeError"
+        for finding in findings
+    )
 
 
 def test_investigate_handles_large_tool_result_without_invalid_json(investigator):
@@ -1720,7 +1724,8 @@ def test_single_provider_fact_outranks_provider_gap_root_cause_unknown():
     assert any("No usable data from query_loki" in finding.content for finding in completed)
     actions = [finding for finding in completed if finding.type is EvidenceType.RECOMMENDATION]
     assert len(actions) == 1
-    assert actions[0].content == "Inspect logs because no cause was found."
+    assert "ceph health detail" in actions[0].content
+    assert "ceph osd perf" in actions[0].content
 
 
 def test_model_causal_verdict_is_preserved_as_capped_synthesis():

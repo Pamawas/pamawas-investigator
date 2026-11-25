@@ -185,9 +185,13 @@ def alert_observation(
     return content, detail
 
 
-def metric_caption(expression: str, metadata: dict, title: str = "") -> str:
-    if title:
-        return title
+def metric_caption(expression: str, metadata: dict) -> str:
+    """Name the metric from provider metadata or the executed expression.
+
+    Incident titles are symptoms, not metric metadata. Reusing a title after a
+    generic word overlap made unrelated values look like the alert's primary
+    measurement (for example, rendering Ceph used bytes as latency).
+    """
     name = metadata.get("name")
     if not name:
         names = _METRIC_NAME.findall(expression)
@@ -283,6 +287,7 @@ def metric_observations(
             candidates.append((item, points))
     if not candidates:
         return ""
+    all_candidates = candidates
     scoped = [
         pair
         for pair in candidates
@@ -295,14 +300,14 @@ def metric_observations(
         json.dumps(pair[0].get("metric", {}), sort_keys=True, default=str),
     ))
     label_values: dict[str, set[str]] = {}
-    for item, _ in candidates:
+    # Use the original result set to retain the label that distinguished a
+    # selected target from neighbouring series. After scoping to one OSD, for
+    # example, ceph_daemon is still important reader context.
+    for item, _ in all_candidates:
         for key, value in item.get("metric", {}).items():
             label_values.setdefault(str(key), set()).add(str(value))
     varying = [key for key, values in sorted(label_values.items()) if len(values) > 1]
-    title = context.title if context else ""
-    title_words = set(re.findall(r"[a-z0-9]+", title.lower()))
-    query_words = set(re.findall(r"[a-z0-9]+", expression.lower()))
-    caption = metric_caption(expression, metadata, title if title_words & query_words else "")
+    caption = metric_caption(expression, metadata)
     unit = metric_unit(expression, metadata)
     observations = []
     for item, points in candidates[:2]:

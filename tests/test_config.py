@@ -14,6 +14,7 @@ def test_from_env_reads_all_values(monkeypatch):
         "LOKI_URL": "http://loki",
         "MAX_TOOL_CALLS": "9",
         "TRUNCATION_LIMIT": "1024",
+        "TELEMETRY_CATALOG_REFRESH_SECONDS": "43200",
     }
     for key, value in values.items():
         monkeypatch.setenv(key, value)
@@ -30,6 +31,7 @@ def test_from_env_reads_all_values(monkeypatch):
         loki_url="http://loki",
         max_tool_calls=9,
         truncation_limit=1024,
+        telemetry_catalog_refresh_seconds=43200,
     )
 
 
@@ -44,6 +46,7 @@ def test_from_env_uses_defaults(monkeypatch):
     assert config.llm_model == "gpt-4o-mini"
     assert config.max_tool_calls == 100
     assert config.truncation_limit == 8192
+    assert config.telemetry_catalog_refresh_seconds == 86400
 
 
 def test_from_env_requires_database_url(monkeypatch):

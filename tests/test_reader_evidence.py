@@ -54,7 +54,8 @@ def test_report_evidence_preserves_primary_signal_and_reads_as_observations(monk
     findings = _ground_findings_in_data_queries([], query_calls(), incident())
     assert len(findings) == 2
     assert findings[0].content == (
-        "CPU peaked at 86.5% at 18:35:00 WIB; the last queried value was 71% at 18:40:00 WIB."
+        "Vendor cpu seconds peaked at 86.5% at 18:35:00 WIB; "
+        "the last queried value was 71% at 18:40:00 WIB."
     )
     assert findings[1].content == (
         "mesh-agent at 18:36:45 WIB: Disconnected from Signal service: EOF."
@@ -130,7 +131,8 @@ async def test_reader_ready_evidence_is_passed_to_persistence(investigator, monk
     await investigator._handle_submit_findings(model_findings, "inc_reader", "key", state)
     persisted = investigator._persist_investigation.await_args.kwargs["findings"]
     assert persisted[0].content == (
-        "CPU peaked at 86.5% at 18:35:00 WIB; the last queried value was 71% at 18:40:00 WIB."
+        "Vendor cpu seconds peaked at 86.5% at 18:35:00 WIB; "
+        "the last queried value was 71% at 18:40:00 WIB."
     )
     assert not any("80.57" in finding.content for finding in persisted)
     assert any(finding.type == EvidenceType.RECOMMENDATION for finding in persisted)
@@ -172,7 +174,7 @@ def test_counter_rate_preserves_provider_declared_unit(monkeypatch):
     findings = _ground_findings_in_data_queries([], [call], incident())
 
     assert findings[0].content == (
-        "CPU peaked at 0.53 seconds per second at 18:35:00 WIB; "
+        "Container cpu usage seconds peaked at 0.53 seconds per second at 18:35:00 WIB; "
         "the last queried value was 0.46 seconds per second at 18:40:00 WIB."
     )
 
@@ -289,7 +291,7 @@ def test_evidence_rules_apply_to_another_signal_and_arbitrary_schemas(monkeypatc
     second = _ground_findings_in_data_queries([], calls, context)
     assert first == second
     assert first[0].content == (
-        "Latency peaked at 1,234.56 ms at 18:35:00 WIB; "
+        "Vendor latency peaked at 1,234.56 ms at 18:35:00 WIB; "
         "the last queried value was 200 ms at 18:40:00 WIB."
     )
     assert first[1].content == (

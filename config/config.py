@@ -97,6 +97,9 @@ class Config:
     investigation_retry_backoff_seconds: int = 60
     # Wake cadence of the background retry scheduler (seconds).
     retry_scheduler_tick_seconds: float = 15.0
+    # How often the investigator may refresh the persisted live Prometheus and
+    # Loki schema catalog. Each run still uses one immutable DB snapshot.
+    telemetry_catalog_refresh_seconds: int = 86_400
 
     @classmethod
     def from_env(cls) -> Config:
@@ -169,6 +172,9 @@ class Config:
                 os.getenv("INVESTIGATION_RETRY_BACKOFF_SECONDS", "60")
             ),
             retry_scheduler_tick_seconds=float(os.getenv("RETRY_SCHEDULER_TICK_SECONDS", "15")),
+            telemetry_catalog_refresh_seconds=int(
+                os.getenv("TELEMETRY_CATALOG_REFRESH_SECONDS", "86400")
+            ),
             verify_max_tool_calls=int(os.getenv("VERIFY_TOOL_CALLS", "6")),
             verify_timeout_seconds=float(os.getenv("VERIFY_TIMEOUT_SECONDS", "180.0")),
         )
@@ -191,6 +197,11 @@ class Config:
             ("max_investigation_attempts", "MAX_INVESTIGATION_ATTEMPTS", 1),
             ("investigation_retry_backoff_seconds", "INVESTIGATION_RETRY_BACKOFF_SECONDS", 1),
             ("retry_scheduler_tick_seconds", "RETRY_SCHEDULER_TICK_SECONDS", 1),
+            (
+                "telemetry_catalog_refresh_seconds",
+                "TELEMETRY_CATALOG_REFRESH_SECONDS",
+                1,
+            ),
             ("circuit_breaker_failure_threshold", "CIRCUIT_BREAKER_FAILURE_THRESHOLD", 1),
             ("circuit_breaker_half_open_max_calls", "CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", 1),
             ("prometheus_allowed_time_range_hours", "PROMETHEUS_ALLOWED_TIME_RANGE_HOURS", 1),

@@ -121,31 +121,25 @@ class CircuitBreaker:
         self._half_open_calls = 0
         self._total_opens += 1
         logger.warning(
-            "circuit_breaker_opened",
-            breaker=self.name,
-            failures=self._failures,
-            consecutive=self._consecutive_failures,
-            timeout_seconds=self.timeout_seconds,
+            "circuit_breaker_opened breaker=%s failures=%d consecutive=%d timeout_seconds=%s",
+            self.name,
+            self._failures,
+            self._consecutive_failures,
+            self.timeout_seconds,
         )
 
     def _transition_half_open(self) -> None:
         self._state = CircuitState.HALF_OPEN
         self._half_open_calls = 0
         self._opened_at = None
-        logger.info(
-            "circuit_breaker_half_open",
-            breaker=self.name,
-        )
+        logger.info("circuit_breaker_half_open breaker=%s", self.name)
 
     def _transition_closed(self) -> None:
         self._state = CircuitState.CLOSED
         self._opened_at = None
         self._consecutive_failures = 0
         self._half_open_calls = 0
-        logger.info(
-            "circuit_breaker_closed",
-            breaker=self.name,
-        )
+        logger.info("circuit_breaker_closed breaker=%s", self.name)
 
     def snapshot(self) -> dict:
         with self._lock:

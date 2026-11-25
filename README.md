@@ -69,6 +69,7 @@ python main.py
 | `LOKI_URL` | Loki HTTP endpoint | `http://loki:3100` |
 | `DEPLOYMENTS_URL` | Deployments service URL | `http://deployments:8080` |
 | `MAX_TOOL_CALLS` | Hard cap on tool rounds | `6` |
+| `TELEMETRY_CATALOG_REFRESH_SECONDS` | Live Prometheus/Loki schema refresh cadence | `86400` |
 | `LOG_LEVEL` | debug, info, warn, error | `info` |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | Tempo OTLP gRPC endpoint | `tempo:4317` |
 

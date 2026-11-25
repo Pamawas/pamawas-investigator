@@ -117,6 +117,150 @@ class InvestigationPersistence:
         if conn:
             conn.rollback()
 
+    def claim_telemetry_catalog_refresh(
+        self, provider: str, refresh_after_seconds: int = 900
+    ) -> bool:
+        """Atomically let one investigator refresh a stale provider catalog."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    INSERT INTO telemetry_catalog_sync_state (
+                        provider, last_attempted_at, updated_at
+                    ) VALUES (%s, now(), now())
+                    ON CONFLICT (provider) DO UPDATE
+                    SET last_attempted_at = now(), updated_at = now()
+                    WHERE telemetry_catalog_sync_state.last_attempted_at IS NULL
+                       OR telemetry_catalog_sync_state.last_attempted_at
+                          < now() - (%s * interval '1 second')
+                    RETURNING provider
+                    """,
+                    (provider, refresh_after_seconds),
+                )
+                claimed = cursor.fetchone() is not None
+                conn.commit()
+                return claimed
+        except psycopg2.Error as e:
+            conn.rollback()
+            logger.warning("Telemetry catalog refresh claim failed for %s: %s", provider, e)
+            return False
+        finally:
+            self._put_connection(conn)
+
+    def store_telemetry_catalog(
+        self, provider: str, resource_kind: str, entries: list[dict[str, Any]]
+    ) -> None:
+        """Upsert one successful live discovery without deleting the last good snapshot."""
+        conn = self._get_connection()
+        try:
+            rows = []
+            for entry in entries:
+                name = str(entry.get("name") or "").strip()
+                if not name:
+                    continue
+                metadata = dict(entry)
+                search_text = " ".join(
+                    str(metadata.get(key) or "")
+                    for key in ("name", "help", "type", "unit")
+                ).strip()
+                rows.append((provider, resource_kind, name, search_text, json.dumps(metadata)))
+            with conn.cursor() as cursor:
+                if rows:
+                    psycopg2.extras.execute_values(
+                        cursor,
+                        """
+                        INSERT INTO telemetry_catalog_entries (
+                            provider, resource_kind, resource_name, search_text,
+                            metadata, first_seen_at, last_seen_at
+                        ) VALUES %s
+                        ON CONFLICT (provider, resource_kind, resource_name) DO UPDATE
+                        SET search_text = EXCLUDED.search_text,
+                            metadata = EXCLUDED.metadata,
+                            last_seen_at = now()
+                        """,
+                        rows,
+                        template="(%s, %s, %s, %s, %s::jsonb, now(), now())",
+                    )
+                    cursor.execute(
+                        """
+                        DELETE FROM telemetry_catalog_entries
+                        WHERE provider = %s
+                          AND resource_kind = %s
+                          AND NOT (resource_name = ANY(%s))
+                        """,
+                        (provider, resource_kind, [row[2] for row in rows]),
+                    )
+                cursor.execute(
+                    """
+                    INSERT INTO telemetry_catalog_sync_state (
+                        provider, last_attempted_at, last_succeeded_at,
+                        last_error_class, entry_count, updated_at
+                    ) VALUES (%s, now(), now(), NULL, %s, now())
+                    ON CONFLICT (provider) DO UPDATE
+                    SET last_succeeded_at = now(), last_error_class = NULL,
+                        entry_count = EXCLUDED.entry_count, updated_at = now()
+                    """,
+                    (provider, len(rows)),
+                )
+            conn.commit()
+        except (psycopg2.Error, TypeError, ValueError):
+            conn.rollback()
+            raise
+        finally:
+            self._put_connection(conn)
+
+    def mark_telemetry_catalog_refresh_failed(
+        self, provider: str, error_class: str
+    ) -> None:
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE telemetry_catalog_sync_state
+                    SET last_error_class = %s, updated_at = now()
+                    WHERE provider = %s
+                    """,
+                    (error_class, provider),
+                )
+            conn.commit()
+        except psycopg2.Error as e:
+            conn.rollback()
+            logger.warning("Could not record %s catalog refresh failure: %s", provider, e)
+        finally:
+            self._put_connection(conn)
+
+    def load_telemetry_catalog(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Load a stable recent catalog snapshot for one investigation."""
+        conn = self._get_connection()
+        catalog: dict[str, dict[str, dict[str, Any]]] = {
+            "prometheus": {},
+            "loki": {},
+        }
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT provider, resource_name, search_text, metadata
+                    FROM telemetry_catalog_entries
+                    WHERE last_seen_at >= now() - interval '7 days'
+                    ORDER BY provider, resource_name
+                    """
+                )
+                for provider, name, search_text, metadata in cursor.fetchall():
+                    descriptor = dict(metadata or {})
+                    descriptor["_search_text"] = search_text or name
+                    catalog.setdefault(provider, {})[name] = descriptor
+            conn.commit()
+            return catalog
+        except psycopg2.Error as e:
+            conn.rollback()
+            logger.warning("Could not load telemetry catalog snapshot: %s", e)
+            return catalog
+        finally:
+            self._put_connection(conn)
+
     def create_investigation_run(
         self,
         incident_id: str,

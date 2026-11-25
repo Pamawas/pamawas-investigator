@@ -52,7 +52,6 @@ from service.evidence_summary import (
     log_observations,
     metric_observations,
     numeric_points,
-    select_metric_queries,
 )
 from service.persistence import InvestigationPersistence
 from service.query_recovery import QueryRecovery
@@ -60,7 +59,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v19"
+PROMPT_VERSION = "pamawas-investigator-v20"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -80,6 +79,235 @@ _PROCESS_ONLY_UNKNOWN_PREFIXES = (
     "Investigation ended without a stated conclusion",
     "Investigation ended without a substantive conclusion",
 )
+
+def _incident_signal_kind(context: IncidentContext | None) -> str:
+    """Map known alert families to deterministic telemetry rules."""
+    title = (context.title if context else "").lower()
+    if "postgres" in title:
+        return "postgres"
+    if "traefik" in title and "latency" in title:
+        return "traefik_latency"
+    if "traefik" in title and "error" in title:
+        return "traefik_error"
+    if "ceph" in title and "latency" in title:
+        return "ceph_latency"
+    if "authentik" in title and "worker" in title:
+        return "authentik_worker"
+    if "cpu" in title:
+        return "cpu"
+    if "crash" in title or "restart" in title:
+        return "pod_restart"
+    return "generic"
+
+
+_RELEVANCE_STOPWORDS = {
+    "alert", "critical", "high", "incident", "production", "service", "warning",
+}
+
+
+def _relevance_terms(value: Any) -> set[str]:
+    terms = set()
+    for token in re.findall(r"[a-z0-9]+", str(value or "").lower()):
+        if len(token) < 2 or token in _RELEVANCE_STOPWORDS:
+            continue
+        terms.add(token[:-1] if len(token) > 3 and token.endswith("s") else token)
+    return terms
+
+
+def _incident_relevance_terms(
+    context: IncidentContext | None,
+) -> tuple[set[str], set[str]]:
+    if context is None:
+        return set(), set()
+    title_terms = _relevance_terms(context.title)
+    target_terms = {
+        token
+        for target in context.affected_services or []
+        for token in _relevance_terms(target)
+    }
+    return title_terms, target_terms
+
+
+def _prometheus_metric_names(expression: str) -> list[str]:
+    names = re.findall(
+        r"(?<![a-zA-Z0-9_:])([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?=\{|\[)",
+        expression,
+    )
+    if not names and re.fullmatch(r"[a-zA-Z_:][a-zA-Z0-9_:]*", expression.strip()):
+        names = [expression.strip()]
+    return list(dict.fromkeys(names))
+
+
+def _prometheus_search_document(
+    call: ToolResult, context: IncidentContext | None
+) -> str:
+    expression = str(call.arguments.get("promql") or "")
+    parts = [expression]
+    result_metadata = (
+        call.result.get("metric_metadata", {})
+        if isinstance(call.result, dict)
+        else {}
+    )
+    if isinstance(result_metadata, dict):
+        parts.append(json.dumps(result_metadata, sort_keys=True, default=str))
+    catalog = (context.telemetry_catalog or {}).get("prometheus", {}) if context else {}
+    for name in _prometheus_metric_names(expression):
+        descriptor = catalog.get(name)
+        if isinstance(descriptor, dict):
+            parts.append(str(descriptor.get("_search_text") or ""))
+            parts.append(json.dumps(descriptor, sort_keys=True, default=str))
+    return " ".join(parts)
+
+
+def _relevance_score(document: str, context: IncidentContext | None) -> int:
+    title_terms, target_terms = _incident_relevance_terms(context)
+    document_terms = _relevance_terms(document)
+    # Title matches identify the incident domain/symptom. Target matches scope
+    # the observation but cannot by themselves outrank a domain match.
+    return (
+        4 * len(title_terms & document_terms)
+        + 6 * len(target_terms & document_terms)
+    )
+
+
+def _relative_relevance_floor(highest: int) -> int:
+    if highest >= 8:
+        return highest - 3
+    if highest > 0:
+        return highest
+    return 0
+
+
+def _prometheus_relevance_score(
+    call: ToolResult, context: IncidentContext | None
+) -> int:
+    """Score PromQL against the incident and the persisted live metric catalog."""
+    expression = str(call.arguments.get("promql") or "")
+    if not expression:
+        return -1
+    if context is None:
+        return 0
+    return _relevance_score(_prometheus_search_document(call, context), context)
+
+
+def _select_relevant_prometheus_calls(
+    calls: list[ToolResult], context: IncidentContext | None, limit: int
+) -> list[ToolResult]:
+    scored = [
+        (index, _prometheus_relevance_score(call, context), call)
+        for index, call in enumerate(calls)
+    ]
+    scored = [item for item in scored if item[1] >= 0]
+    if not scored:
+        return []
+    highest = max(item[1] for item in scored)
+    floor = _relative_relevance_floor(highest)
+    selected = [item for item in scored if item[1] >= floor]
+    selected.sort(key=lambda item: (-item[1], item[0]))
+    return [item[2] for item in selected[:limit]]
+
+
+def _loki_relevance_score(call: ToolResult, context: IncidentContext | None) -> int:
+    """Score returned live log content without deployment-specific vocabularies."""
+    if context is None:
+        return 0
+    result = call.result if isinstance(call.result, dict) else {}
+    streams = result.get("data", {}).get("result", [])
+    payload_parts: list[str] = []
+    for stream in streams if isinstance(streams, list) else []:
+        if not isinstance(stream, dict):
+            continue
+        payload_parts.append(json.dumps(stream.get("stream", {}), sort_keys=True))
+        payload_parts.extend(
+            str(point[1])
+            for point in stream.get("values", [])
+            if isinstance(point, list) and len(point) >= 2
+        )
+    document = " ".join([str(call.arguments.get("logql") or ""), *payload_parts])
+    return _relevance_score(document, context)
+
+
+def _select_relevant_loki_calls(
+    calls: list[ToolResult], context: IncidentContext | None, limit: int
+) -> list[ToolResult]:
+    scored = [
+        (index, _loki_relevance_score(call, context), call)
+        for index, call in enumerate(calls)
+    ]
+    scored = [item for item in scored if item[1] >= 0]
+    if not scored:
+        return []
+    floor = _relative_relevance_floor(max(item[1] for item in scored))
+    scored = [item for item in scored if item[1] >= floor]
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return [item[2] for item in scored[:limit]]
+
+
+def _current_scoped_values(call: ToolResult, targets: set[str]) -> list[float]:
+    data = call.result.get("data") if isinstance(call.result, dict) else None
+    series = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(series, list):
+        return []
+    expression = str(call.arguments.get("promql") or "").lower()
+    expression_is_scoped = any(target in expression for target in targets)
+    scoped_values: list[float] = []
+    fallback_values: list[float] = []
+    for item in series:
+        points = numeric_points(item)
+        if not points:
+            continue
+        latest = points[-1][1]
+        fallback_values.append(latest)
+        labels = json.dumps(item.get("metric", {}), sort_keys=True).lower()
+        if expression_is_scoped or not targets or any(target in labels for target in targets):
+            scoped_values.append(latest)
+    return scoped_values or ([] if targets else fallback_values)
+
+
+def _incident_state_reconciliation(
+    calls: list[ToolResult], context: IncidentContext | None
+) -> Finding | None:
+    """Surface current healthy telemetry that conflicts with an open incident."""
+    if context is None or context.status.lower() not in {"open", "investigating", "firing"}:
+        return None
+    title = context.title.lower()
+    if not any(marker in title for marker in ("absent", "down", "unavailable")):
+        return None
+
+    targets = {
+        str(target).strip().lower()
+        for target in context.affected_services or []
+        if str(target).strip()
+    }
+    for call in calls:
+        expression = str(call.arguments.get("promql") or "")
+        lowered = expression.lower()
+        if not (
+            re.search(r"(?:^|[^a-z0-9_:])up(?:$|[^a-z0-9_:])", lowered)
+            or "worker" in lowered
+            or "replicas_available" in lowered
+            or "ready_replicas" in lowered
+        ):
+            continue
+        values = _current_scoped_values(call, targets)
+        if not values or min(values) <= 0:
+            continue
+        metadata = call.result.get("metric_metadata", {})
+        metric_name = str(metadata.get("name") or "").strip()
+        if not metric_name:
+            match = re.search(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{|\[|$)", expression)
+            metric_name = match.group(1) if match else "availability metric"
+        return Finding(
+            type=EvidenceType.FACT,
+            content=(
+                f"Current {metric_name} is {min(values):g}, which conflicts with the "
+                f"still-open {context.title} incident state."
+            ),
+            source=EvidenceSource.PROMETHEUS,
+            source_detail="incident-state reconciliation",
+            confidence=1.0,
+        )
+    return None
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
@@ -163,10 +391,10 @@ def _is_reasoning_preamble(text: str) -> bool:
     marker_hits = sum(1 for marker in _PROCESS_MARKERS if marker in lowered)
 
     if opens_with_narration:
-        # Narration followed by a conclusion is still worth reading, but only
-        # when it stays short; several process markers mean the model never
-        # reached a conclusion at all.
-        return marker_hits >= 2 or len(lowered) > 400
+        # A finding is the conclusion, never narration about the next query.
+        # Short working notes were the production escape hatch: "Let me query
+        # Loki..." contains only one marker and is under 400 characters.
+        return True
 
     # Not opening with narration, but visibly reasoning throughout.
     return marker_hits >= 3
@@ -975,6 +1203,7 @@ def _ensure_causal_verdict(
     candidates = [finding for finding in findings if finding.type in _CAUSAL_FINDING_TYPES]
     causal_unknowns = [finding for finding in findings if _is_root_cause_unknown(finding)]
     facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
+    fact_sources = {finding.source for finding in facts}
 
     selected: Finding
     if candidates:
@@ -985,9 +1214,13 @@ def _ensure_causal_verdict(
                 finding.confidence,
             ),
         )
-        # A likely cause needs corroboration. One observation can support a
-        # hypothesis, but not a strongly worded mechanism verdict.
-        if selected.type == EvidenceType.LIKELY_CAUSE and len(facts) < 2:
+        # A likely cause needs independent corroboration from both telemetry
+        # providers. Two metrics from Prometheus are still one line of
+        # evidence; alert state plus a metric is not an independent mechanism.
+        if selected.type == EvidenceType.LIKELY_CAUSE and not {
+            EvidenceSource.PROMETHEUS,
+            EvidenceSource.LOKI,
+        }.issubset(fact_sources):
             selected = replace(
                 selected,
                 type=EvidenceType.HYPOTHESIS,
@@ -1011,6 +1244,56 @@ def _ensure_actions(
     context: IncidentContext | None = None,
 ) -> list[Finding]:
     """Keep operator actions available even when the model or a provider fails."""
+    kind = _incident_signal_kind(context)
+    deterministic_actions = {
+        "postgres": (
+            "Use pg_stat_statements to identify the statements contributing most to the "
+            "alerted PostgreSQL signal, run EXPLAIN (ANALYZE, BUFFERS) on the leading "
+            "candidate in a safe environment, and verify the alert measurement is below "
+            "its configured threshold after remediation."
+        ),
+        "traefik_latency": (
+            "Inspect Traefik request-duration metrics for the exact router and service, "
+            "correlate the same window with that backend's logs, and verify latency remains "
+            "below the configured threshold after remediation."
+        ),
+        "traefik_error": (
+            "Inspect Traefik response-code metrics for the exact router and service, "
+            "correlate the same window with that backend's logs, and verify the error rate "
+            "remains below the configured threshold after remediation."
+        ),
+        "ceph_latency": (
+            "Run ceph health detail and ceph osd perf, inspect CPU, memory, disk, and network "
+            "pressure on the affected OSD node, then verify OSD latency remains below the "
+            "configured threshold."
+        ),
+        "authentik_worker": (
+            "Compare the Authentik Deployment's desired and available replicas with "
+            "authentik_tasks_workers, reconcile the incident if current capacity is healthy, "
+            "and verify the alert rule clears."
+        ),
+        "cpu": (
+            "Identify the process or workload consuming CPU on the affected target, address "
+            "that workload, and verify CPU remains below the configured threshold."
+        ),
+        "pod_restart": (
+            "Inspect the container's previous logs, termination reason, Kubernetes events, "
+            "and rollout history, then verify the pod remains ready without additional "
+            "restarts."
+        ),
+    }
+    if kind in deterministic_actions:
+        findings = [
+            finding for finding in findings
+            if finding.type != EvidenceType.RECOMMENDATION
+        ]
+        return [*findings, Finding(
+            type=EvidenceType.RECOMMENDATION,
+            content=deterministic_actions[kind],
+            source=EvidenceSource.SYSTEM,
+            source_detail=f"deterministic action for {kind}",
+            confidence=1.0,
+        )]
     if any(finding.type == EvidenceType.RECOMMENDATION for finding in findings):
         return findings
     facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
@@ -1134,7 +1417,6 @@ def _ground_findings_in_data_queries(
             or finding.source not in (EvidenceSource.PROMETHEUS, EvidenceSource.LOKI))
         and finding.type not in _CAUSAL_FINDING_TYPES
     ]
-    causal_synthesis = _normalized_causal_synthesis(findings, tool_calls)
     grounded: list[Finding] = []
     alert_content, alert_detail = alert_observation(context, _format_query_timestamp)
     if alert_content:
@@ -1161,16 +1443,27 @@ def _ground_findings_in_data_queries(
     prometheus_calls = _representative_distinct_query_calls(
         prometheus_calls, "promql"
     )
-    loki_calls = _successful_tool_calls(tool_calls, "query_loki")
+    prometheus_calls = _select_relevant_prometheus_calls(
+        prometheus_calls, context, _MAX_GROUNDED_FINDINGS_PER_SOURCE
+    )
+    loki_calls = _select_relevant_loki_calls(
+        _successful_tool_calls(tool_calls, "query_loki"),
+        context,
+        _MAX_GROUNDED_FINDINGS_PER_SOURCE,
+    )
     grounded.extend(
         _prometheus_query_finding(call, context)
-        for call in select_metric_queries(
-            prometheus_calls, context, _MAX_GROUNDED_FINDINGS_PER_SOURCE
-        )
+        for call in prometheus_calls
     )
     grounded.extend(
         _loki_query_finding(call, context)
-        for call in loki_calls[-_MAX_GROUNDED_FINDINGS_PER_SOURCE:]
+        for call in loki_calls
+    )
+    reconciliation = _incident_state_reconciliation(prometheus_calls, context)
+    if reconciliation is not None:
+        grounded.append(reconciliation)
+    causal_synthesis = _normalized_causal_synthesis(
+        findings, [*prometheus_calls, *loki_calls]
     )
     if causal_synthesis is not None:
         grounded.append(causal_synthesis)
@@ -1984,6 +2277,80 @@ class PamawasInvestigator:
             logger.error("Failed to connect to database: %s", e)
             increment_db_errors()
             self.db_conn = None
+
+    async def _refresh_telemetry_catalog(self, context: IncidentContext) -> None:
+        """Refresh stale live provider schemas, then freeze one DB snapshot.
+
+        The database claim prevents concurrent investigator workers from
+        stampeding Prometheus or Loki. Failed refreshes never erase the last
+        successful catalog, so evidence selection remains deterministic and
+        available while a provider is temporarily unhealthy.
+        """
+        if self.persistence is None:
+            return
+
+        async def refresh_provider(provider: str) -> None:
+            claimed = await asyncio.to_thread(
+                self.persistence.claim_telemetry_catalog_refresh,
+                provider,
+                self.config.telemetry_catalog_refresh_seconds,
+            )
+            if not claimed:
+                return
+            try:
+                if provider == "prometheus":
+                    response = await self.tools._prometheus_adapter.query_metric_catalog()
+                    data = response.get("data") if isinstance(response, dict) else None
+                    entries = data if isinstance(data, list) else []
+                    resource_kind = "metric"
+                else:
+                    response = await self.tools._loki_adapter.query_labels()
+                    data = response.get("data") if isinstance(response, dict) else None
+                    entries = [
+                        {"name": str(label)} for label in data or []
+                        if str(label).strip()
+                    ] if isinstance(data, list) else []
+                    resource_kind = "label"
+                if not entries:
+                    raise ValueError(f"{provider} discovery returned no catalog entries")
+                await asyncio.to_thread(
+                    self.persistence.store_telemetry_catalog,
+                    provider,
+                    resource_kind,
+                    entries,
+                )
+                logger.info(
+                    "Refreshed %s telemetry catalog with %d entries",
+                    provider,
+                    len(entries),
+                )
+            except (
+                PrometheusError,
+                LokiError,
+                RuntimeError,
+                ValueError,
+                TypeError,
+                KeyError,
+                psycopg2.Error,
+            ) as e:
+                logger.warning(
+                    "%s telemetry catalog refresh failed with %s; keeping last snapshot",
+                    provider,
+                    type(e).__name__,
+                )
+                await asyncio.to_thread(
+                    self.persistence.mark_telemetry_catalog_refresh_failed,
+                    provider,
+                    type(e).__name__,
+                )
+
+        await asyncio.gather(
+            refresh_provider("prometheus"),
+            refresh_provider("loki"),
+        )
+        context.telemetry_catalog = await asyncio.to_thread(
+            self.persistence.load_telemetry_catalog
+        )
 
     async def close(self):
         """Close investigator tools and database connections."""
@@ -3226,6 +3593,7 @@ class PamawasInvestigator:
                 request_key_hash=request_key_hash,
                 context=context,
             )
+        await self._refresh_telemetry_catalog(context)
 
         # Initialize investigation state
         state = InvestigationState(
@@ -3290,6 +3658,7 @@ class PamawasInvestigator:
                 "reason": context.error,
                 "findings": [f.to_dict() for f in findings],
             }
+        await self._refresh_telemetry_catalog(context)
 
         state = InvestigationState(
             incident_id=incident_id,
@@ -3696,8 +4065,12 @@ class PamawasInvestigator:
                 state.findings.append(
                     Finding(
                         type=EvidenceType.UNKNOWN,
-                        content=f"Investigation error: {e!s}",
+                        content=(
+                            "Investigation ended because an internal processing error occurred; "
+                            "no raw exception details were included in report evidence."
+                        ),
                         source=EvidenceSource.SYSTEM,
+                        source_detail=f"internal error class: {type(e).__name__}",
                         confidence=0.0,
                     )
                 )

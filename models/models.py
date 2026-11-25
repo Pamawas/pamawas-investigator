@@ -105,6 +105,9 @@ class IncidentContext:
     severity: str = ""
     affected_services: list[str] | None = None
     events: list[dict[str, Any]] | None = None
+    # One immutable snapshot of the provider schemas discovered from the live
+    # Prometheus/Loki instances and persisted by the investigator.
+    telemetry_catalog: dict[str, dict[str, Any]] | None = None
     error: str | None = None
 
     def __post_init__(self):
@@ -112,6 +115,8 @@ class IncidentContext:
             self.affected_services = []
         if self.events is None:
             self.events = []
+        if self.telemetry_catalog is None:
+            self.telemetry_catalog = {}
 
 
 @dataclass
