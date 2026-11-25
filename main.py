@@ -227,7 +227,10 @@ async def healthz():
     dependencies.update(db_deps)
     overall_healthy = overall_healthy and db_healthy
 
-    adapter_healthy, adapter_deps = _check_adapter_health(getattr(investigator, "tools", None))
+    adapter_healthy, adapter_deps = _check_adapter_health(
+        getattr(investigator, "tools", None),
+        getattr(investigator, "condition_evaluators", None),
+    )
     dependencies.update(adapter_deps)
     overall_healthy = overall_healthy and adapter_healthy
 
@@ -265,7 +268,7 @@ def _check_database_health(db_conn) -> tuple[bool, dict]:
         return False, deps
 
 
-def _check_adapter_health(tools) -> tuple[bool, dict]:
+def _check_adapter_health(tools, condition_evaluators=None) -> tuple[bool, dict]:
     """Check external adapter circuit breaker states; return (healthy, dependency entries)."""
     deps: dict = {}
     healthy = True
@@ -291,6 +294,16 @@ def _check_adapter_health(tools) -> tuple[bool, dict]:
                 healthy = False
         else:
             deps[name] = {"status": "unknown"}
+
+    if condition_evaluators is not None:
+        for name, state in condition_evaluators.circuit_breaker_states().items():
+            key = f"condition:{name}"
+            deps[key] = {
+                "status": "unhealthy" if state.get("is_open") else "healthy",
+                "circuit_breaker": state,
+            }
+            if state.get("is_open"):
+                healthy = False
 
     return healthy, deps
 

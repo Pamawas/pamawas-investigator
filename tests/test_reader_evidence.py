@@ -10,7 +10,7 @@ from models import (
     InvestigationState,
     ToolResult,
 )
-from service.evidence_summary import human_number
+from service.evidence_summary import human_number, metric_unit
 from service.investigator import _finalize_findings, _ground_findings_in_data_queries
 
 
@@ -207,6 +207,73 @@ def test_counter_rate_does_not_infer_unit_from_metric_name(monkeypatch):
 
     assert "2.5 units per second" in findings[0].content
     assert "bytes per second" not in findings[0].content
+
+
+def test_composite_same_metric_ratio_scaled_by_100_renders_percent(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Jakarta")
+    expression = (
+        'sum by (service) (rate(traefik_service_requests_total{service="grafana",'
+        'code=~"5.."}[5m])) / sum by (service) '
+        '(rate(traefik_service_requests_total{service="grafana"}[5m])) * 100'
+    )
+    context = IncidentContext(
+        "inc_traefik_error",
+        "Traefik Service High Error Rate",
+        started_at="2026-11-24T15:28:40Z",
+        resolved_at="2026-11-24T15:34:40Z",
+        affected_services=["grafana"],
+    )
+    call = ToolResult(
+        "query_prometheus",
+        {
+            "promql": expression,
+            "start": "2026-11-24T15:23:40Z",
+            "end": "2026-11-24T15:39:40Z",
+        },
+        {
+            "status": "success",
+            "metric_metadata": {
+                "name": "traefik_service_requests_total",
+                "type": "counter",
+                "unit": "",
+            },
+            "data": {"result": [{
+                "metric": {"service": "grafana"},
+                "values": [[1795533940, "80"], [1795534780, "8.09"]],
+            }]},
+        },
+        1,
+    )
+
+    findings = _ground_findings_in_data_queries([], [call], context)
+
+    assert len(findings) == 1
+    assert "peaked at 80%" in findings[0].content
+    assert "last queried value was 8.09%" in findings[0].content
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
+        ('metric_total{service="api"} * 100', ""),
+        (
+            'rate(metric_total{service="api"}[5m]) '
+            '/ rate(metric_total{service="api"}[5m])',
+            "",
+        ),
+        (
+            'metric_total{path="/download*100"} / 10',
+            "",
+        ),
+        (
+            'sum(rate(bytes_total{service="api"}[5m])) '
+            '/ sum(rate(seconds_total{service="api"}[5m])) * 100',
+            "",
+        ),
+    ],
+)
+def test_metric_unit_does_not_guess_ambiguous_percentages(expression, expected):
+    assert metric_unit(expression, {"type": "counter", "unit": ""}) == expected
 
 
 def test_alert_payload_preserves_explicit_measurement_for_arbitrary_alert(monkeypatch):

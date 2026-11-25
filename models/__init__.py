@@ -1,4 +1,5 @@
 from .models import (
+    ConditionReference,
     Evidence,
     EvidenceSource,
     EvidenceType,
@@ -11,6 +12,7 @@ from .models import (
 )
 
 __all__ = [
+    "ConditionReference",
     "Evidence",
     "EvidenceSource",
     "EvidenceType",

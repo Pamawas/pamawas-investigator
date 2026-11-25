@@ -49,6 +49,8 @@ docker run -e DATABASE_URL="postgres://user:pass@host:5432/db" \
   -e LLM_MODEL="gpt-4o-mini" \
   -e PROMETHEUS_URL="http://prometheus:9090" \
   -e LOKI_URL="http://loki:3100" \
+  -e GRAFANA_URL="http://grafana:3000" \
+  -e GRAFANA_API_TOKEN="glsa_..." \
   -e OTEL_EXPORTER_OTLP_ENDPOINT="tempo:4317" \
   ghcr.io/yoganovvaindra/pamawas-investigator:latest
 
@@ -67,6 +69,10 @@ python main.py
 | `LLM_MODEL` | Model name | `gpt-4o-mini` |
 | `PROMETHEUS_URL` | Prometheus HTTP endpoint | `http://prometheus:9090` |
 | `LOKI_URL` | Loki HTTP endpoint | `http://loki:3100` |
+| `GRAFANA_URL` | Grafana endpoint used for authoritative alert-instance state | Disabled |
+| `GRAFANA_API_TOKEN` | Dedicated service-account token with alert-rule read access; when absent, evaluation is disabled and recovery remains inconclusive | Disabled |
+| `GRAFANA_ORG_ID` | Grafana organization expected in condition references | `1` |
+| `GRAFANA_TIMEOUT_SECONDS` | Alert-state API timeout | `10` |
 | `DEPLOYMENTS_URL` | Deployments service URL | `http://deployments:8080` |
 | `MAX_TOOL_CALLS` | Hard cap on tool rounds | `6` |
 | `TELEMETRY_CATALOG_REFRESH_SECONDS` | Live Prometheus/Loki schema refresh cadence | `86400` |

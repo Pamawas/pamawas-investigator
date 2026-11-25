@@ -7,6 +7,7 @@ import openai
 import pytest
 
 from models import (
+    ConditionReference,
     EvidenceSource,
     EvidenceType,
     Finding,
@@ -22,6 +23,7 @@ from service.investigator import (
     _ground_findings_in_data_queries,
     _logs_from_tool_calls,
     _metrics_from_tool_calls,
+    _select_condition_reference,
 )
 
 
@@ -314,6 +316,16 @@ def test_get_incident_context_loads_incident_and_events(investigator, cursor):
             "open",
             {},
             {"x": 1},
+            {
+                "version": 1,
+                "source": "grafana",
+                "evaluator": "managed_alerting",
+                "resource_type": "alert_rule",
+                "resource_id": "api-rule",
+                "instance_id": "api-instance",
+                "tenant_id": "1",
+                "labels": {"service": "api"},
+            },
         )
     ]
 
@@ -322,7 +334,54 @@ def test_get_incident_context_loads_incident_and_events(investigator, cursor):
     assert context.title == "Outage"
     assert context.affected_services == ["api"]
     assert context.events[0]["raw_payload"] == {"x": 1}
+    assert context.condition_ref.resource_id == "api-rule"
+    assert context.condition_ref_error is None
     assert cursor.execute.call_count == 2
+
+
+def test_condition_reference_labels_do_not_create_false_identity_conflict():
+    base = {
+        "version": 1,
+        "source": "grafana",
+        "evaluator": "managed_alerting",
+        "resource_type": "alert_rule",
+        "resource_id": "api-rule",
+        "instance_id": "api-instance",
+        "tenant_id": "1",
+    }
+
+    reference, error = _select_condition_reference([
+        {"id": "legacy", "condition_ref": {**base, "labels": {}}},
+        {
+            "id": "new",
+            "condition_ref": {**base, "labels": {"service": "api"}},
+        },
+    ])
+
+    assert error is None
+    assert reference is not None
+    assert reference.resource_id == "api-rule"
+
+
+def test_condition_reference_locator_conflict_fails_closed():
+    first = {
+        "version": 1,
+        "source": "grafana",
+        "evaluator": "managed_alerting",
+        "resource_type": "alert_rule",
+        "resource_id": "rule-a",
+        "instance_id": "instance",
+        "tenant_id": "1",
+        "labels": {},
+    }
+
+    reference, error = _select_condition_reference([
+        {"id": "a", "condition_ref": first},
+        {"id": "b", "condition_ref": {**first, "resource_id": "rule-b"}},
+    ])
+
+    assert reference is None
+    assert error == "the incident contains conflicting condition references"
 
 
 def test_get_incident_context_reports_missing_incident(investigator, cursor):
@@ -351,7 +410,9 @@ def test_investigate_returns_context_error(investigator):
 
 
 def test_investigate_executes_tool_then_submits_findings(investigator):
-    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "API Down", affected_services=["api"])
+    )
     # Mock the async adapters directly - use AsyncMock for async methods
     from unittest.mock import AsyncMock
 
@@ -376,7 +437,10 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
         side_effect=[
             response(
                 tool_calls=[
-                    tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})
+                    tool_call(
+                        "query_prometheus",
+                        {"promql": 'up{target="api"}', "start": "s", "end": "e"},
+                    )
                 ]
             ),
             response(
@@ -412,9 +476,11 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     assert findings[0].type is EvidenceType.FACT
     assert "peaked at 1" in findings[0].content
     assert "last queried value was 0" in findings[0].content
-    assert findings[0].source_detail == "query_prometheus: up [s to e]"
+    assert findings[0].source_detail == 'query_prometheus: up{target="api"} [s to e]'
     assert all(finding.content != "down" for finding in findings)
-    investigator.tools._prometheus_adapter.query_range.assert_called_once_with("up", "s", "e")
+    investigator.tools._prometheus_adapter.query_range.assert_called_once_with(
+        'up{target="api"}', "s", "e"
+    )
     investigator.tools._loki_adapter.query_range.assert_called_once_with(
         '{service="api"}', "s", "e", 100
     )
@@ -628,7 +694,9 @@ def test_repeated_discovery_is_redirected_to_real_data_queries(investigator):
 
 def test_investigate_final_text_without_data_becomes_unknown(investigator):
     investigator.config.max_tool_calls = 1
-    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "API Down", affected_services=["api"])
+    )
     investigator.llm.chat_completion = MagicMock(
         return_value=response("Possible resource exhaustion")
     )
@@ -654,11 +722,16 @@ def test_investigate_returns_unknown_when_llm_raises(investigator):
 def test_investigate_handles_large_tool_result_without_invalid_json(investigator):
     investigator.config.max_tool_calls = 1
     investigator.config.truncation_limit = 80
-    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "API Down", affected_services=["api"])
+    )
     investigator.tools.query_prometheus = MagicMock(return_value={"data": "x" * 500})
     investigator.llm.chat_completion = MagicMock(
         return_value=response(
-            tool_calls=[tool_call("query_prometheus", {"promql": "up", "start": "s", "end": "e"})]
+            tool_calls=[tool_call(
+                "query_prometheus",
+                {"promql": 'up{target="api"}', "start": "s", "end": "e"},
+            )]
         )
     )
     findings = investigator.investigate("inc")
@@ -676,7 +749,9 @@ def test_text_only_turns_are_bounded_by_turn_budget(investigator):
     ended with a synthesized UNKNOWN even though tools had succeeded.
     """
     investigator.config.max_tool_calls = 3
-    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "API Down", affected_services=["api"])
+    )
     investigator.llm.chat_completion = MagicMock(return_value=response("still thinking"))
 
     findings = investigator.investigate("inc")
@@ -921,7 +996,9 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
     investigator.DEADLINE_RESERVE_MIN_SECONDS = 2.0
     _advancing_clock(monkeypatch, step=0.5)
 
-    investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
+    investigator._get_incident_context = MagicMock(
+        return_value=IncidentContext("inc", "API Down", affected_services=["api"])
+    )
     investigator.tools._prometheus_adapter.query_range = AsyncMock(
         return_value={
             "status": "success",
@@ -972,7 +1049,7 @@ def test_deadline_reserve_forces_submission_instead_of_losing_the_run(investigat
                 tool_calls=[
                     tool_call(
                         "query_prometheus",
-                        {"promql": "up", "start": "s", "end": "e"},
+                        {"promql": 'up{target="api"}', "start": "s", "end": "e"},
                         "prom-required",
                     ),
                     tool_call(
@@ -1580,7 +1657,12 @@ def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
         ),
     ]
 
-    grounded = _ground_findings_in_data_queries(model_findings, tool_calls)
+    context = IncidentContext(
+        "inc_custom",
+        "Custom Utilization",
+        affected_services=["alpha-target"],
+    )
+    grounded = _ground_findings_in_data_queries(model_findings, tool_calls, context)
 
     assert [finding.source for finding in grounded] == [
         EvidenceSource.PROMETHEUS,
@@ -1724,8 +1806,7 @@ def test_single_provider_fact_outranks_provider_gap_root_cause_unknown():
     assert any("No usable data from query_loki" in finding.content for finding in completed)
     actions = [finding for finding in completed if finding.type is EvidenceType.RECOMMENDATION]
     assert len(actions) == 1
-    assert "ceph health detail" in actions[0].content
-    assert "ceph osd perf" in actions[0].content
+    assert actions[0].content == "Inspect logs because no cause was found."
 
 
 def test_model_causal_verdict_is_preserved_as_capped_synthesis():
@@ -1754,7 +1835,12 @@ def test_model_causal_verdict_is_preserved_as_capped_synthesis():
         )
     ]
 
-    grounded = _ground_findings_in_data_queries(model_findings, tool_calls)
+    context = IncidentContext(
+        "inc_restart",
+        "Target Restart",
+        affected_services=["target"],
+    )
+    grounded = _ground_findings_in_data_queries(model_findings, tool_calls, context)
 
     hypotheses = [
         finding for finding in grounded if finding.type is EvidenceType.HYPOTHESIS
@@ -2203,28 +2289,9 @@ def test_a_fact_keeps_its_confidence():
     assert _normalize_finding(fact).confidence == 1.0
 
 
-def test_claim_recovered_recognizes_positive_recovery():
-    """A verification only closes an incident on a positive recovery claim."""
-    from service.investigator import _claim_recovered
-
-    assert _claim_recovered("The target has recovered; up is 1 again.")
-    assert _claim_recovered("up{job='x'} is back up since 14:32.")
-    assert _claim_recovered("no longer down; the host is reachable.")
-    # Uncertainty, failure, or still firing/unreachable is not recovery.
-    assert not _claim_recovered("The target may still be down.")
-    assert not _claim_recovered("up is 0; still failing.")
-    assert not _claim_recovered(
-        "The alert is still firing as of the last evaluation at 07:02:00, "
-        "confirming the target remains unreachable."
-    )
-    assert not _claim_recovered("The target remains unreachable.")
-    assert not _claim_recovered("no recovery observed in the metrics.")
-
-
-def test_cached_verification_evidence_does_not_assume_schema_or_recovery():
+def test_cached_verification_evidence_does_not_assume_metric_semantics():
     from service.investigator import (
         _cached_verification_results,
-        _claim_recovered,
         _loki_verification_finding,
         _prometheus_verification_finding,
     )
@@ -2269,68 +2336,98 @@ def test_cached_verification_evidence_does_not_assume_schema_or_recovery():
     assert all(finding is not None for finding in findings)
     assert "1 result series" in findings[0].content
     assert "1 log lines across 1 result streams" in findings[1].content
-    assert all(not _claim_recovered(finding.content) for finding in findings)
 
 
 @pytest.mark.asyncio
-async def test_verify_incident_closes_only_on_recovery(investigator):
-    """A stale incident closes only when the evidence says it recovered.
+async def test_verify_incident_closes_only_on_authoritative_normal_state(investigator):
+    from datetime import UTC, datetime
 
-    The correlator acts on this verdict. A finding that the target is still down
-    must keep the incident open (still_down), never close it.
-    """
-    from models import EvidenceSource, EvidenceType, Finding, IncidentContext
+    from adapters import ConditionEvaluation, ConditionState
 
     investigator._get_incident_context = MagicMock(
-        return_value=IncidentContext("inc", "Outage", affected_services=["svc"])
+        return_value=IncidentContext(
+            "inc",
+            "Outage",
+            affected_services=["svc"],
+            condition_ref=ConditionReference(
+                1,
+                "grafana",
+                "managed_alerting",
+                "alert_rule",
+                "rule-uid",
+                "instance-id",
+                "1",
+                {},
+            ),
+        )
     )
-    investigator._run_investigation_loop = AsyncMock(
-        return_value=[
-            Finding(
-                type=EvidenceType.FACT,
-                content="The target has recovered; up is 1 since 14:32.",
-                source=EvidenceSource.PROMETHEUS,
-                confidence=1.0,
-            )
-        ]
+    investigator._evaluate_condition = AsyncMock(
+        return_value=ConditionEvaluation(
+            ConditionState.NORMAL,
+            "grafana",
+            "managed_alerting",
+            "instance_normal",
+            "normal",
+            True,
+            datetime.now(UTC),
+        )
     )
+    investigator._persist_investigation = AsyncMock()
+    investigator._run_investigation_loop = AsyncMock()
 
     result = await investigator.verify_incident("inc")
     assert result["verdict"] == "recovered"
+    investigator._run_investigation_loop.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_verify_incident_keeps_open_when_still_down(investigator):
-    from models import EvidenceSource, EvidenceType, Finding, IncidentContext
+async def test_verify_incident_keeps_open_when_source_is_firing(investigator):
+    from datetime import UTC, datetime
+
+    from adapters import ConditionEvaluation, ConditionState
 
     investigator._get_incident_context = MagicMock(
         return_value=IncidentContext("inc", "Outage", affected_services=["svc"])
     )
-    investigator._run_investigation_loop = AsyncMock(
-        return_value=[
-            Finding(
-                type=EvidenceType.FACT,
-                content="up is 0; scrape_duration_seconds is 30s.",
-                source=EvidenceSource.PROMETHEUS,
-                confidence=1.0,
-            )
-        ]
+    investigator._evaluate_condition = AsyncMock(
+        return_value=ConditionEvaluation(
+            ConditionState.FIRING,
+            "grafana",
+            "managed_alerting",
+            "instance_firing",
+            "firing",
+            True,
+            datetime.now(UTC),
+        )
     )
+    investigator._persist_investigation = AsyncMock()
 
     result = await investigator.verify_incident("inc")
     assert result["verdict"] == "still_down"
 
 
 @pytest.mark.asyncio
-async def test_verify_incident_defaults_to_still_down_when_inconclusive(investigator):
-    """An empty or UNKNOWN verification never closes the incident."""
-    from models import IncidentContext
+async def test_verify_incident_is_inconclusive_when_source_state_is_unknown(investigator):
+    from datetime import UTC, datetime
+
+    from adapters import ConditionEvaluation, ConditionState
 
     investigator._get_incident_context = MagicMock(return_value=IncidentContext("inc", "Outage"))
-    investigator._run_investigation_loop = AsyncMock(return_value=[])
+    investigator._evaluate_condition = AsyncMock(
+        return_value=ConditionEvaluation(
+            ConditionState.UNKNOWN,
+            "system",
+            "none",
+            "missing_condition_reference",
+            "missing",
+            False,
+            datetime.now(UTC),
+        )
+    )
+    investigator._persist_investigation = AsyncMock()
 
     result = await investigator.verify_incident("inc")
-    assert result["verdict"] == "still_down"
+    assert result["verdict"] == "inconclusive"
 
 
 def test_verification_prompt_and_message_anchors_current_time(investigator):

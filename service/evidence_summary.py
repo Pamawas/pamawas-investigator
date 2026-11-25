@@ -13,6 +13,9 @@ _TIMESTAMP_PREFIX = re.compile(r"^\s*\d{4}-\d{2}-\d{2}T\S+\s+")
 _LEVEL_PREFIX = re.compile(r"^(?:WARN|ERRO|ERROR|INFO|DEBUG|TRACE|FATAL)\s+", re.IGNORECASE)
 _CODE_PREFIX = re.compile(r"^(?:\[[^\]]+\]\s*)?[\w./-]+\.[a-zA-Z]+:\d+:?\s*")
 _METRIC_NAME = re.compile(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*\{")
+_METRIC_REFERENCE = re.compile(
+    r"(?<![a-zA-Z0-9_:])([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?=\{|\[)"
+)
 _PROMQL_MATCHER = re.compile(
     r'([a-zA-Z_][a-zA-Z0-9_]*)\s*(=|=~)\s*"((?:\\.|[^"\\])*)"'
 )
@@ -202,11 +205,126 @@ def metric_caption(expression: str, metadata: dict) -> str:
     return str(name).replace("_", " ").removesuffix(" total").capitalize()
 
 
+def _unquoted_promql_characters(expression: str):
+    """Yield code characters while hiding matcher string contents."""
+    quoted = False
+    escaped = False
+    for index, char in enumerate(expression):
+        if quoted:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                quoted = False
+        elif char == '"':
+            quoted = True
+        else:
+            yield index, char
+
+
+def _outer_parentheses_wrap_complete_expression(expression: str) -> bool:
+    if not expression.startswith("(") or not expression.endswith(")"):
+        return False
+    depth = 0
+    for index, char in _unquoted_promql_characters(expression):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return index == len(expression) - 1
+    return False
+
+
+def _strip_outer_parentheses(expression: str) -> str:
+    """Remove parentheses only when they wrap the complete PromQL expression."""
+    stripped = expression.strip()
+    while _outer_parentheses_wrap_complete_expression(stripped):
+        stripped = stripped[1:-1].strip()
+    return stripped
+
+
+def _top_level_operator_positions(expression: str, operator: str) -> list[int]:
+    """Find arithmetic operators outside strings, selectors, ranges, and calls."""
+    positions = []
+    depths = {"(": 0, "{": 0, "[": 0}
+    closing = {")": "(", "}": "{", "]": "["}
+    for index, char in _unquoted_promql_characters(expression):
+        if char in depths:
+            depths[char] += 1
+        elif char in closing:
+            opening = closing[char]
+            depths[opening] = max(0, depths[opening] - 1)
+        elif char == operator and not any(depths.values()):
+            positions.append(index)
+    return positions
+
+
+def _is_hundred_literal(expression: str) -> bool:
+    return re.fullmatch(r"100(?:\.0+)?", expression.strip()) is not None
+
+
+def _is_evidence_backed_percent_ratio(expression: str) -> bool:
+    """Recognize a conservative ratio-to-percent PromQL transformation.
+
+    Provider metadata describes source metrics, not the final value of a
+    composite expression. A ratio of the same metric family has an explicit
+    denominator and cancels the source unit; multiplying that complete ratio by
+    100 therefore has deterministic percent semantics. Ambiguous expressions
+    remain unitless rather than being guessed from names or alert titles.
+    """
+    expression = _strip_outer_parentheses(expression)
+    multiplications = _top_level_operator_positions(expression, "*")
+    if not multiplications:
+        return False
+
+    ratio_expression = ""
+    first = multiplications[0]
+    last = multiplications[-1]
+    if _is_hundred_literal(expression[last + 1:]):
+        ratio_expression = expression[:last]
+    elif _is_hundred_literal(expression[:first]):
+        ratio_expression = expression[first + 1:]
+    if not ratio_expression:
+        return False
+
+    ratio_expression = _strip_outer_parentheses(ratio_expression)
+    divisions = _top_level_operator_positions(ratio_expression, "/")
+    if not divisions:
+        return False
+    division = divisions[-1]
+    numerator = ratio_expression[:division]
+    denominator = ratio_expression[division + 1:]
+    numerator_metrics = set(_METRIC_REFERENCE.findall(numerator))
+    denominator_metrics = set(_METRIC_REFERENCE.findall(denominator))
+    return bool(numerator_metrics.intersection(denominator_metrics))
+
+
+def _has_top_level_arithmetic(expression: str) -> bool:
+    expression = _strip_outer_parentheses(expression)
+    return any(
+        _top_level_operator_positions(expression, operator)
+        for operator in "+-*/%^"
+    )
+
+
 def metric_unit(expression: str, metadata: dict) -> str:
-    unit = str(metadata.get("unit") or "").strip()
+    unit = str(
+        metadata.get("result_unit")
+        or metadata.get("expression_unit")
+        or metadata.get("unit")
+        or ""
+    ).strip()
     if unit.lower() in ("percent", "percentage"):
         return "%"
-    if metadata.get("type") == "counter" and re.search(r"\b(?:i?rate)\s*\(", expression):
+    if _is_evidence_backed_percent_ratio(expression):
+        return "%"
+    if (
+        metadata.get("type") == "counter"
+        and re.search(r"\b(?:i?rate)\s*\(", expression)
+        and not _has_top_level_arithmetic(expression)
+    ):
         return f"{unit or 'units'} per second"
     return unit
 

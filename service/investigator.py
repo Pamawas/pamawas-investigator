@@ -22,7 +22,12 @@ import psycopg2
 from openai import OpenAI
 
 from adapters import (
+    ConditionEvaluation,
+    ConditionEvaluatorRegistry,
+    ConditionState,
     DeploymentAdapterError,
+    GrafanaAlertingAdapter,
+    GrafanaAlertingConfig,
     LokiError,
     PrometheusError,
     RelatedIncidentsError,
@@ -37,6 +42,7 @@ from metrics import (
     increment_max_tool_calls_reached,
 )
 from models import (
+    ConditionReference,
     EvidenceSource,
     EvidenceType,
     Finding,
@@ -59,7 +65,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v20"
+PROMPT_VERSION = "pamawas-investigator-v22"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -79,26 +85,6 @@ _PROCESS_ONLY_UNKNOWN_PREFIXES = (
     "Investigation ended without a stated conclusion",
     "Investigation ended without a substantive conclusion",
 )
-
-def _incident_signal_kind(context: IncidentContext | None) -> str:
-    """Map known alert families to deterministic telemetry rules."""
-    title = (context.title if context else "").lower()
-    if "postgres" in title:
-        return "postgres"
-    if "traefik" in title and "latency" in title:
-        return "traefik_latency"
-    if "traefik" in title and "error" in title:
-        return "traefik_error"
-    if "ceph" in title and "latency" in title:
-        return "ceph_latency"
-    if "authentik" in title and "worker" in title:
-        return "authentik_worker"
-    if "cpu" in title:
-        return "cpu"
-    if "crash" in title or "restart" in title:
-        return "pod_restart"
-    return "generic"
-
 
 _RELEVANCE_STOPWORDS = {
     "alert", "critical", "high", "incident", "production", "service", "warning",
@@ -175,7 +161,10 @@ def _relative_relevance_floor(highest: int) -> int:
         return highest - 3
     if highest > 0:
         return highest
-    return 0
+    # A zero maximum means none of the returned telemetry shares an incident
+    # domain or target term. Treat that as no eligible evidence rather than
+    # admitting every arbitrary call at the same zero score.
+    return 1
 
 
 def _prometheus_relevance_score(
@@ -243,71 +232,106 @@ def _select_relevant_loki_calls(
     return [item[2] for item in scored[:limit]]
 
 
-def _current_scoped_values(call: ToolResult, targets: set[str]) -> list[float]:
-    data = call.result.get("data") if isinstance(call.result, dict) else None
-    series = data.get("result") if isinstance(data, dict) else None
-    if not isinstance(series, list):
-        return []
-    expression = str(call.arguments.get("promql") or "").lower()
-    expression_is_scoped = any(target in expression for target in targets)
-    scoped_values: list[float] = []
-    fallback_values: list[float] = []
-    for item in series:
-        points = numeric_points(item)
-        if not points:
+def _select_condition_reference(
+    events: list[dict[str, Any]],
+) -> tuple[ConditionReference | None, str | None]:
+    """Select one immutable source condition from normalized alert events."""
+    references: dict[tuple[Any, ...], ConditionReference] = {}
+    for event in events:
+        raw_reference = event.get("condition_ref")
+        if raw_reference is None:
             continue
-        latest = points[-1][1]
-        fallback_values.append(latest)
-        labels = json.dumps(item.get("metric", {}), sort_keys=True).lower()
-        if expression_is_scoped or not targets or any(target in labels for target in targets):
-            scoped_values.append(latest)
-    return scoped_values or ([] if targets else fallback_values)
+        try:
+            reference = (
+                raw_reference
+                if isinstance(raw_reference, ConditionReference)
+                else ConditionReference.from_dict(raw_reference)
+            )
+        except ValueError as exc:
+            event_id = str(event.get("id") or "unknown event")
+            return None, f"{event_id} carries an invalid condition reference ({exc})"
+        # Labels are bounded source metadata, not condition identity. Legacy
+        # backfills and new notifications may retain different label subsets
+        # for the same source-owned instance; that must not create a false
+        # conflict. The required locator fields remain exact.
+        identity = (
+            reference.version,
+            reference.source,
+            reference.evaluator,
+            reference.resource_type,
+            reference.resource_id,
+            reference.instance_id,
+            reference.tenant_id,
+        )
+        references.setdefault(identity, reference)
+    if not references:
+        return None, "no typed condition reference was attached to the incident"
+    if len(references) > 1:
+        return None, "the incident contains conflicting condition references"
+    return next(iter(references.values())), None
 
 
-def _incident_state_reconciliation(
-    calls: list[ToolResult], context: IncidentContext | None
-) -> Finding | None:
-    """Surface current healthy telemetry that conflicts with an open incident."""
-    if context is None or context.status.lower() not in {"open", "investigating", "firing"}:
-        return None
-    title = context.title.lower()
-    if not any(marker in title for marker in ("absent", "down", "unavailable")):
-        return None
+def _condition_reference_prompt(context: IncidentContext | None) -> str:
+    if context is None or context.condition_ref is None:
+        return (
+            "No authoritative condition reference is available. Telemetry may explain the "
+            "incident, but it must not be used to declare recovery.\n"
+        )
+    reference = context.condition_ref
+    state = context.condition_state or "not evaluated"
+    return (
+        f"Authoritative condition: {reference.source}/{reference.evaluator}, "
+        f"{reference.resource_type}={reference.resource_id}, instance={reference.instance_id}. "
+        f"Current evaluator state: {state}. Telemetry may explain this condition but cannot "
+        "override its source state or independently establish recovery.\n"
+    )
 
-    targets = {
-        str(target).strip().lower()
-        for target in context.affected_services or []
-        if str(target).strip()
-    }
-    for call in calls:
-        expression = str(call.arguments.get("promql") or "")
-        lowered = expression.lower()
-        if not (
-            re.search(r"(?:^|[^a-z0-9_:])up(?:$|[^a-z0-9_:])", lowered)
-            or "worker" in lowered
-            or "replicas_available" in lowered
-            or "ready_replicas" in lowered
-        ):
-            continue
-        values = _current_scoped_values(call, targets)
-        if not values or min(values) <= 0:
-            continue
-        metadata = call.result.get("metric_metadata", {})
-        metric_name = str(metadata.get("name") or "").strip()
-        if not metric_name:
-            match = re.search(r"([a-zA-Z_:][a-zA-Z0-9_:]*)\s*(?:\{|\[|$)", expression)
-            metric_name = match.group(1) if match else "availability metric"
+
+def _condition_evaluation_finding(
+    reference: ConditionReference | None,
+    evaluation: ConditionEvaluation,
+) -> Finding:
+    detail = (
+        f"condition evaluator={evaluation.source}/{evaluation.evaluator}; "
+        f"reason={evaluation.reason_code}"
+    )
+    if reference is not None:
+        detail += (
+            f"; resource={reference.resource_type}:{reference.resource_id}; "
+            f"instance={reference.instance_id}"
+        )
+    if evaluation.state == ConditionState.NORMAL and evaluation.authoritative:
         return Finding(
             type=EvidenceType.FACT,
             content=(
-                f"Current {metric_name} is {min(values):g}, which conflicts with the "
-                f"still-open {context.title} incident state."
+                "The authoritative alert source reports the exact condition instance as "
+                "normal, which conflicts with the incident remaining open."
             ),
-            source=EvidenceSource.PROMETHEUS,
-            source_detail="incident-state reconciliation",
+            source=EvidenceSource.ALERT,
+            source_detail=detail,
             confidence=1.0,
         )
-    return None
+    if evaluation.state in {ConditionState.FIRING, ConditionState.PENDING}:
+        return Finding(
+            type=EvidenceType.FACT,
+            content=(
+                "The authoritative alert source reports the exact condition instance as "
+                f"{evaluation.state.value}; recovery is not established."
+            ),
+            source=EvidenceSource.ALERT,
+            source_detail=detail,
+            confidence=1.0,
+        )
+    return Finding(
+        type=EvidenceType.UNKNOWN,
+        content=(
+            "The authoritative condition state could not establish recovery: "
+            f"{evaluation.detail}"
+        ),
+        source=EvidenceSource.SYSTEM,
+        source_detail=detail,
+        confidence=0.0,
+    )
 
 # Use datetime.UTC from Python 3.11+, fallback for older versions
 try:
@@ -1244,56 +1268,6 @@ def _ensure_actions(
     context: IncidentContext | None = None,
 ) -> list[Finding]:
     """Keep operator actions available even when the model or a provider fails."""
-    kind = _incident_signal_kind(context)
-    deterministic_actions = {
-        "postgres": (
-            "Use pg_stat_statements to identify the statements contributing most to the "
-            "alerted PostgreSQL signal, run EXPLAIN (ANALYZE, BUFFERS) on the leading "
-            "candidate in a safe environment, and verify the alert measurement is below "
-            "its configured threshold after remediation."
-        ),
-        "traefik_latency": (
-            "Inspect Traefik request-duration metrics for the exact router and service, "
-            "correlate the same window with that backend's logs, and verify latency remains "
-            "below the configured threshold after remediation."
-        ),
-        "traefik_error": (
-            "Inspect Traefik response-code metrics for the exact router and service, "
-            "correlate the same window with that backend's logs, and verify the error rate "
-            "remains below the configured threshold after remediation."
-        ),
-        "ceph_latency": (
-            "Run ceph health detail and ceph osd perf, inspect CPU, memory, disk, and network "
-            "pressure on the affected OSD node, then verify OSD latency remains below the "
-            "configured threshold."
-        ),
-        "authentik_worker": (
-            "Compare the Authentik Deployment's desired and available replicas with "
-            "authentik_tasks_workers, reconcile the incident if current capacity is healthy, "
-            "and verify the alert rule clears."
-        ),
-        "cpu": (
-            "Identify the process or workload consuming CPU on the affected target, address "
-            "that workload, and verify CPU remains below the configured threshold."
-        ),
-        "pod_restart": (
-            "Inspect the container's previous logs, termination reason, Kubernetes events, "
-            "and rollout history, then verify the pod remains ready without additional "
-            "restarts."
-        ),
-    }
-    if kind in deterministic_actions:
-        findings = [
-            finding for finding in findings
-            if finding.type != EvidenceType.RECOMMENDATION
-        ]
-        return [*findings, Finding(
-            type=EvidenceType.RECOMMENDATION,
-            content=deterministic_actions[kind],
-            source=EvidenceSource.SYSTEM,
-            source_detail=f"deterministic action for {kind}",
-            confidence=1.0,
-        )]
     if any(finding.type == EvidenceType.RECOMMENDATION for finding in findings):
         return findings
     facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
@@ -1459,9 +1433,6 @@ def _ground_findings_in_data_queries(
         _loki_query_finding(call, context)
         for call in loki_calls
     )
-    reconciliation = _incident_state_reconciliation(prometheus_calls, context)
-    if reconciliation is not None:
-        grounded.append(reconciliation)
     causal_synthesis = _normalized_causal_synthesis(
         findings, [*prometheus_calls, *loki_calls]
     )
@@ -1778,61 +1749,6 @@ def _remaining_budget(started: float, budget_seconds: float | None) -> float | N
 def _is_timeout(error: Exception) -> bool:
     """True when the endpoint accepted the request but did not answer in time."""
     return isinstance(error, (openai.APITimeoutError, TimeoutError))
-
-
-def _claim_recovered(text: str) -> bool:
-    """True when a finding states the condition is no longer failing.
-
-    A verification only closes an incident on a positive claim of recovery.
-    Anything phrased as failure, ongoing alert, negative, or uncertainty must not count.
-    """
-    if not text:
-        return False
-    lowered = " ".join(text.lower().split())
-
-    disqualifiers = (
-        "unreachable",
-        "not reachable",
-        "still down",
-        "still firing",
-        "still failing",
-        "remains down",
-        "remains unreachable",
-        "no recovery",
-        "not recovered",
-        "has not recovered",
-        "did not recover",
-        "did not confirm",
-        "cannot reach",
-        "unable to reach",
-        "cannot conclude",
-        "could not verify",
-        "unconfirmed",
-        "not confirmed",
-        "may still be down",
-        "up is 0",
-        "up=0",
-        "up == 0",
-    )
-    if any(d in lowered for d in disqualifiers):
-        return False
-
-    positive_recovery_patterns = (
-        r"\brecovered\b",
-        r"\brecovery\b",
-        r"\bback up\b",
-        r"\bbackup\b",
-        r"\bis up\b",
-        r"\bis back\b",
-        r"\bno longer down\b",
-        r"\bno longer failing\b",
-        r"\breturned\b",
-        r"\breachable\b",
-        r"\bis alive\b",
-        r"\brestored\b",
-        r"\bself-resolved\b",
-    )
-    return any(re.search(pat, lowered) for pat in positive_recovery_patterns)
 
 
 def _out_of_time(remaining: float | None, attempt: int) -> bool:
@@ -2251,6 +2167,37 @@ class PamawasInvestigator:
         self.config = config
         self.llm = InvestigatorLLM(config)
         self.tools = InvestigatorTools(config)
+        self.condition_evaluators = ConditionEvaluatorRegistry()
+        if config.grafana_url.strip() and config.grafana_api_token.strip():
+            self.condition_evaluators.register(
+                "grafana",
+                "managed_alerting",
+                GrafanaAlertingAdapter(
+                    GrafanaAlertingConfig(
+                        base_url=config.grafana_url.strip(),
+                        api_token=config.grafana_api_token.strip(),
+                        org_id=config.grafana_org_id.strip(),
+                        timeout_seconds=config.grafana_timeout_seconds,
+                        max_response_bytes=config.grafana_max_response_bytes,
+                        max_alerts=config.grafana_max_alerts,
+                        max_rules=config.grafana_max_rules,
+                        circuit_breaker_failure_threshold=(
+                            config.circuit_breaker_failure_threshold
+                        ),
+                        circuit_breaker_timeout_seconds=(
+                            config.circuit_breaker_timeout_seconds
+                        ),
+                        circuit_breaker_half_open_max_calls=(
+                            config.circuit_breaker_half_open_max_calls
+                        ),
+                    )
+                ),
+            )
+        elif config.grafana_url.strip():
+            logger.warning(
+                "Grafana URL is configured without an API token; authoritative "
+                "Grafana condition evaluation is disabled and recovery will fail closed"
+            )
 
         self.db_conn = None
         self.persistence = None
@@ -2352,8 +2299,25 @@ class PamawasInvestigator:
             self.persistence.load_telemetry_catalog
         )
 
+    async def _evaluate_condition(
+        self, context: IncidentContext
+    ) -> ConditionEvaluation:
+        """Evaluate current source state before any telemetry investigation."""
+        if context.condition_ref is None and context.condition_ref_error:
+            evaluation = ConditionEvaluation.unknown(
+                None,
+                "invalid_condition_reference",
+                context.condition_ref_error,
+            )
+        else:
+            evaluation = await self.condition_evaluators.evaluate(context.condition_ref)
+        context.condition_state = evaluation.state.value
+        context.condition_state_reason = evaluation.reason_code
+        return evaluation
+
     async def close(self):
         """Close investigator tools and database connections."""
+        await self.condition_evaluators.close()
         await self.tools.close()
         if self.db_conn and not self.db_conn.closed:
             self.db_conn.close()
@@ -2397,7 +2361,8 @@ class PamawasInvestigator:
                 cursor.execute(
                     """
                     SELECT e.id, e.source, e.type, e.occurred_at, e.service, e.environment,
-                           e.severity, e.title, e.status, e.labels, e.raw_payload
+                           e.severity, e.title, e.status, e.labels, e.raw_payload,
+                           e.condition_ref
                     FROM events e
                     JOIN incident_events ie ON e.id = ie.event_id
                     WHERE ie.incident_id = %s
@@ -2406,6 +2371,24 @@ class PamawasInvestigator:
                     (incident_id,),
                 )
                 events = cursor.fetchall()
+                event_context = [
+                    {
+                        "id": e[0],
+                        "source": e[1],
+                        "type": e[2],
+                        "timestamp": str(e[3]),
+                        "service": e[4],
+                        "environment": e[5],
+                        "severity": e[6],
+                        "title": e[7],
+                        "status": e[8],
+                        "labels": e[9],
+                        "raw_payload": e[10],
+                        "condition_ref": e[11],
+                    }
+                    for e in events
+                ]
+                condition_ref, condition_ref_error = _select_condition_reference(event_context)
 
                 return IncidentContext(
                     incident_id=incident_row[0],
@@ -2415,22 +2398,9 @@ class PamawasInvestigator:
                     resolved_at=str(incident_row[4]) if incident_row[4] else None,
                     severity=incident_row[5],
                     affected_services=incident_row[6],
-                    events=[
-                        {
-                            "id": e[0],
-                            "source": e[1],
-                            "type": e[2],
-                            "timestamp": str(e[3]),
-                            "service": e[4],
-                            "environment": e[5],
-                            "severity": e[6],
-                            "title": e[7],
-                            "status": e[8],
-                            "labels": e[9],
-                            "raw_payload": e[10],
-                        }
-                        for e in events
-                    ],
+                    events=event_context,
+                    condition_ref=condition_ref,
+                    condition_ref_error=condition_ref_error,
                 )
             # db_conn runs in autocommit mode, so each statement completes
             # immediately and no transaction is left open.
@@ -2475,6 +2445,7 @@ class PamawasInvestigator:
                 "get_related_incidents only to tell the operator whether this "
                 "condition keeps recurring — never as the cause of this "
                 "occurrence.\n"
+                f"{_condition_reference_prompt(context)}"
                 "=== END SESSION SCOPE ===\n\n"
             )
         return scope + (
@@ -2638,6 +2609,7 @@ class PamawasInvestigator:
             f"Title: {title}\n"
             f"Affected service(s): {affected}\n"
             f"CURRENT LIVE TIME (NOW UTC): {now_iso}\n\n"
+            f"{_condition_reference_prompt(context)}\n"
             "Answer ONE question: is this condition actually still down right now?\n"
             "- Check ONLY the current/live state right now.\n"
             f"- Query Prometheus for the live window (e.g. start='{fifteen_min_ago}', "
@@ -3539,7 +3511,10 @@ class PamawasInvestigator:
         state.findings.extend(finding for finding in cached_findings if finding is not None)
 
         # Fallback if we still have no findings
-        if not state.findings:
+        if not any(
+            not finding.source_detail.startswith("condition evaluator=")
+            for finding in state.findings
+        ):
             state.findings.append(
                 Finding(
                     type=EvidenceType.UNKNOWN,
@@ -3593,8 +3568,6 @@ class PamawasInvestigator:
                 request_key_hash=request_key_hash,
                 context=context,
             )
-        await self._refresh_telemetry_catalog(context)
-
         # Initialize investigation state
         state = InvestigationState(
             incident_id=incident_id,
@@ -3608,6 +3581,17 @@ class PamawasInvestigator:
         checkpoint_status = self._hydrate_state_from_checkpoint(state, "investigation")
         if checkpoint_status == "completed":
             return state.findings
+
+        evaluation = await self._evaluate_condition(context)
+        state.findings = [
+            finding
+            for finding in state.findings
+            if not finding.source_detail.startswith("condition evaluator=")
+        ]
+        state.findings.append(
+            _condition_evaluation_finding(context.condition_ref, evaluation)
+        )
+        await self._refresh_telemetry_catalog(context)
 
         return await self._run_investigation_loop(
             incident_id=incident_id,
@@ -3623,16 +3607,13 @@ class PamawasInvestigator:
         request_key_hash: str | None = None,
         run_id: str | None = None,
     ) -> dict[str, Any]:
-        """Return a verdict on whether an incident is still actually down.
+        """Return a source-authoritative verdict for one stale incident.
 
         This audits a stale-open incident: the Scheduler discovered an incident
         silent past INCIDENT_STALE_AFTER, enqueued it in stale_verifications,
-        and the async stale-verification worker executes this bounded check.
-
-        The verdict is evidence-backed. Only a positive claim that the target
-        recovered closes the incident; anything else — still down, uncertain, or
-        an error — keeps it open. Returns a dict with verdict, a one-line
-        reason drawn from the highest-confidence finding, and the findings.
+        and the async stale-verification worker executes this bounded check. A
+        normal state from the condition's own evaluator is the only path to a
+        recovered verdict. Metrics, logs, titles, and model prose cannot close it.
         """
         request_key_hash = request_key_hash or (
             f"verification:{incident_id}:{uuid.uuid4().hex}"
@@ -3654,69 +3635,45 @@ class PamawasInvestigator:
                 run_kind="verification",
             )
             return {
-                "verdict": "still_down",
+                "verdict": "inconclusive",
                 "reason": context.error,
                 "findings": [f.to_dict() for f in findings],
             }
-        await self._refresh_telemetry_catalog(context)
 
-        state = InvestigationState(
+        evaluation = await self._evaluate_condition(context)
+        finding = _condition_evaluation_finding(context.condition_ref, evaluation)
+        findings = [finding]
+        if evaluation.authoritative and evaluation.state == ConditionState.NORMAL:
+            verdict = "recovered"
+        elif evaluation.authoritative and evaluation.state in {
+            ConditionState.FIRING,
+            ConditionState.PENDING,
+        }:
+            verdict = "still_down"
+        else:
+            verdict = "inconclusive"
+        reason = finding.content
+
+        await self._persist_investigation(
             incident_id=incident_id,
-            findings=[],
-            tool_calls=[],
-            # A verification is one question, not a full investigation. Keep the
-            # budget small so it checks the target's availability and stops.
-            max_tool_calls=self.config.verify_max_tool_calls,
             request_key_hash=request_key_hash,
-            run_id=run_id,
+            findings=findings,
+            tool_calls=[],
+            model_provider=self.config.llm_base_url,
+            model_name=self.config.llm_model,
+            prompt_version=PROMPT_VERSION,
+            tool_contract=1,
+            max_tool_calls=self.config.verify_max_tool_calls,
+            service=(context.affected_services or [None])[0],
             run_kind="verification",
-            service=context.affected_services[0] if context.affected_services else None,
         )
-        checkpoint_status = self._hydrate_state_from_checkpoint(state, "verification")
-
-        if checkpoint_status == "completed":
-            findings = state.findings
-        else:
-            deadline = time.monotonic() + self.config.verify_timeout_seconds
-            findings = await self._run_investigation_loop(
-                incident_id=incident_id,
-                request_key_hash=request_key_hash,
-                state=state,
-                context=context,
-                deadline=deadline,
-                verification=True,
-            )
-
-        # Highest-confidence evidence drives the reason. A positive recovery
-        # claim closes the incident; the default is still_down so an inconclusive
-        # verification never closes it.
-        verdict = "still_down"
-        reason = "The verification did not confirm the condition recovered."
-        ranked = sorted(findings, key=lambda f: f.confidence, reverse=True)
-        for f in ranked:
-            if f.type in (EvidenceType.FACT, EvidenceType.LIKELY_CAUSE) and _claim_recovered(
-                f.content
-            ):
-                verdict = "recovered"
-                reason = f.content
-                break
-        else:
-            for f in ranked:
-                if (
-                    f.type in (
-                        EvidenceType.FACT,
-                        EvidenceType.LIKELY_CAUSE,
-                        EvidenceType.HYPOTHESIS,
-                    )
-                    and not _is_placeholder_or_dummy(f.content)
-                ):
-                    reason = f.content
-                    break
 
         return {
             "verdict": verdict,
             "reason": reason,
             "findings": [f.to_dict() for f in findings],
+            "condition_state": evaluation.state.value,
+            "authoritative": evaluation.authoritative,
         }
 
     async def _handle_error_context_path(
@@ -4099,7 +4056,10 @@ class PamawasInvestigator:
         # If we exit the loop without submitting findings (deadline or turn
         # budget), synthesize a submission from whatever partial findings and
         # tool results we have.
-        if not state.findings:
+        if not any(
+            not finding.source_detail.startswith("condition evaluator=")
+            for finding in state.findings
+        ):
             reason = _exhaustion_reason(
                 exhausted_by, state.tool_calls, verification
             )

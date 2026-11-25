@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from models import (
+    ConditionReference,
     EvidenceSource,
     EvidenceType,
     Finding,
@@ -29,6 +30,52 @@ def test_incident_context_lists_are_not_shared():
     first.affected_services.append("api")
     assert second.events == []
     assert second.affected_services == []
+
+
+def test_condition_reference_round_trip_is_provider_neutral():
+    raw = {
+        "version": 1,
+        "source": "grafana",
+        "evaluator": "managed_alerting",
+        "resource_type": "alert_rule",
+        "resource_id": "rule-uid",
+        "instance_id": "instance-fingerprint",
+        "tenant_id": "1",
+        "labels": {"service": "api"},
+    }
+
+    reference = ConditionReference.from_dict(raw)
+
+    assert reference.to_dict() == raw
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        {
+            "version": 1,
+            "source": "grafana",
+            "evaluator": "managed_alerting",
+            "resource_type": "alert_rule",
+            "resource_id": "rule-uid",
+            "instance_id": "instance-fingerprint",
+            "labels": {},
+            "threshold": 1,
+        },
+        {
+            "version": 1,
+            "source": "grafana",
+            "evaluator": "managed_alerting",
+            "resource_type": "alert_rule",
+            "resource_id": "rule-uid",
+            "instance_id": "",
+            "labels": {},
+        },
+    ],
+)
+def test_condition_reference_rejects_unknown_fields_and_missing_identity(raw):
+    with pytest.raises(ValueError):
+        ConditionReference.from_dict(raw)
 
 
 def test_tool_result_sets_timezone_aware_timestamp():

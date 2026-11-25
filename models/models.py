@@ -51,6 +51,98 @@ class EvidenceSource(StrEnum):
     SYSTEM = "system"
 
 
+def _bounded_condition_string(
+    data: dict[str, Any], name: str, maximum: int, *, required: bool = True
+) -> str | None:
+    value = data.get(name)
+    if value is None and not required:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"condition_ref.{name} must be a string")
+    rendered = value.strip()
+    if (required and not rendered) or len(rendered) > maximum:
+        raise ValueError(f"condition_ref.{name} must be a bounded string")
+    if any(ord(char) < 32 or ord(char) == 127 for char in rendered):
+        raise ValueError(f"condition_ref.{name} contains control characters")
+    return rendered or None
+
+
+def _condition_labels(data: dict[str, Any]) -> dict[str, str]:
+    raw_labels = data.get("labels")
+    if not isinstance(raw_labels, dict) or len(raw_labels) > 64:
+        raise ValueError("condition_ref.labels must be an object with at most 64 entries")
+    labels: dict[str, str] = {}
+    for key, value in raw_labels.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise ValueError("condition_ref.labels must contain string keys and values")
+        clean_key = key.strip()
+        if not clean_key or len(clean_key) > 128 or len(value) > 512:
+            raise ValueError("condition_ref.labels contains an invalid bounded label")
+        if any(ord(char) < 32 or ord(char) == 127 for char in clean_key + value):
+            raise ValueError("condition_ref.labels contains control characters")
+        labels[clean_key] = value
+    return labels
+
+
+@dataclass(frozen=True)
+class ConditionReference:
+    """Bounded identity for one condition owned by an external evaluator."""
+
+    version: int
+    source: str
+    evaluator: str
+    resource_type: str
+    resource_id: str
+    instance_id: str
+    tenant_id: str | None = None
+    labels: dict[str, str] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: Any) -> ConditionReference:
+        if not isinstance(data, dict):
+            raise ValueError("condition_ref must be an object")
+        unknown = set(data) - {
+            "version",
+            "source",
+            "evaluator",
+            "resource_type",
+            "resource_id",
+            "instance_id",
+            "tenant_id",
+            "labels",
+        }
+        if unknown:
+            raise ValueError("condition_ref contains unsupported fields")
+        version = data.get("version")
+        if isinstance(version, bool) or version != 1:
+            raise ValueError("condition_ref.version must equal 1")
+
+        return cls(
+            version=version,
+            source=_bounded_condition_string(data, "source", 128) or "",
+            evaluator=_bounded_condition_string(data, "evaluator", 128) or "",
+            resource_type=_bounded_condition_string(data, "resource_type", 128) or "",
+            resource_id=_bounded_condition_string(data, "resource_id", 256) or "",
+            instance_id=_bounded_condition_string(data, "instance_id", 256) or "",
+            tenant_id=_bounded_condition_string(data, "tenant_id", 128, required=False),
+            labels=_condition_labels(data),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "version": self.version,
+            "source": self.source,
+            "evaluator": self.evaluator,
+            "resource_type": self.resource_type,
+            "resource_id": self.resource_id,
+            "instance_id": self.instance_id,
+            "labels": dict(self.labels),
+        }
+        if self.tenant_id is not None:
+            result["tenant_id"] = self.tenant_id
+        return result
+
+
 @dataclass
 class Finding:
     """Represents a piece of evidence or finding from the investigation."""
@@ -108,6 +200,11 @@ class IncidentContext:
     # One immutable snapshot of the provider schemas discovered from the live
     # Prometheus/Loki instances and persisted by the investigator.
     telemetry_catalog: dict[str, dict[str, Any]] | None = None
+    # Stable source identity used by an adapter to query exact current state.
+    condition_ref: ConditionReference | None = None
+    condition_ref_error: str | None = None
+    condition_state: str | None = None
+    condition_state_reason: str | None = None
     error: str | None = None
 
     def __post_init__(self):

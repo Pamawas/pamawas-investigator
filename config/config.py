@@ -49,6 +49,16 @@ class Config:
     llm_models: list[str] | None = None
     prometheus_url: str = "http://prometheus:9090"
     loki_url: str = "http://loki:3100"
+    # Authoritative condition state. Both URL and token must be configured to
+    # enable Grafana-managed alert evaluation; otherwise conditions fail closed
+    # as UNKNOWN and stale incidents are never resolved from telemetry guesses.
+    grafana_url: str = ""
+    grafana_api_token: str = ""
+    grafana_org_id: str = "1"
+    grafana_timeout_seconds: float = 10.0
+    grafana_max_response_bytes: int = 1_000_000
+    grafana_max_alerts: int = 1000
+    grafana_max_rules: int = 1000
     max_tool_calls: int = 100
     # How many investigations may call the LLM at once. The endpoint is the
     # scarce resource — a free endpoint serves a handful of concurrent requests
@@ -125,6 +135,15 @@ class Config:
             llm_models=_parse_env_list(os.getenv("LLM_MODELS")),
             prometheus_url=os.getenv("PROMETHEUS_URL", "http://prometheus:9090"),
             loki_url=os.getenv("LOKI_URL", "http://loki:3100"),
+            grafana_url=os.getenv("GRAFANA_URL", ""),
+            grafana_api_token=os.getenv("GRAFANA_API_TOKEN", ""),
+            grafana_org_id=os.getenv("GRAFANA_ORG_ID", "1"),
+            grafana_timeout_seconds=float(os.getenv("GRAFANA_TIMEOUT_SECONDS", "10.0")),
+            grafana_max_response_bytes=int(
+                os.getenv("GRAFANA_MAX_RESPONSE_BYTES", "1000000")
+            ),
+            grafana_max_alerts=int(os.getenv("GRAFANA_MAX_ALERTS", "1000")),
+            grafana_max_rules=int(os.getenv("GRAFANA_MAX_RULES", "1000")),
             max_tool_calls=int(os.getenv("MAX_TOOL_CALLS", "100")),
             max_concurrent_investigations=int(os.getenv("MAX_CONCURRENT_INVESTIGATIONS", "4")),
             truncation_limit=int(os.getenv("TRUNCATION_LIMIT", "8192")),
@@ -206,6 +225,9 @@ class Config:
             ("circuit_breaker_half_open_max_calls", "CIRCUIT_BREAKER_HALF_OPEN_MAX_CALLS", 1),
             ("prometheus_allowed_time_range_hours", "PROMETHEUS_ALLOWED_TIME_RANGE_HOURS", 1),
             ("loki_allowed_time_range_hours", "LOKI_ALLOWED_TIME_RANGE_HOURS", 1),
+            ("grafana_max_response_bytes", "GRAFANA_MAX_RESPONSE_BYTES", 1),
+            ("grafana_max_alerts", "GRAFANA_MAX_ALERTS", 1),
+            ("grafana_max_rules", "GRAFANA_MAX_RULES", 1),
             ("deployment_max_results", "DEPLOYMENT_MAX_RESULTS", 1),
             ("related_incidents_max_results", "RELATED_INCIDENTS_MAX_RESULTS", 1),
         ]
@@ -221,6 +243,7 @@ class Config:
             ("circuit_breaker_timeout_seconds", "CIRCUIT_BREAKER_TIMEOUT_SECONDS"),
             ("prometheus_timeout_seconds", "PROMETHEUS_TIMEOUT_SECONDS"),
             ("loki_timeout_seconds", "LOKI_TIMEOUT_SECONDS"),
+            ("grafana_timeout_seconds", "GRAFANA_TIMEOUT_SECONDS"),
             ("deployment_timeout_seconds", "DEPLOYMENT_TIMEOUT_SECONDS"),
         ]:
             if getattr(self, field) <= 0:
@@ -228,6 +251,15 @@ class Config:
 
         if self.port > 65535:
             raise ValueError(f"PORT must be <= 65535, got {self.port}")
+
+        grafana_url_configured = bool(self.grafana_url.strip())
+        grafana_token_configured = bool(self.grafana_api_token.strip())
+        if grafana_token_configured and not grafana_url_configured:
+            raise ValueError(
+                "GRAFANA_URL must be set when GRAFANA_API_TOKEN is configured"
+            )
+        if grafana_url_configured and not self.grafana_org_id.strip():
+            raise ValueError("GRAFANA_ORG_ID must not be empty when Grafana is configured")
 
         self._validate_llm_configuration()
 

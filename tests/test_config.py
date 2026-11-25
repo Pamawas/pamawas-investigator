@@ -12,6 +12,10 @@ def test_from_env_reads_all_values(monkeypatch):
         "LLM_MODEL": "model",
         "PROMETHEUS_URL": "http://prom",
         "LOKI_URL": "http://loki",
+        "GRAFANA_URL": "http://grafana",
+        "GRAFANA_API_TOKEN": "grafana-token",
+        "GRAFANA_ORG_ID": "7",
+        "GRAFANA_TIMEOUT_SECONDS": "12",
         "MAX_TOOL_CALLS": "9",
         "TRUNCATION_LIMIT": "1024",
         "TELEMETRY_CATALOG_REFRESH_SECONDS": "43200",
@@ -29,6 +33,10 @@ def test_from_env_reads_all_values(monkeypatch):
         llm_model="model",
         prometheus_url="http://prom",
         loki_url="http://loki",
+        grafana_url="http://grafana",
+        grafana_api_token="grafana-token",
+        grafana_org_id="7",
+        grafana_timeout_seconds=12,
         max_tool_calls=9,
         truncation_limit=1024,
         telemetry_catalog_refresh_seconds=43200,
@@ -71,4 +79,17 @@ def test_plural_llm_configuration_must_be_aligned():
     )
 
     with pytest.raises(ValueError, match="LLM_API_KEYS must contain exactly 2"):
+        config.validate()
+
+
+def test_grafana_url_without_token_is_allowed_for_fail_closed_startup():
+    config = Config(database_url="postgres://db", grafana_url="http://grafana")
+
+    config.validate()
+
+
+def test_grafana_token_requires_url():
+    config = Config(database_url="postgres://db", grafana_api_token="token")
+
+    with pytest.raises(ValueError, match="GRAFANA_URL must be set"):
         config.validate()

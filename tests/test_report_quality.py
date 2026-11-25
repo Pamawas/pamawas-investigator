@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from adapters.circuit_breaker import CircuitBreaker, CircuitState
-from models import EvidenceSource, EvidenceType, Finding, IncidentContext, ToolResult
+from models import (
+    EvidenceSource,
+    EvidenceType,
+    Finding,
+    IncidentContext,
+    ToolResult,
+)
 from service.investigator import (
     _ensure_causal_verdict,
     _ground_findings_in_data_queries,
@@ -102,6 +108,31 @@ def test_traefik_rejects_webhook_metrics_and_unrelated_queue_logs():
     assert "nuq.queue_scrape" not in rendered
 
 
+def test_zero_score_telemetry_is_not_admitted_as_incident_evidence():
+    context = IncidentContext(
+        "inc_pg",
+        "PostgreSQL Slow Query",
+        affected_services=["postgres"],
+    )
+    calls = [
+        metric_call("ambient_temperature_celsius"),
+        log_call('{job="backup-agent"}', "filesystem snapshot completed normally"),
+    ]
+
+    findings = _ground_findings_in_data_queries([], calls, context)
+
+    assert findings == []
+
+
+def test_contextless_telemetry_is_not_admitted_as_incident_evidence():
+    calls = [
+        metric_call('up{target="api"}'),
+        log_call('{service="api"}', "api restarted after timeout"),
+    ]
+
+    assert _ground_findings_in_data_queries([], calls) == []
+
+
 def test_ceph_capacity_is_excluded_from_latency_evidence():
     context = IncidentContext("inc_ceph", "Ceph OSD High Latency", affected_services=["osd.1"])
     findings = _ground_findings_in_data_queries(
@@ -122,23 +153,20 @@ def test_short_reasoning_note_is_never_a_finding():
     assert _is_reasoning_preamble("Let me query Loki for matching backend logs.")
 
 
-def test_open_authentik_incident_surfaces_current_worker_conflict():
+def test_positive_telemetry_never_independently_declares_recovery():
     context = IncidentContext(
-        "inc_authentik",
-        "Authentik Worker Absent",
+        "inc_capacity",
+        "Capacity condition",
         status="open",
-        affected_services=["authentik-worker"],
+        affected_services=["worker-service"],
     )
     findings = _ground_findings_in_data_queries(
-        [], [metric_call('authentik_tasks_workers{deployment="authentik-worker"}', "1")], context
+        [], [metric_call('active_capacity{service="worker-service"}', "1")], context
     )
 
-    conflict = [
-        finding for finding in findings
-        if finding.source_detail == "incident-state reconciliation"
-    ]
-    assert len(conflict) == 1
-    assert "conflicts with the still-open" in conflict[0].content
+    assert findings
+    assert all(finding.source is not EvidenceSource.ALERT for finding in findings)
+    assert all("recovery" not in finding.content.lower() for finding in findings)
 
 
 def test_likely_cause_requires_prometheus_and_loki_facts():

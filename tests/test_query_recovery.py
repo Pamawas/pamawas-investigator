@@ -36,7 +36,7 @@ async def test_loki_recovery_uses_its_own_keys_and_values():
         '{log_scope="alpha-target"}', "2026-11-23T11:30:10+00:00",
         "2026-11-23T11:45:10+00:00", 100,
     )
-    grounded = _ground_findings_in_data_queries([], recovery.calls)
+    grounded = _ground_findings_in_data_queries([], recovery.calls, recovery.context)
     assert "Worker restarted after timeout" in grounded[0].content
     assert "metric_job" not in grounded[0].source_detail
 
@@ -133,7 +133,7 @@ async def test_counter_recovery_preserves_rate_query_and_meaningful_observations
 
     executed = recovery.calls[-1]
     assert executed.arguments["promql"] == f"rate({original}[5m])"
-    grounded = _ground_findings_in_data_queries([], recovery.calls)
+    grounded = _ground_findings_in_data_queries([], recovery.calls, recovery.context)
     assert "0.85 seconds per second" in grounded[0].content
     assert "18:35:00 WIB" in grounded[0].content
     assert "{" not in grounded[0].content
