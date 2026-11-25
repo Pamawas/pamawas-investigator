@@ -23,6 +23,7 @@ from service.investigator import (
     _ground_findings_in_data_queries,
     _logs_from_tool_calls,
     _metrics_from_tool_calls,
+    _prometheus_metric_candidates,
     _select_condition_reference,
 )
 
@@ -1339,10 +1340,74 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
 
     assert result["status"] == "empty"
     assert result["metric_candidates"][0]["name"] == "mktxp_system_cpu_load"
+    assert result["_candidate_selection_audit"]["accepted_total"] == 5
     assert "does not satisfy the evidence gate" in result["error"]
     assert findings is None
     assert is_final is False
     investigator.tools._prometheus_adapter.query_metric_catalog.assert_awaited_once_with()
+
+
+def test_metric_candidates_reject_overlap_from_only_scope_and_generic_terms():
+    candidates = _prometheus_metric_candidates(
+        'traefik_service_request_duration_seconds{cluster="production"}',
+        [
+            {
+                "name": "argocd_cluster_cache_age_seconds",
+                "type": "gauge",
+                "help": "Cluster cache age in seconds",
+                "unit": "seconds",
+            },
+            {
+                "name": "kube_pod_service_account",
+                "type": "gauge",
+                "help": "Pod service account metadata",
+                "unit": "",
+            },
+            {
+                "name": "traefik_connections_open",
+                "type": "gauge",
+                "help": "Open proxy connections",
+                "unit": "connections",
+            },
+        ],
+    )
+
+    assert [candidate["name"] for candidate in candidates] == [
+        "traefik_connections_open"
+    ]
+
+
+def test_private_candidate_audit_is_persisted_but_hidden_from_model_context(investigator):
+    result = {
+        "status": "empty",
+        "metric_candidates": [],
+        "_candidate_selection_audit": {
+            "accepted": [],
+            "rejected": [{"name": "unrelated_metric", "reason": "no_overlap"}],
+        },
+    }
+    arguments = {"promql": "missing_metric", "start": "s", "end": "e"}
+    state = InvestigationState("inc_audit", [], [])
+    messages = []
+
+    investigator._handle_tool_result(
+        tool_call("query_prometheus", arguments),
+        "query_prometheus",
+        arguments,
+        result,
+        0,
+        state,
+        messages,
+    )
+    signature = investigator._call_signature("query_prometheus", arguments)
+    state.seen_calls[signature] = investigator._truncate_result(result)
+
+    assert "_candidate_selection_audit" in state.tool_calls[0].result
+    assert "_candidate_selection_audit" not in messages[0]["content"]
+    assert "_candidate_selection_audit" not in state.seen_calls[signature]
+    assert "_candidate_selection_audit" not in investigator._build_resume_message(state)[
+        "content"
+    ]
 
 
 @pytest.mark.asyncio

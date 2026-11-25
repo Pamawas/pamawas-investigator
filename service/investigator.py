@@ -60,7 +60,7 @@ from service.evidence_summary import (
     numeric_points,
 )
 from service.persistence import InvestigationPersistence
-from service.query_recovery import QueryRecovery
+from service.query_recovery import QueryRecovery, metric_semantic_terms
 from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -79,12 +79,19 @@ _LOGQL_SELECTOR = re.compile(r"\{([^{}]*)\}")
 _LOGQL_MATCHER = re.compile(
     r'([a-zA-Z_][a-zA-Z0-9_]*)\s*(=~|!~|=|!=)\s*"((?:\\.|[^"\\])*)"'
 )
-_PROMETHEUS_TERM = re.compile(r"[a-z0-9]+")
 _CAUSAL_FINDING_TYPES = (EvidenceType.LIKELY_CAUSE, EvidenceType.HYPOTHESIS)
 _PROCESS_ONLY_UNKNOWN_PREFIXES = (
     "Investigation ended without a stated conclusion",
     "Investigation ended without a substantive conclusion",
 )
+_PRIVATE_RESULT_KEYS = frozenset({"_candidate_selection_audit"})
+_RECOVERY_SIGNAL_ROLES = frozenset(
+    {"recovered_primary", "recovered_target", "related", "related_candidate"}
+)
+_ACCEPTED_RECOVERY_SIGNAL_ROLES = frozenset(
+    {"recovered_primary", "recovered_target", "related"}
+)
+_CANDIDATE_AUDIT_LIMIT = 12
 
 _RELEVANCE_STOPWORDS = {
     "alert", "critical", "high", "incident", "production", "service", "warning",
@@ -536,17 +543,19 @@ def _prometheus_has_numeric_samples(result: Any) -> bool:
     return any(numeric_points(item) for item in series)
 
 
-def _prometheus_metric_candidates(
+def _prometheus_metric_candidate_plan(
     promql: str, metric_catalog: Any, limit: int = 12
-) -> list[dict[str, str]]:
-    """Rank real metric metadata against the failed query without assuming a schema."""
-    if not isinstance(metric_catalog, list):
-        return []
-
-    query_terms = _PROMETHEUS_TERM.findall(str(promql).lower().replace("_", " "))
+) -> tuple[list[dict[str, str]], dict[str, Any]]:
+    """Admit only real metrics with positive non-generic query-domain overlap."""
+    metric_names = _prometheus_metric_names(str(promql))
+    # Selector labels and values describe scope, not the metric domain. Using
+    # them for admission recreated the production bug where a shared cluster
+    # label made unrelated Argo CD and Kubernetes metrics look relevant.
+    query_terms = metric_semantic_terms(" ".join(metric_names))
     query_counts = Counter(query_terms)
     query_bigrams = set(itertools.pairwise(query_terms))
     normalized_query = "_".join(query_terms)
+
     def normalize(item: Any) -> dict[str, str] | None:
         if isinstance(item, str) and item.strip():
             return {"name": item, "type": "unknown", "help": "", "unit": ""}
@@ -559,30 +568,9 @@ def _prometheus_metric_candidates(
             "unit": str(item.get("unit") or ""),
         }
 
-    def score(item: dict[str, str]) -> tuple[int, int, int, int, float]:
-        name = item["name"]
-        terms = _PROMETHEUS_TERM.findall(name.lower().replace("_", " "))
-        weighted_overlap = sum(query_counts[term] for term in set(terms))
-        bigram_overlap = len(query_bigrams.intersection(itertools.pairwise(terms)))
-        metadata_terms = set(
-            _PROMETHEUS_TERM.findall(
-                f"{item['help']} {item['unit']}".lower().replace("_", " ")
-            )
-        )
-        metadata_overlap = sum(query_counts[term] for term in metadata_terms)
-        covered_terms = len(
-            set(query_terms).intersection({*terms, *metadata_terms})
-        )
-        similarity = SequenceMatcher(None, normalized_query, name.lower()).ratio()
-        return (
-            weighted_overlap + metadata_overlap,
-            covered_terms,
-            weighted_overlap,
-            bigram_overlap,
-            similarity,
-        )
-
-    normalized = [normalize(item) for item in metric_catalog]
+    normalized = [
+        normalize(item) for item in metric_catalog
+    ] if isinstance(metric_catalog, list) else []
     candidates: dict[str, dict[str, str]] = {}
     for item in normalized:
         if item is None:
@@ -607,19 +595,99 @@ def _prometheus_metric_candidates(
         if previous_quality is None or quality > previous_quality:
             candidates[item["name"]] = item
 
-    def rank_key(item: dict[str, str]) -> tuple[float | str, ...]:
-        item_score = score(item)
-        return (*(-part for part in item_score), item["name"])
+    ranked: list[
+        tuple[tuple[int, int, int, int], str, dict[str, str], list[str]]
+    ] = []
+    rejected: list[dict[str, str]] = []
+    rejected_total = 0
+    query_term_set = set(query_terms)
+    for item in candidates.values():
+        candidate_terms = metric_semantic_terms(
+            f"{item['name']} {item['help']} {item['unit']}"
+        )
+        overlap = sorted(query_term_set.intersection(candidate_terms))
+        if not overlap:
+            rejected_total += 1
+            if len(rejected) < _CANDIDATE_AUDIT_LIMIT:
+                rejected.append(
+                    {
+                        "name": item["name"],
+                        "reason": "no_incident_domain_overlap",
+                    }
+                )
+            continue
+        score = (
+            sum(query_counts[term] for term in set(candidate_terms)),
+            len(overlap),
+            len(query_bigrams.intersection(itertools.pairwise(candidate_terms))),
+            int(
+                SequenceMatcher(
+                    None, normalized_query, "_".join(candidate_terms)
+                ).ratio()
+                * 1000
+            ),
+        )
+        ranked.append((score, item["name"], item, overlap))
 
-    ranked = sorted(
-        candidates.values(),
-        key=rank_key,
-    )
-    relevant = [
-        item for item in ranked
-        if score(item)[0] > 0
-    ]
-    return (relevant or ranked)[:limit]
+    ranked.sort(key=lambda item: (*(-part for part in item[0]), item[1]))
+    selected = [item for _, _, item, _ in ranked[:limit]]
+    audit = {
+        "policy_version": 1,
+        "stage": "empty_prometheus_query_recovery",
+        "query_domain_terms": sorted(query_term_set),
+        "accepted": [
+            {
+                "name": name,
+                "domain_overlap": overlap,
+                "score": {
+                    "weighted_domain_overlap": score[0],
+                    "distinct_domain_overlap": score[1],
+                    "ordered_domain_overlap": score[2],
+                    "semantic_similarity_milli": score[3],
+                },
+            }
+            for score, name, _, overlap in ranked[:_CANDIDATE_AUDIT_LIMIT]
+        ],
+        "accepted_total": len(ranked),
+        "rejected": rejected,
+        "rejected_total": rejected_total,
+    }
+    return selected, audit
+
+
+def _prometheus_metric_candidates(
+    promql: str, metric_catalog: Any, limit: int = 12
+) -> list[dict[str, str]]:
+    """Compatibility wrapper returning only admitted retry candidates."""
+    return _prometheus_metric_candidate_plan(promql, metric_catalog, limit)[0]
+
+
+def _public_tool_result(result: Any) -> Any:
+    """Remove persisted harness audits before a result enters model context."""
+    if not isinstance(result, dict):
+        return result
+    return {
+        key: value
+        for key, value in result.items()
+        if key not in _PRIVATE_RESULT_KEYS and key != "_private"
+    }
+
+
+def _is_private_tool_call(call: ToolResult) -> bool:
+    return isinstance(call.result, dict) and call.result.get("_private") is True
+
+
+def _has_admissible_recovery_coverage(call: ToolResult) -> bool:
+    """Fail closed for harness-recovered signals without exact target coverage."""
+    if not isinstance(call.result, dict):
+        return False
+    role = call.result.get("signal_role")
+    if role not in _RECOVERY_SIGNAL_ROLES:
+        return True
+    if role not in _ACCEPTED_RECOVERY_SIGNAL_ROLES:
+        return False
+    coverage = call.result.get("target_coverage")
+    return isinstance(coverage, dict) and coverage.get("validated") is True
 
 
 def _successful_tool_calls(
@@ -632,6 +700,7 @@ def _successful_tool_calls(
         if call.tool_name == tool_name
         and isinstance(call.result, dict)
         and call.result.get("status") == "success"
+        and _has_admissible_recovery_coverage(call)
         and (
             tool_name != "query_prometheus"
             or _prometheus_has_numeric_samples(call.result)
@@ -695,6 +764,7 @@ def _missing_required_data_tools(
             call.tool_name in _required_data_tools(verification)
             and isinstance(call.result, dict)
             and call.result.get("status") == "success"
+            and _has_admissible_recovery_coverage(call)
             and (
                 call.tool_name != "query_prometheus"
                 or _prometheus_has_numeric_samples(call.result)
@@ -2736,13 +2806,14 @@ class PamawasInvestigator:
 
         state.tool_calls = restored_tools
         state.findings = restored_findings
-        state.tool_call_count = len(restored_tools)
+        public_tools = [call for call in restored_tools if not _is_private_tool_call(call)]
+        state.tool_call_count = len(public_tools)
         # LLM turns are not persisted because raw conversation transcripts are
         # deliberately excluded. Count each restored tool execution as one
         # consumed turn: conservative, bounded, and never resets a retry to a
         # fresh budget after substantial work was already completed.
-        state.turn_count = min(len(restored_tools), state.max_tool_calls)
-        for call in restored_tools:
+        state.turn_count = min(len(public_tools), state.max_tool_calls)
+        for call in public_tools:
             signature = self._call_signature(call.tool_name, call.arguments)
             state.seen_calls[signature] = self._truncate_result(call.result)
             state.seen_call_counts.setdefault(signature, 0)
@@ -2804,9 +2875,10 @@ class PamawasInvestigator:
                 "sequence": index,
                 "tool": call.tool_name,
                 "arguments_redacted": call.arguments,
-                "result_summary": call.result,
+                "result_summary": _public_tool_result(call.result),
             }
             for index, call in enumerate(state.tool_calls)
+            if not _is_private_tool_call(call)
         ]
         findings = [finding.to_dict() for finding in state.findings]
         checkpoint = self._truncate_context(
@@ -3029,7 +3101,9 @@ class PamawasInvestigator:
                             "Prometheus metric-name discovery failed after empty query: %s",
                             exc,
                         )
-                    candidates = _prometheus_metric_candidates(promql, metric_catalog)
+                    candidates, candidate_audit = _prometheus_metric_candidate_plan(
+                        promql, metric_catalog
+                    )
                     logger.warning(
                         "Prometheus query returned no numeric series; retry candidates: %s",
                         candidates,
@@ -3047,6 +3121,7 @@ class PamawasInvestigator:
                             ),
                             "data": result.get("data", {}),
                             "metric_candidates": candidates,
+                            "_candidate_selection_audit": candidate_audit,
                         },
                         None,
                         False,
@@ -3246,11 +3321,10 @@ class PamawasInvestigator:
             return {"error": f"Unknown tool: {function_name}"}, None, False
 
     def _truncate_result(self, result: any) -> str:
-        """Truncate result if too large."""
-        result_str = json.dumps(result)
+        """Truncate a model-visible result while retaining private audits in state."""
+        result_str = json.dumps(_public_tool_result(result))
         if len(result_str) > self.config.truncation_limit:
             result_str = self._truncate_context(result_str, self.config.truncation_limit)
-            result = {"truncated": result_str}
         return result_str
 
     @staticmethod
@@ -4249,6 +4323,20 @@ class PamawasInvestigator:
         state.completed = True
         return True
 
+    def _record_recovery_call(
+        self, call: ToolResult, state: InvestigationState
+    ) -> None:
+        """Persist one harness call without exposing private audits to the model cache."""
+        state.tool_calls.append(call)
+        if _is_private_tool_call(call):
+            logger.info("Persisting private harness audit %s", call.tool_name)
+            return
+        state.tool_call_count += 1
+        state.seen_calls[self._call_signature(call.tool_name, call.arguments)] = (
+            self._truncate_result(call.result)
+        )
+        logger.info("Harness recovery tool %s with args %s", call.tool_name, call.arguments)
+
     async def _recover_data_query(
         self, name: str, arguments: dict, result: dict,
         state: InvestigationState, messages: list[dict],
@@ -4286,18 +4374,16 @@ class PamawasInvestigator:
             result["counter_only"] = True
             state.seen_calls[self._call_signature(name, arguments)] = self._truncate_result(result)
         for call in recovery.calls:
-            state.tool_calls.append(call)
-            state.tool_call_count += 1
-            state.seen_calls[self._call_signature(call.tool_name, call.arguments)] = (
-                self._truncate_result(call.result)
-            )
-            logger.info("Harness recovery tool %s with args %s", call.tool_name, call.arguments)
+            self._record_recovery_call(call, state)
         if recovery.calls:
             summaries = _ground_findings_in_data_queries([], recovery.calls, state.context)
             messages.append({"role": "user", "content": (
                 "The harness executed schema-discovered recovery queries. Use these "
                 "observations and exact queries for the cause assessment and suggested actions:\n"
-                + json.dumps([finding.to_dict() for finding in summaries])
+                + json.dumps({
+                    "observations": [finding.to_dict() for finding in summaries],
+                    "target_coverage": recovery.target_coverage,
+                })
             )})
 
     async def _handle_investigation_turn(  # noqa: C901

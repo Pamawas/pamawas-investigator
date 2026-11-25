@@ -15,6 +15,8 @@ from service.investigator import (
     _ensure_causal_verdict,
     _ground_findings_in_data_queries,
     _is_reasoning_preamble,
+    _logs_from_tool_calls,
+    _metrics_from_tool_calls,
 )
 
 
@@ -131,6 +133,33 @@ def test_contextless_telemetry_is_not_admitted_as_incident_evidence():
     ]
 
     assert _ground_findings_in_data_queries([], calls) == []
+
+
+def test_recovered_telemetry_without_validated_target_coverage_is_not_evidence():
+    context = IncidentContext(
+        "inc_coverage",
+        "Vendor latency",
+        affected_services=["alpha-target"],
+    )
+    metric = metric_call('vendor_latency{scope="alpha-target"}', "82")
+    metric.result["signal_role"] = "recovered_primary"
+    metric.result["target_coverage"] = {
+        "validated": False,
+        "reason": "no_exact_target_label_match",
+    }
+    log = log_call(
+        '{scope="alpha-target"}',
+        "vendor request exceeded latency threshold",
+    )
+    log.result["signal_role"] = "recovered_target"
+    log.result["target_coverage"] = {
+        "validated": False,
+        "reason": "no_exact_target_label_match",
+    }
+
+    assert _ground_findings_in_data_queries([], [metric, log], context) == []
+    assert _metrics_from_tool_calls([metric]) == []
+    assert _logs_from_tool_calls([log]) == []
 
 
 def test_ceph_capacity_is_excluded_from_latency_evidence():

@@ -298,3 +298,166 @@ async def test_recovery_does_not_query_without_a_validated_target():
     recovery = QueryRecovery(SimpleNamespace(_loki_adapter=adapter), context(), 100)
     await recovery.recover_loki()
     adapter.query_range.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_condition_reference_target_label_is_preferred_over_broad_event_scope():
+    async def label_values(label):
+        values = {
+            "cluster": ["production"],
+            "opaque_target": ["alpha-target"],
+        }
+        return {"status": "success", "data": values[label]}
+
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={
+            "status": "success", "data": ["cluster", "opaque_target"],
+        }),
+        query_label_values=AsyncMock(side_effect=label_values),
+        query_range=AsyncMock(return_value={"status": "success", "data": {"result": []}}),
+    )
+    incident = IncidentContext(
+        "inc_condition_ref",
+        "Arbitrary latency condition",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["alpha-target"],
+        events=[{
+            "labels": {"cluster": "production"},
+            "condition_ref": {"labels": {"opaque_target": "alpha-target"}},
+        }],
+    )
+    recovery = QueryRecovery(SimpleNamespace(_loki_adapter=adapter), incident, 100)
+
+    await recovery.recover_loki()
+
+    assert [call.args[0] for call in adapter.query_label_values.await_args_list] == [
+        "opaque_target"
+    ]
+    adapter.query_range.assert_awaited_once_with(
+        '{opaque_target="alpha-target"}',
+        "2026-11-24T06:46:00+00:00",
+        "2026-11-24T06:57:00+00:00",
+        100,
+    )
+
+
+@pytest.mark.asyncio
+async def test_broad_cluster_match_cannot_authorize_recovery_query():
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={"status": "success", "data": ["cluster"]}),
+        query_label_values=AsyncMock(return_value={
+            "status": "success", "data": ["production"],
+        }),
+        query_range=AsyncMock(),
+    )
+    incident = IncidentContext(
+        "inc_broad_scope",
+        "Gateway latency",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["checkout-api"],
+        events=[{"labels": {"cluster": "production"}}],
+    )
+    recovery = QueryRecovery(SimpleNamespace(_loki_adapter=adapter), incident, 100)
+
+    await recovery.recover_loki()
+
+    adapter.query_label_values.assert_awaited_once_with("cluster")
+    adapter.query_range.assert_not_awaited()
+    assert recovery.calls[0].result["target_coverage"] == {
+        "validated": False,
+        "reason": "no_exact_target_label_match",
+    }
+
+
+@pytest.mark.asyncio
+async def test_caller_supplied_broad_selector_cannot_bypass_target_validation():
+    adapter = SimpleNamespace(
+        query_metric_catalog=AsyncMock(),
+        query_range=AsyncMock(),
+    )
+    incident = IncidentContext(
+        "inc_supplied_scope",
+        "Gateway latency",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["checkout-api"],
+    )
+    recovery = QueryRecovery(SimpleNamespace(_prometheus_adapter=adapter), incident, 100)
+
+    await recovery.recover_related_prometheus('{cluster="production"}')
+
+    adapter.query_metric_catalog.assert_not_awaited()
+    adapter.query_range.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_related_recovery_rejects_unrelated_production_shaped_metrics():
+    async def query_range(expression, _start, _end):
+        assert expression == 'traefik_connections_open{opaque_scope="edge-api"}'
+        return {
+            "status": "success",
+            "data": {"result": [{
+                "metric": {"opaque_scope": "edge-api"},
+                "values": [[1795502880, "12"], [1795503420, "4"]],
+            }]},
+        }
+
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={
+            "status": "success", "data": ["opaque_scope"],
+        }),
+        query_label_values=AsyncMock(return_value={
+            "status": "success", "data": ["edge-api"],
+        }),
+        query_metric_catalog=AsyncMock(return_value={
+            "status": "success",
+            "data": [
+                {
+                    "name": "argocd_cluster_cache_age_seconds",
+                    "type": "gauge",
+                    "help": "Age of the application cache",
+                    "unit": "seconds",
+                },
+                {
+                    "name": "kube_pod_service_account",
+                    "type": "gauge",
+                    "help": "Pod service account metadata",
+                    "unit": "",
+                },
+                {
+                    "name": "traefik_connections_open",
+                    "type": "gauge",
+                    "help": "Open proxy connections",
+                    "unit": "connections",
+                },
+            ],
+        }),
+        query_range=AsyncMock(side_effect=query_range),
+    )
+    incident = IncidentContext(
+        "inc_traefik",
+        "Traefik Service High Latency",
+        started_at="2026-11-24T06:51:00Z",
+        resolved_at="2026-11-24T06:52:00Z",
+        affected_services=["edge-api"],
+        events=[{"condition_ref": {"labels": {"opaque_scope": "edge-api"}}}],
+    )
+    recovery = QueryRecovery(SimpleNamespace(_prometheus_adapter=adapter), incident, 100)
+
+    await recovery.recover_related_prometheus()
+
+    adapter.query_range.assert_awaited_once()
+    query_call = next(call for call in recovery.calls if call.tool_name == "query_prometheus")
+    assert query_call.result["target_coverage"]["validated"] is True
+    assert query_call.result["signal_role"] == "related"
+    audit = next(
+        call for call in recovery.calls if call.tool_name == "select_prometheus_candidates"
+    )
+    rejected = {item["name"] for item in audit.result["rejected"]}
+    assert rejected == {
+        "argocd_cluster_cache_age_seconds",
+        "kube_pod_service_account",
+    }
+    assert audit.result["_private"] is True
