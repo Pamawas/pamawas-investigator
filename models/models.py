@@ -3,15 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
-
-# Python 3.9 compatibility for datetime.UTC (added in 3.11)
-try:
-    from datetime import UTC
-except ImportError:
-    UTC = timezone.utc
 
 
 class EvidenceType(StrEnum):

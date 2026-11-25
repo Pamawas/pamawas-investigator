@@ -15,6 +15,8 @@ import logging
 import re
 from typing import Any
 
+import openai
+
 logger = logging.getLogger(__name__)
 
 # A morning digest gets read in ten seconds or not at all.
@@ -159,7 +161,15 @@ def write_day_summary(llm, facts: dict[str, Any]) -> str:
             tools=None,
             max_tokens=800,
         )
-    except Exception as e:  # noqa: BLE001 - the digest must never fail for this
+    except (
+        openai.OpenAIError,
+        RuntimeError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        TimeoutError,
+        OSError,
+    ) as e:
         logger.warning("Daily summary generation failed: %s", e)
         return ""
 

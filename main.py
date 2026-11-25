@@ -37,6 +37,16 @@ from service.investigator import PROMPT_VERSION, PamawasInvestigator
 # Configure structured logging
 log = get_logger()
 VERSION_FILE = Path(__file__).with_name("version.txt")
+_BACKGROUND_OPERATION_ERRORS = (
+    psycopg2.Error,
+    RuntimeError,
+    ValueError,
+    KeyError,
+    TypeError,
+    AttributeError,
+    OSError,
+    TimeoutError,
+)
 
 
 def get_app_version() -> str:
@@ -59,12 +69,7 @@ def print_startup_banner(version: str, port: int) -> None:
 | |__) |   / /\ \   | \  / |   / /\ \    \ \  /\  / /    / /\ \   \___ \
 |  ___/   / ____ \  | |\/| |  / ____ \    \ \/  \/ /    / ____ \   ___) |
 |_|      /_/    \_\ |_|  |_| /_/    \_\    \__/\__/    /_/    \_\ |____/"""
-    service_art = r""" _____   _   _  __      __  ______   _____   _______   _____    _____      /\      _______    ___    _____
-|_   _| | \ | | \ \    / / |  ____| / ____| |__   __| |_   _|  / ____|    /  \    |__   __|  / _ \  |  __ \
-  | |   |  \| |  \ \  / /  | |__    \___ \     | |      | |   | |  __    / /\ \      | |    | | | | | |__) |
-  | |   | |\  |   \ \/ /   |  __|    ___) |    | |      | |   | | |_ |  / ____ \     | |    | |_| | |  _  /
- _| |_  |_| \_|    \__/    |______| |____/     |_|     _| |_   \_____| /_/    \_\    |_|     \___/  |_| \_\
-""".rstrip("\n")  # noqa: E501
+    service_art = "PAMAWAS INVESTIGATOR"
     # Write to stderr so the banner doesn't contaminate the structured JSON stream on stdout.
     sys.stderr.write(
         f"\033[1;36m{banner}\n{service_art}\033[0m\nVersion: {version} | Port: :{port}\n\n"
@@ -642,7 +647,7 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
         await investigator.investigate_async(
             incident_id, request_key_hash, run_id=run_id
         )
-    except Exception as e:  # noqa: BLE001
+    except _BACKGROUND_OPERATION_ERRORS as e:
         log.error(
             "investigation_task_failed",
             run_id=run_id,
@@ -724,7 +729,7 @@ async def _investigation_worker(worker_id: int, config: InvestigationConfig):
             await _run_investigation_task(run_id, incident_id, request_key_hash)
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001
+        except _BACKGROUND_OPERATION_ERRORS as e:
             # A worker must never die: it is one of a fixed pool, and losing one
             # silently reduces capacity for the life of the process.
             log.error("investigation_worker_error", worker=logger_prefix, error=str(e))
@@ -770,7 +775,7 @@ async def _investigation_retry_scheduler(tick_seconds: float):
                 if requeued:
                     increment_stale_verification_requeued(requeued)
                     log.info("stale_verifications_requeued", count=requeued)
-        except Exception as e:  # noqa: BLE001
+        except _BACKGROUND_OPERATION_ERRORS as e:
             investigation_retry_errors_total.inc()
             log.error("investigation_retry_scheduler_error", error=str(e))
         await asyncio.sleep(tick_seconds)
@@ -898,7 +903,7 @@ async def _stale_verification_worker():
                 )
             except asyncio.CancelledError:
                 raise
-            except Exception as e:  # noqa: BLE001
+            except _BACKGROUND_OPERATION_ERRORS as e:
                 log.error(
                     "stale_verification_failed",
                     incident_id=incident_id,
@@ -919,7 +924,7 @@ async def _stale_verification_worker():
                 increment_stale_verification_failed()
         except asyncio.CancelledError:
             raise
-        except Exception as e:  # noqa: BLE001
+        except _BACKGROUND_OPERATION_ERRORS as e:
             log.error("stale_verification_worker_error", error=str(e))
             await asyncio.sleep(poll_seconds)
 

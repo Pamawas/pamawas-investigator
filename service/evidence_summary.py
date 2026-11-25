@@ -117,7 +117,7 @@ def _parse_annotation_measurement(value: Any) -> tuple[float, str] | None:
     return number, unit
 
 
-def _measurement_from_annotations(raw_payload: Any) -> tuple[float, str] | None:
+def annotation_measurement(raw_payload: Any) -> tuple[float, str] | None:
     """Extract one explicit measurement without interpreting alert-specific fields."""
     candidates: list[tuple[int, str, str, tuple[float, str]]] = []
     priority = {key: index for index, key in enumerate(_MEASUREMENT_KEYS)}
@@ -151,7 +151,7 @@ def alert_observation(
         ),
     )
     for event in events:
-        measurement = _measurement_from_annotations(event.get("raw_payload"))
+        measurement = annotation_measurement(event.get("raw_payload"))
         if measurement is None:
             continue
         value, unit = measurement

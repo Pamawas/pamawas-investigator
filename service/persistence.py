@@ -6,7 +6,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import psycopg2
@@ -14,12 +14,6 @@ import psycopg2.extras
 import psycopg2.pool
 
 from models import Finding, LogEntry, Metric
-
-# Python 3.9 compatibility for datetime.UTC (added in 3.11)
-try:
-    from datetime import UTC
-except ImportError:
-    UTC = timezone.utc
 
 logger = logging.getLogger(__name__)
 

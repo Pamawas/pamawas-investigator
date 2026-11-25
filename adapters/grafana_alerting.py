@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -203,70 +203,32 @@ class GrafanaAlertingAdapter:
             reason_code=reason_code,
             detail=detail,
             authoritative=authoritative,
-            observed_at=datetime.now(timezone.utc),
+            observed_at=datetime.now(UTC),
         )
 
-    async def evaluate(  # noqa: C901
-        self, reference: ConditionReference
-    ) -> ConditionEvaluation:
+    @staticmethod
+    def _reference_error(
+        reference: ConditionReference, expected_org_id: str
+    ) -> ConditionEvaluation | None:
         if reference.resource_type != "alert_rule":
             return ConditionEvaluation.unknown(
                 reference,
                 "unsupported_resource_type",
                 "Grafana managed alerting requires an alert_rule resource.",
             )
-        if reference.tenant_id != self.config.org_id:
+        if reference.tenant_id != expected_org_id:
             return ConditionEvaluation.unknown(
                 reference,
                 "tenant_mismatch",
                 "The condition tenant does not match the configured Grafana organization.",
             )
-        if not self._circuit_breaker.allow_call():
-            return ConditionEvaluation.unknown(
-                reference,
-                "circuit_breaker_open",
-                "The Grafana alert-state adapter is temporarily unavailable.",
-            )
+        return None
 
-        escaped_uid = reference.resource_id.replace("\\", "\\\\").replace('"', '\\"')
-        try:
-            rules_payload, alerts_payload = await asyncio.gather(
-                self._get_json(self._RULES_PATH, {"rule_uid": reference.resource_id}),
-                self._get_json(
-                    self._ALERTS_PATH,
-                    {
-                        "active": "true",
-                        "silenced": "true",
-                        "inhibited": "true",
-                        "filter": f'__alert_rule_uid__="{escaped_uid}"',
-                    },
-                ),
-            )
-            rules = self._matching_rules(rules_payload, reference.resource_id)
-            alerts = self._active_alerts(alerts_payload)
-        except (
-            httpx.HTTPError,
-            GrafanaAlertingError,
-            TimeoutError,
-            OSError,
-        ) as exc:
-            self._circuit_breaker.record_failure()
-            return ConditionEvaluation.unknown(
-                reference,
-                "grafana_api_unavailable",
-                f"Grafana alert state could not be read ({type(exc).__name__}).",
-            )
-
-        self._circuit_breaker.record_success()
-        if len(rules) != 1:
-            reason = "rule_not_found" if not rules else "ambiguous_rule"
-            return ConditionEvaluation.unknown(
-                reference,
-                reason,
-                "Grafana did not return exactly one matching alert rule.",
-            )
-
-        rule_state = self._normalized_rule_state(rules[0])
+    def _match_alert_instances(
+        self,
+        reference: ConditionReference,
+        alerts: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], ConditionEvaluation | None]:
         unexpected_alert = next(
             (
                 alert
@@ -277,12 +239,13 @@ class GrafanaAlertingAdapter:
             None,
         )
         if unexpected_alert is not None:
-            return ConditionEvaluation.unknown(
+            error = ConditionEvaluation.unknown(
                 reference,
                 "invalid_alert_instance",
                 "Grafana returned an alert that could not be matched exactly "
                 "to the rule and instance.",
             )
+            return [], [], error
         same_rule = [
             alert
             for alert in alerts
@@ -294,12 +257,21 @@ class GrafanaAlertingAdapter:
             if str(alert.get("fingerprint") or "").strip() == reference.instance_id
         ]
         if len(exact) > 1:
-            return ConditionEvaluation.unknown(
+            error = ConditionEvaluation.unknown(
                 reference,
                 "ambiguous_alert_instance",
                 "Grafana returned more than one alert with the same instance identity.",
             )
+            return same_rule, exact, error
+        return same_rule, exact, None
 
+    def _evaluate_matched_state(
+        self,
+        reference: ConditionReference,
+        rule_state: ConditionState,
+        same_rule: list[dict[str, Any]],
+        exact: list[dict[str, Any]],
+    ) -> ConditionEvaluation:
         if rule_state in {ConditionState.ERROR, ConditionState.NO_DATA}:
             return self._evaluation(
                 reference,
@@ -360,3 +332,57 @@ class GrafanaAlertingAdapter:
             "unknown_rule_state",
             "Grafana returned an unsupported rule state.",
         )
+
+    async def evaluate(self, reference: ConditionReference) -> ConditionEvaluation:
+        if error := self._reference_error(reference, self.config.org_id):
+            return error
+        if not self._circuit_breaker.allow_call():
+            return ConditionEvaluation.unknown(
+                reference,
+                "circuit_breaker_open",
+                "The Grafana alert-state adapter is temporarily unavailable.",
+            )
+
+        escaped_uid = reference.resource_id.replace("\\", "\\\\").replace('"', '\\"')
+        try:
+            rules_payload, alerts_payload = await asyncio.gather(
+                self._get_json(self._RULES_PATH, {"rule_uid": reference.resource_id}),
+                self._get_json(
+                    self._ALERTS_PATH,
+                    {
+                        "active": "true",
+                        "silenced": "true",
+                        "inhibited": "true",
+                        "filter": f'__alert_rule_uid__="{escaped_uid}"',
+                    },
+                ),
+            )
+            rules = self._matching_rules(rules_payload, reference.resource_id)
+            alerts = self._active_alerts(alerts_payload)
+        except (
+            httpx.HTTPError,
+            GrafanaAlertingError,
+            TimeoutError,
+            OSError,
+        ) as exc:
+            self._circuit_breaker.record_failure()
+            return ConditionEvaluation.unknown(
+                reference,
+                "grafana_api_unavailable",
+                f"Grafana alert state could not be read ({type(exc).__name__}).",
+            )
+
+        self._circuit_breaker.record_success()
+        if len(rules) != 1:
+            reason = "rule_not_found" if not rules else "ambiguous_rule"
+            return ConditionEvaluation.unknown(
+                reference,
+                reason,
+                "Grafana did not return exactly one matching alert rule.",
+            )
+
+        rule_state = self._normalized_rule_state(rules[0])
+        same_rule, exact, error = self._match_alert_instances(reference, alerts)
+        if error is not None:
+            return error
+        return self._evaluate_matched_state(reference, rule_state, same_rule, exact)

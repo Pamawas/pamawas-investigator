@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -108,7 +108,7 @@ class PrometheusFetcher(MetricsFetcher):
             dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
             return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except ValueError:
-            return datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            return datetime.now(tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     async def fetch_async(
         self,
@@ -175,7 +175,7 @@ class PrometheusFetcher(MetricsFetcher):
             labels = {k: v for k, v in item.get("labels", {}).items() if k != "__name__"}
 
             # For instant query, use the timestamp from the result or current time
-            at = datetime.now(tz=timezone.utc)
+            at = datetime.now(tz=UTC)
             metrics.append(
                 Metric(
                     name=metric_name,

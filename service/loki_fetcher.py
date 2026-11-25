@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -97,7 +97,7 @@ class LokiFetcher(LogsFetcher):
         seconds and raises OSError ("Value too large"), which aborted the whole
         enrichment and left every Loki fetch empty.
         """
-        return datetime.fromtimestamp(ts / 1_000_000_000, tz=timezone.utc)
+        return datetime.fromtimestamp(ts / 1_000_000_000, tz=UTC)
 
     async def _query_range(self, logql: str, start: str, end: str, limit: int) -> dict[str, Any]:
         """Execute a Loki query_range request."""
@@ -151,15 +151,15 @@ class LokiFetcher(LogsFetcher):
         try:
             end_dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
-            end_dt = datetime.now(tz=timezone.utc)
+            end_dt = datetime.now(tz=UTC)
 
         if start:
             try:
                 start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
             except (ValueError, AttributeError):
-                start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
+                start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=UTC)
         else:
-            start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=timezone.utc)
+            start_dt = datetime.fromtimestamp(end_dt.timestamp() - 300, tz=UTC)
 
         return (
             start_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),

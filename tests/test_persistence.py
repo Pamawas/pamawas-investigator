@@ -4,6 +4,7 @@ These tests cover the persistence layer directly, including edge cases and rollb
 """
 
 import json
+from datetime import UTC
 from unittest.mock import MagicMock, patch
 
 import psycopg2
@@ -858,10 +859,10 @@ class TestEnqueueStaleVerification:
     """Tests for InvestigationPersistence.enqueue_stale_verification."""
 
     def test_enqueues_and_returns_dict(self, mock_pool):
-        from datetime import datetime, timezone
+        from datetime import datetime
 
         mock_pool, mock_conn, mock_cursor = mock_pool
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         mock_cursor.fetchone.return_value = (INCIDENT_ID_SV, "queued", now)
 
         with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
