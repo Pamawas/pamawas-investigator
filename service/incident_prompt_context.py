@@ -268,7 +268,7 @@ class PromptIncidentContext:
                 "affected_services_omitted": self.affected_services_omitted,
                 "annotations_omitted": self.annotations_omitted,
                 "annotation_text_truncated": self.annotation_text_truncated,
-                "raw_payload_excluded": True,
+                "raw_payload_replaced_by_typed_fields": True,
                 "free_form_annotations_typed": True,
             },
         }

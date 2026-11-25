@@ -78,6 +78,7 @@ def test_prompt_context_types_untrusted_annotations_and_keeps_measurement():
     ]
     assert all(item["trust"] == "untrusted_external_text" for item in annotations)
     assert data["omissions"]["free_form_annotations_typed"] is True
+    assert data["omissions"]["raw_payload_replaced_by_typed_fields"] is True
 
 
 def test_annotation_derived_title_remains_typed_data():
