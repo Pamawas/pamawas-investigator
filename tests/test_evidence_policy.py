@@ -1,4 +1,4 @@
-from models import EvidenceSource, EvidenceType, Finding, IncidentContext
+from models import ConditionReference, EvidenceSource, EvidenceType, Finding, IncidentContext
 from service.evidence_policy import EVIDENCE_POLICY
 
 
@@ -54,6 +54,50 @@ def test_target_identity_alone_is_scope_not_mechanism_support():
     )
 
     assert EVIDENCE_POLICY.validate(candidate, facts, context) is None
+
+
+def test_descriptive_condition_labels_do_not_erase_mechanism_terms():
+    context = IncidentContext(
+        "inc_generic",
+        "Vendor request latency",
+        affected_services=["alpha-target"],
+        condition_ref=ConditionReference(
+            version=1,
+            source="generic-alerting",
+            evaluator="managed-rules",
+            resource_type="rule",
+            resource_id="rule-1",
+            instance_id="instance-1",
+            labels={
+                "scope": "alpha-target",
+                "rule_name": "Vendor Request Latency",
+            },
+        ),
+    )
+    facts = [
+        fact(
+            "Vendor request bytes increased before request latency.",
+            EvidenceSource.PROMETHEUS,
+            "query: vendor_request_bytes",
+        ),
+        fact(
+            "Vendor request volume increased during the same interval.",
+            EvidenceSource.PROMETHEUS,
+            "query: vendor_request_volume",
+        ),
+    ]
+    candidate = Finding(
+        EvidenceType.LIKELY_CAUSE,
+        "Increased vendor request volume and bytes caused request latency.",
+        EvidenceSource.LLM,
+        0.9,
+    )
+
+    validated = EVIDENCE_POLICY.validate(candidate, facts, context)
+
+    assert validated is not None
+    assert validated.type is EvidenceType.LIKELY_CAUSE
+    assert validated.supports_evidence == [0, 1]
 
 
 def test_prompt_contract_is_rendered_from_enforced_policy_values():

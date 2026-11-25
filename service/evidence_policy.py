@@ -131,13 +131,10 @@ def _meaningful_terms(text: str) -> set[str]:
 def _target_terms(context: IncidentContext | None) -> set[str]:
     if context is None:
         return set()
-    identities = [str(target) for target in context.affected_services or []]
-    if context.condition_ref is not None:
-        identities.extend(str(value) for value in context.condition_ref.labels.values())
     return {
         term
-        for identity in identities
-        for term in _meaningful_terms(identity)
+        for target in context.affected_services or []
+        for term in _meaningful_terms(str(target))
     }
 
 
