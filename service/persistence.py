@@ -1,5 +1,6 @@
 """Database persistence for investigation runs, tool executions, and evidence."""
 
+import hashlib
 import json
 import logging
 import threading
@@ -37,6 +38,7 @@ class InvestigationRun:
     tool_contract: int
     max_tool_calls: int
     run_kind: str = "investigation"
+    catalog_revision_id: str | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
     safe_error_code: str | None = None
@@ -231,33 +233,179 @@ class InvestigationPersistence:
         finally:
             self._put_connection(conn)
 
-    def load_telemetry_catalog(self) -> dict[str, dict[str, dict[str, Any]]]:
-        """Load a stable recent catalog snapshot for one investigation."""
-        conn = self._get_connection()
+    @staticmethod
+    def _catalog_from_rows(
+        rows: list[tuple[Any, ...]],
+    ) -> dict[str, dict[str, dict[str, Any]]]:
         catalog: dict[str, dict[str, dict[str, Any]]] = {
             "prometheus": {},
             "loki": {},
         }
+        for provider, name, search_text, metadata in rows:
+            descriptor = dict(metadata or {})
+            descriptor["_search_text"] = search_text or name
+            catalog.setdefault(str(provider), {})[str(name)] = descriptor
+        return catalog
+
+    @staticmethod
+    def _catalog_content(
+        catalog: dict[str, dict[str, dict[str, Any]]],
+    ) -> tuple[str, str, int]:
+        canonical = json.dumps(
+            catalog,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        )
+        content_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        entry_count = sum(len(entries) for entries in catalog.values())
+        return canonical, content_hash, entry_count
+
+    @staticmethod
+    def _load_live_catalog_rows(cursor) -> list[tuple[Any, ...]]:
+        cursor.execute(
+            """
+            SELECT provider, resource_name, search_text, metadata
+            FROM telemetry_catalog_entries
+            WHERE last_seen_at >= now() - interval '7 days'
+            ORDER BY provider, resource_name
+            """
+        )
+        return cursor.fetchall()
+
+    def load_telemetry_catalog(self) -> dict[str, dict[str, dict[str, Any]]]:
+        """Load the current mutable catalog used only to create a revision."""
+        conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT provider, resource_name, search_text, metadata
-                    FROM telemetry_catalog_entries
-                    WHERE last_seen_at >= now() - interval '7 days'
-                    ORDER BY provider, resource_name
-                    """
+                catalog = self._catalog_from_rows(
+                    self._load_live_catalog_rows(cursor)
                 )
-                for provider, name, search_text, metadata in cursor.fetchall():
-                    descriptor = dict(metadata or {})
-                    descriptor["_search_text"] = search_text or name
-                    catalog.setdefault(provider, {})[name] = descriptor
             conn.commit()
             return catalog
         except psycopg2.Error as e:
             conn.rollback()
             logger.warning("Could not load telemetry catalog snapshot: %s", e)
-            return catalog
+            return {"prometheus": {}, "loki": {}}
+        finally:
+            self._put_connection(conn)
+
+    def load_pinned_telemetry_catalog(self, run_id: str) -> dict[str, Any] | None:
+        """Load the immutable catalog revision already pinned to one run."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT revision.id, revision.content_hash, revision.catalog,
+                           revision.entry_count
+                    FROM investigation_runs run
+                    JOIN telemetry_catalog_revisions revision
+                      ON revision.id = run.catalog_revision_id
+                    WHERE run.id = %s
+                    """,
+                    (run_id,),
+                )
+                row = cursor.fetchone()
+            conn.commit()
+            if not row:
+                return None
+            return {
+                "revision_id": str(row[0]),
+                "content_hash": str(row[1]),
+                "catalog": dict(row[2] or {}),
+                "entry_count": int(row[3] or 0),
+            }
+        except (psycopg2.Error, TypeError, ValueError) as e:
+            conn.rollback()
+            logger.warning("Could not load catalog revision for run %s: %s", run_id, e)
+            return None
+        finally:
+            self._put_connection(conn)
+
+    def pin_telemetry_catalog_revision(self, run_id: str) -> dict[str, Any]:
+        """Atomically pin one content-addressed catalog revision to a run.
+
+        A retry that reaches this method after a refresh still receives the
+        original revision. The run row lock serializes concurrent attempts,
+        and the database trigger prevents a later re-pin.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT catalog_revision_id
+                    FROM investigation_runs
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (run_id,),
+                )
+                run = cursor.fetchone()
+                if not run:
+                    raise RuntimeError(f"Investigation run {run_id} does not exist")
+
+                revision_id = str(run[0]) if run[0] else None
+                if revision_id is None:
+                    catalog = self._catalog_from_rows(
+                        self._load_live_catalog_rows(cursor)
+                    )
+                    canonical, content_hash, entry_count = self._catalog_content(catalog)
+                    revision_id = f"tcr_{content_hash.upper()}"
+                    cursor.execute(
+                        """
+                        INSERT INTO telemetry_catalog_revisions (
+                            id, content_hash, catalog, entry_count
+                        ) VALUES (%s, %s, %s::jsonb, %s)
+                        ON CONFLICT (content_hash) DO NOTHING
+                        """,
+                        (revision_id, content_hash, canonical, entry_count),
+                    )
+                    cursor.execute(
+                        """
+                        SELECT id
+                        FROM telemetry_catalog_revisions
+                        WHERE content_hash = %s
+                        """,
+                        (content_hash,),
+                    )
+                    stored = cursor.fetchone()
+                    if not stored:
+                        raise RuntimeError("Failed to create telemetry catalog revision")
+                    revision_id = str(stored[0])
+                    cursor.execute(
+                        """
+                        UPDATE investigation_runs
+                        SET catalog_revision_id = %s, updated_at = now()
+                        WHERE id = %s AND catalog_revision_id IS NULL
+                        """,
+                        (revision_id, run_id),
+                    )
+
+                cursor.execute(
+                    """
+                    SELECT id, content_hash, catalog, entry_count
+                    FROM telemetry_catalog_revisions
+                    WHERE id = %s
+                    """,
+                    (revision_id,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    raise RuntimeError(
+                        f"Catalog revision {revision_id} for run {run_id} is missing"
+                    )
+            conn.commit()
+            return {
+                "revision_id": str(row[0]),
+                "content_hash": str(row[1]),
+                "catalog": dict(row[2] or {}),
+                "entry_count": int(row[3] or 0),
+            }
+        except (psycopg2.Error, RuntimeError, TypeError, ValueError):
+            conn.rollback()
+            raise
         finally:
             self._put_connection(conn)
 
@@ -349,7 +497,7 @@ class InvestigationPersistence:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT id, status, run_kind
+                    SELECT id, status, run_kind, catalog_revision_id
                     FROM investigation_runs
                     WHERE incident_id = %s AND request_key_hash = %s
                     """,
@@ -387,6 +535,7 @@ class InvestigationPersistence:
                 "run_id": run[0],
                 "status": run[1],
                 "run_kind": run[2],
+                "catalog_revision_id": run[3],
                 "tool_executions": tools,
                 "evidence": evidence,
             }

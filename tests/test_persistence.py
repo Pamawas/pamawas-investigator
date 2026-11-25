@@ -142,6 +142,68 @@ class TestCreateInvestigationRun:
         mock_conn.rollback.assert_called_once()
 
 
+class TestTelemetryCatalogRevisions:
+    """Tests for immutable catalog pinning on investigation runs."""
+
+    def test_pins_content_addressed_revision_to_unpinned_run(self, mock_pool):
+        _, mock_conn, mock_cursor = mock_pool
+        catalog = {
+            "prometheus": {
+                "vendor_queue_depth": {
+                    "name": "vendor_queue_depth",
+                    "_search_text": "Vendor queue depth",
+                }
+            },
+            "loki": {},
+        }
+        mock_cursor.fetchall.return_value = [
+            (
+                "prometheus",
+                "vendor_queue_depth",
+                "Vendor queue depth",
+                {"name": "vendor_queue_depth"},
+            )
+        ]
+        mock_cursor.fetchone.side_effect = [
+            (None,),
+            ("tcr_stored",),
+            ("tcr_stored", "catalog-hash", catalog, 1),
+        ]
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                snapshot = pers.pin_telemetry_catalog_revision("irun_1")
+
+        assert snapshot["revision_id"] == "tcr_stored"
+        assert snapshot["catalog"] == catalog
+        assert snapshot["entry_count"] == 1
+        statements = [call.args[0] for call in mock_cursor.execute.call_args_list]
+        assert any("INSERT INTO telemetry_catalog_revisions" in sql for sql in statements)
+        assert any("SET catalog_revision_id = %s" in sql for sql in statements)
+        mock_conn.commit.assert_called_once()
+
+    def test_existing_pin_is_loaded_without_reading_mutable_catalog(self, mock_pool):
+        _, mock_conn, mock_cursor = mock_pool
+        catalog = {"prometheus": {}, "loki": {"app": {"name": "app"}}}
+        mock_cursor.fetchone.side_effect = [
+            ("tcr_existing",),
+            ("tcr_existing", "existing-hash", catalog, 1),
+        ]
+
+        with patch.object(InvestigationPersistence, "_get_connection", return_value=mock_conn):
+            with patch.object(InvestigationPersistence, "_put_connection"):
+                pers = InvestigationPersistence(database_url="test://url")
+                snapshot = pers.pin_telemetry_catalog_revision("irun_retry")
+
+        assert snapshot["revision_id"] == "tcr_existing"
+        assert snapshot["content_hash"] == "existing-hash"
+        mock_cursor.fetchall.assert_not_called()
+        statements = [call.args[0] for call in mock_cursor.execute.call_args_list]
+        assert not any("telemetry_catalog_entries" in sql for sql in statements)
+        assert not any("INSERT INTO telemetry_catalog_revisions" in sql for sql in statements)
+
+
 class TestUpdateRunStatus:
     """Tests for InvestigationPersistence.update_run_status."""
 

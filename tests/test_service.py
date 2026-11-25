@@ -132,6 +132,7 @@ def test_checkpoint_reconstructs_tool_cache_findings_and_resume_message(investig
         "run_id": "irun_resume",
         "status": "running",
         "run_kind": "investigation",
+        "catalog_revision_id": "tcr_resume",
         "tool_executions": [
             (
                 0,
@@ -169,6 +170,7 @@ def test_checkpoint_reconstructs_tool_cache_findings_and_resume_message(investig
 
     assert status == "running"
     assert state.run_id == "irun_resume"
+    assert state.catalog_revision_id == "tcr_resume"
     assert state.tool_call_count == 1
     assert state.turn_count == 1
     assert state.resumed_from_checkpoint is True

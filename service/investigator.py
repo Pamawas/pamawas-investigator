@@ -645,6 +645,12 @@ def _prometheus_metric_candidate_plan(
     audit = {
         "policy_version": 1,
         "stage": "empty_prometheus_query_recovery",
+        "catalog_revision_id": (
+            context.telemetry_catalog_revision_id if context else None
+        ),
+        "catalog_content_hash": (
+            context.telemetry_catalog_content_hash if context else None
+        ),
         "query_domain_terms": sorted(query_term_set),
         "incident_domain_terms": sorted(set(incident_terms)),
         "required_domain_terms": sorted(required_terms),
@@ -2315,15 +2321,45 @@ class PamawasInvestigator:
             increment_db_errors()
             self.db_conn = None
 
-    async def _refresh_telemetry_catalog(self, context: IncidentContext) -> None:
-        """Refresh stale live provider schemas, then freeze one DB snapshot.
+    @staticmethod
+    def _apply_catalog_revision(
+        context: IncidentContext, snapshot: dict[str, Any]
+    ) -> None:
+        catalog = snapshot.get("catalog")
+        if not isinstance(catalog, dict):
+            raise RuntimeError("Telemetry catalog revision has invalid content")
+        context.telemetry_catalog = catalog
+        context.telemetry_catalog_revision_id = str(snapshot["revision_id"])
+        context.telemetry_catalog_content_hash = str(snapshot["content_hash"])
+
+    async def _refresh_telemetry_catalog(
+        self, context: IncidentContext, run_id: str | None = None
+    ) -> None:
+        """Refresh live provider schemas and pin one immutable run revision.
 
         The database claim prevents concurrent investigator workers from
         stampeding Prometheus or Loki. Failed refreshes never erase the last
-        successful catalog, so evidence selection remains deterministic and
-        available while a provider is temporarily unhealthy.
+        successful catalog. A retry loads its already-pinned revision before
+        considering refresh state, so provider changes cannot alter candidate
+        selection partway through one logical run.
         """
         if self.persistence is None:
+            return
+        if not run_id:
+            raise RuntimeError(
+                "A persisted investigation must have a run ID before catalog pinning"
+            )
+
+        pinned = await asyncio.to_thread(
+            self.persistence.load_pinned_telemetry_catalog, run_id
+        )
+        if pinned is not None:
+            self._apply_catalog_revision(context, pinned)
+            logger.info(
+                "Loaded pinned telemetry catalog revision %s for run %s",
+                context.telemetry_catalog_revision_id,
+                run_id,
+            )
             return
 
         async def refresh_provider(provider: str) -> None:
@@ -2385,8 +2421,15 @@ class PamawasInvestigator:
             refresh_provider("prometheus"),
             refresh_provider("loki"),
         )
-        context.telemetry_catalog = await asyncio.to_thread(
-            self.persistence.load_telemetry_catalog
+        pinned = await asyncio.to_thread(
+            self.persistence.pin_telemetry_catalog_revision, run_id
+        )
+        self._apply_catalog_revision(context, pinned)
+        logger.info(
+            "Pinned telemetry catalog revision %s (%s entries) to run %s",
+            context.telemetry_catalog_revision_id,
+            pinned.get("entry_count", 0),
+            run_id,
         )
 
     async def _evaluate_condition(
@@ -2796,6 +2839,10 @@ class PamawasInvestigator:
             )
         state.run_id = checkpoint_run_id or state.run_id
         state.run_kind = run_kind
+        checkpoint_revision_id = checkpoint.get("catalog_revision_id")
+        state.catalog_revision_id = (
+            str(checkpoint_revision_id) if checkpoint_revision_id else None
+        )
 
         restored_tools: list[ToolResult] = []
         for row in checkpoint.get("tool_executions") or []:
@@ -3106,15 +3153,24 @@ class PamawasInvestigator:
                     and result.get("status") == "success"
                     and not _prometheus_has_numeric_samples(result)
                 ):
-                    metric_catalog: Any = []
-                    try:
-                        catalog = await self.tools._prometheus_adapter.query_metric_catalog()
-                        metric_catalog = catalog.get("data", [])
-                    except (AttributeError, PrometheusError) as exc:
-                        logger.warning(
-                            "Prometheus metric-name discovery failed after empty query: %s",
-                            exc,
+                    if context is not None and context.telemetry_catalog_revision_id:
+                        pinned = (context.telemetry_catalog or {}).get("prometheus", {})
+                        metric_catalog: Any = (
+                            list(pinned.values()) if isinstance(pinned, dict) else []
                         )
+                    else:
+                        metric_catalog = []
+                        try:
+                            catalog = (
+                                await self.tools._prometheus_adapter.query_metric_catalog()
+                            )
+                            metric_catalog = catalog.get("data", [])
+                        except (AttributeError, PrometheusError) as exc:
+                            logger.warning(
+                                "Prometheus metric-name discovery failed after empty "
+                                "query: %s",
+                                exc,
+                            )
                     candidates, candidate_audit = _prometheus_metric_candidate_plan(
                         promql, metric_catalog, context=context
                     )
@@ -3632,7 +3688,10 @@ class PamawasInvestigator:
         )
 
     async def investigate_async(
-        self, incident_id: str, request_key_hash: str = ""
+        self,
+        incident_id: str,
+        request_key_hash: str = "",
+        run_id: str | None = None,
     ) -> list[Finding]:
         """Run the bounded investigation loop; every terminal path persists
         the run and its evidence.
@@ -3663,12 +3722,24 @@ class PamawasInvestigator:
             tool_calls=[],
             max_tool_calls=self.config.max_tool_calls,
             request_key_hash=request_key_hash,
+            run_id=run_id,
             run_kind="investigation",
             service=context.affected_services[0] if context.affected_services else None,
         )
         checkpoint_status = self._hydrate_state_from_checkpoint(state, "investigation")
         if checkpoint_status == "completed":
             return state.findings
+        if self.persistence is not None and not state.run_id:
+            state.run_id, _ = self.persistence.create_investigation_run(
+                incident_id=incident_id,
+                request_key_hash=request_key_hash,
+                model_provider=self.config.llm_base_url,
+                model_name=self.config.llm_model,
+                prompt_version=PROMPT_VERSION,
+                tool_contract=1,
+                max_tool_calls=state.max_tool_calls,
+                run_kind=state.run_kind,
+            )
 
         evaluation = await self._evaluate_condition(context)
         state.findings = [
@@ -3679,7 +3750,8 @@ class PamawasInvestigator:
         state.findings.append(
             _condition_evaluation_finding(context.condition_ref, evaluation)
         )
-        await self._refresh_telemetry_catalog(context)
+        await self._refresh_telemetry_catalog(context, state.run_id)
+        state.catalog_revision_id = context.telemetry_catalog_revision_id
 
         return await self._run_investigation_loop(
             incident_id=incident_id,

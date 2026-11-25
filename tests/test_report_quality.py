@@ -333,15 +333,21 @@ def test_circuit_breaker_stdlib_logging_does_not_raise(caplog):
 async def test_investigator_refreshes_and_freezes_live_catalog(investigator):
     persistence = MagicMock()
     persistence.claim_telemetry_catalog_refresh.return_value = True
-    persistence.load_telemetry_catalog.return_value = {
-        "prometheus": {
-            "pg_stat_statements_mean_exec_time": {
-                "name": "pg_stat_statements_mean_exec_time",
-                "help": "PostgreSQL query duration",
-                "_search_text": "PostgreSQL query duration",
-            }
+    persistence.load_pinned_telemetry_catalog.return_value = None
+    persistence.pin_telemetry_catalog_revision.return_value = {
+        "revision_id": "tcr_abc",
+        "content_hash": "abc",
+        "entry_count": 2,
+        "catalog": {
+            "prometheus": {
+                "pg_stat_statements_mean_exec_time": {
+                    "name": "pg_stat_statements_mean_exec_time",
+                    "help": "PostgreSQL query duration",
+                    "_search_text": "PostgreSQL query duration",
+                }
+            },
+            "loki": {"app": {"name": "app", "_search_text": "app"}},
         },
-        "loki": {"app": {"name": "app", "_search_text": "app"}},
     }
     investigator.persistence = persistence
     investigator.tools._prometheus_adapter.query_metric_catalog = AsyncMock(return_value={
@@ -358,20 +364,27 @@ async def test_investigator_refreshes_and_freezes_live_catalog(investigator):
     })
     context = IncidentContext("inc", "PostgreSQL Slow Query")
 
-    await investigator._refresh_telemetry_catalog(context)
+    await investigator._refresh_telemetry_catalog(context, "irun_1")
 
     assert persistence.store_telemetry_catalog.call_count == 2
     assert "pg_stat_statements_mean_exec_time" in context.telemetry_catalog["prometheus"]
-    persistence.load_telemetry_catalog.assert_called_once_with()
+    assert context.telemetry_catalog_revision_id == "tcr_abc"
+    persistence.pin_telemetry_catalog_revision.assert_called_once_with("irun_1")
 
 
 @pytest.mark.asyncio
 async def test_failed_catalog_refresh_keeps_last_db_snapshot(investigator):
     persistence = MagicMock()
     persistence.claim_telemetry_catalog_refresh.return_value = True
-    persistence.load_telemetry_catalog.return_value = {
-        "prometheus": {"up": {"name": "up", "_search_text": "up"}},
-        "loki": {},
+    persistence.load_pinned_telemetry_catalog.return_value = None
+    persistence.pin_telemetry_catalog_revision.return_value = {
+        "revision_id": "tcr_last_good",
+        "content_hash": "last-good",
+        "entry_count": 1,
+        "catalog": {
+            "prometheus": {"up": {"name": "up", "_search_text": "up"}},
+            "loki": {},
+        },
     }
     investigator.persistence = persistence
     investigator.tools._prometheus_adapter.query_metric_catalog = AsyncMock(
@@ -382,7 +395,35 @@ async def test_failed_catalog_refresh_keeps_last_db_snapshot(investigator):
     )
     context = IncidentContext("inc", "Target Down")
 
-    await investigator._refresh_telemetry_catalog(context)
+    await investigator._refresh_telemetry_catalog(context, "irun_2")
 
     assert context.telemetry_catalog["prometheus"]["up"]["name"] == "up"
     assert persistence.mark_telemetry_catalog_refresh_failed.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_reuses_pinned_catalog_without_live_refresh(investigator):
+    persistence = MagicMock()
+    persistence.load_pinned_telemetry_catalog.return_value = {
+        "revision_id": "tcr_original",
+        "content_hash": "original-hash",
+        "entry_count": 1,
+        "catalog": {
+            "prometheus": {
+                "vendor_queue_depth": {
+                    "name": "vendor_queue_depth",
+                    "_search_text": "vendor queue depth",
+                }
+            },
+            "loki": {},
+        },
+    }
+    investigator.persistence = persistence
+    context = IncidentContext("inc", "Vendor queue latency")
+
+    await investigator._refresh_telemetry_catalog(context, "irun_retry")
+
+    assert context.telemetry_catalog_revision_id == "tcr_original"
+    assert "vendor_queue_depth" in context.telemetry_catalog["prometheus"]
+    persistence.claim_telemetry_catalog_refresh.assert_not_called()
+    persistence.pin_telemetry_catalog_revision.assert_not_called()

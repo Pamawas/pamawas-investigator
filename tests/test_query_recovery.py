@@ -17,6 +17,30 @@ def context():
 
 
 @pytest.mark.asyncio
+async def test_metric_recovery_uses_pinned_catalog_revision():
+    incident = context()
+    incident.telemetry_catalog_revision_id = "tcr_pinned"
+    incident.telemetry_catalog_content_hash = "pinned-hash"
+    incident.telemetry_catalog = {
+        "prometheus": {
+            "vendor_activity_seconds_total": {
+                "name": "vendor_activity_seconds_total",
+                "type": "counter",
+                "unit": "seconds",
+            }
+        },
+        "loki": {},
+    }
+    adapter = SimpleNamespace(query_metric_catalog=AsyncMock())
+    recovery = QueryRecovery(SimpleNamespace(_prometheus_adapter=adapter), incident, 100)
+
+    catalog = await recovery.metric_catalog()
+
+    assert catalog[0]["name"] == "vendor_activity_seconds_total"
+    adapter.query_metric_catalog.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_loki_recovery_uses_its_own_keys_and_values():
     adapter = SimpleNamespace(
         query_labels=AsyncMock(return_value={"status": "success", "data": ["log_scope"]}),
@@ -100,11 +124,18 @@ async def test_selector_discovers_arbitrary_provider_label_name():
         resolved_at="2026-11-24T06:52:00Z",
         affected_services=["alpha-target"],
         events=[{"labels": {"different_source_key": "alpha-target"}}],
+        telemetry_catalog={
+            "prometheus": {},
+            "loki": {"opaque_dimension": {"name": "opaque_dimension"}},
+        },
+        telemetry_catalog_revision_id="tcr_labels",
+        telemetry_catalog_content_hash="labels-hash",
     )
     recovery = QueryRecovery(SimpleNamespace(_loki_adapter=adapter), incident, 100)
 
     await recovery.recover_loki()
 
+    adapter.query_labels.assert_not_awaited()
     adapter.query_label_values.assert_awaited_once_with("opaque_dimension")
     adapter.query_range.assert_awaited_once_with(
         '{opaque_dimension="alpha-target"}',

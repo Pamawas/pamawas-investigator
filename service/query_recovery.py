@@ -237,6 +237,8 @@ def _related_metric_plan(
     audit = {
         "policy_version": 1,
         "stage": "related_metric_recovery",
+        "catalog_revision_id": context.telemetry_catalog_revision_id,
+        "catalog_content_hash": context.telemetry_catalog_content_hash,
         "primary_terms": sorted(primary_signature),
         "accepted": [
             {
@@ -434,9 +436,25 @@ class QueryRecovery:
         if provider in self._selector_cache:
             return self._selector_cache[provider]
         adapter = getattr(self.tools, f"_{provider}_adapter")
-        catalog = await self.call(
-            f"get_{provider}_labels", {}, adapter.query_labels
-        )
+        pinned = (self.context.telemetry_catalog or {}).get(provider, {})
+        if (
+            provider == "loki"
+            and self.context.telemetry_catalog_revision_id
+            and isinstance(pinned, dict)
+        ):
+            catalog = {
+                "status": "success",
+                "data": sorted(str(name) for name in pinned),
+                "catalog_revision_id": self.context.telemetry_catalog_revision_id,
+                "_private": True,
+            }
+            self.calls.append(
+                ToolResult(f"get_{provider}_labels", {}, catalog, 0.0)
+            )
+        else:
+            catalog = await self.call(
+                f"get_{provider}_labels", {}, adapter.query_labels
+            )
         if catalog.get("status") != "success" or not isinstance(catalog.get("data"), list):
             coverage = {
                 "validated": False,
@@ -505,14 +523,17 @@ class QueryRecovery:
     async def metric_catalog(self) -> list[dict[str, Any]]:
         if self._metric_catalog is not None:
             return self._metric_catalog
-        adapter = self.tools._prometheus_adapter
-        response = await self.call(
-            "get_prometheus_metadata", {}, adapter.query_metric_catalog
-        )
-        data = response.get("data")
-        self._metric_catalog = (
-            _canonical_metric_catalog(data) if isinstance(data, list) else []
-        )
+        if self.context.telemetry_catalog_revision_id:
+            catalog = (self.context.telemetry_catalog or {}).get("prometheus", {})
+            data = list(catalog.values()) if isinstance(catalog, dict) else []
+        else:
+            adapter = self.tools._prometheus_adapter
+            response = await self.call(
+                "get_prometheus_metadata", {}, adapter.query_metric_catalog
+            )
+            raw_data = response.get("data")
+            data = raw_data if isinstance(raw_data, list) else []
+        self._metric_catalog = _canonical_metric_catalog(data)
         return self._metric_catalog
 
     async def _query_metric(

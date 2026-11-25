@@ -200,6 +200,8 @@ class IncidentContext:
     # One immutable snapshot of the provider schemas discovered from the live
     # Prometheus/Loki instances and persisted by the investigator.
     telemetry_catalog: dict[str, dict[str, Any]] | None = None
+    telemetry_catalog_revision_id: str | None = None
+    telemetry_catalog_content_hash: str | None = None
     # Stable source identity used by an adapter to query exact current state.
     condition_ref: ConditionReference | None = None
     condition_ref_error: str | None = None
@@ -285,6 +287,7 @@ class InvestigationState:
     request_key_hash: str | None = None
     run_id: str | None = None
     run_kind: str = "investigation"
+    catalog_revision_id: str | None = None
     resumed_from_checkpoint: bool = False
     # Legacy affected-target hint retained for request compatibility. It is not
     # mapped onto any Prometheus or Loki label without schema validation.

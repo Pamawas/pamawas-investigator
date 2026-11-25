@@ -639,7 +639,9 @@ async def _run_investigation_task(run_id: str, incident_id: str, request_key_has
     scheduler dispatch a (possibly partial) report instead of a stuck queued run.
     """
     try:
-        await investigator.investigate_async(incident_id, request_key_hash)
+        await investigator.investigate_async(
+            incident_id, request_key_hash, run_id=run_id
+        )
     except Exception as e:  # noqa: BLE001
         log.error(
             "investigation_task_failed",
