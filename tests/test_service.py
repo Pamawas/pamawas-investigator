@@ -1339,7 +1339,7 @@ async def test_empty_prometheus_query_returns_ranked_real_metric_candidates(inve
     )
 
     assert result["status"] == "empty"
-    assert result["metric_candidates"][0]["name"] == "mktxp_system_cpu_load"
+    assert result["metric_candidates"][0]["name"] == "node_cpu_seconds_total"
     assert result["_candidate_selection_audit"]["accepted_total"] == 5
     assert "does not satisfy the evidence gate" in result["error"]
     assert findings is None
@@ -1374,6 +1374,55 @@ def test_metric_candidates_reject_overlap_from_only_scope_and_generic_terms():
 
     assert [candidate["name"] for candidate in candidates] == [
         "traefik_connections_open"
+    ]
+
+
+def test_metric_candidates_require_incident_domain_not_shared_symptom_words():
+    context = IncidentContext(
+        "inc_live_regression",
+        "Traefik Service High Latency",
+        affected_services=["arbitrary-target"],
+    )
+    candidates = _prometheus_metric_candidates(
+        'traefik_service_latency_seconds_p95{opaque_scope="arbitrary-target"}',
+        [
+            {
+                "name": "traefik_config_reloads_total",
+                "type": "counter",
+                "help": "Config reloads",
+                "unit": "",
+            },
+            {
+                "name": "traefik_tls_certs_not_after",
+                "type": "gauge",
+                "help": "Certificate expiration timestamp",
+                "unit": "",
+            },
+            {
+                "name": "ubntStaTxLatency",
+                "type": "gauge",
+                "help": "Uplink latency in milliseconds",
+                "unit": "",
+            },
+            {
+                "name": "argocd_kubectl_request_duration_seconds",
+                "type": "histogram",
+                "help": "Request latency in seconds",
+                "unit": "",
+            },
+            {
+                "name": "ceph_osd_apply_latency_ms",
+                "type": "gauge",
+                "help": "OSD apply latency",
+                "unit": "",
+            },
+        ],
+        context=context,
+    )
+
+    assert [candidate["name"] for candidate in candidates] == [
+        "traefik_config_reloads_total",
+        "traefik_tls_certs_not_after",
     ]
 
 

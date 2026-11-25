@@ -30,6 +30,12 @@ _EXACT_LABEL_MATCHER = re.compile(
 _SEMANTIC_STOP_TERMS = frozenset(
     {
         "alert",
+        "absent",
+        "after",
+        "age",
+        "average",
+        "avg",
+        "before",
         "bucket",
         "byte",
         "bytes",
@@ -37,23 +43,61 @@ _SEMANTIC_STOP_TERMS = frozenset(
         "counter",
         "critical",
         "cluster",
+        "current",
+        "duration",
+        "error",
+        "errors",
+        "failed",
+        "failure",
+        "failures",
         "gauge",
+        "health",
+        "healthy",
         "high",
         "histogram",
         "incident",
         "info",
         "instance",
         "job",
+        "last",
+        "latency",
         "low",
+        "maximum",
+        "max",
+        "minimum",
+        "min",
+        "missing",
         "namespace",
+        "normal",
+        "not",
+        "percent",
+        "percentage",
         "production",
+        "quantile",
+        "ratio",
+        "rate",
+        "request",
+        "requests",
+        "response",
+        "responses",
         "second",
         "seconds",
         "service",
+        "slow",
+        "status",
+        "success",
+        "successful",
         "sum",
+        "saturation",
         "target",
+        "threshold",
+        "timeout",
+        "timeouts",
         "total",
         "unit",
+        "unhealthy",
+        "usage",
+        "utilization",
         "value",
         "values",
         "warning",
@@ -70,7 +114,12 @@ def metric_semantic_terms(value: Any) -> list[str]:
     terms = []
     for token in _TOKEN.findall(str(value or "").lower().replace("_", " ")):
         normalized = token[:-1] if len(token) > 3 and token.endswith("s") else token
-        if len(normalized) < 2 or normalized in _SEMANTIC_STOP_TERMS:
+        if (
+            len(normalized) < 2
+            or normalized.isdigit()
+            or re.fullmatch(r"[pq]\d{1,3}", normalized)
+            or normalized in _SEMANTIC_STOP_TERMS
+        ):
             continue
         terms.append(normalized)
     return terms
@@ -154,9 +203,7 @@ def _related_metric_plan(
     """Require incident-domain overlap before ranking related metrics."""
     primary_terms, scope_terms = _context_terms(context)
     common_terms = _common_catalog_terms(catalog)
-    primary_signature = (
-        primary_terms | _semantic_tokens(" ".join(sorted(excluded_names)))
-    ) - common_terms - scope_terms
+    primary_signature = primary_terms - common_terms - scope_terms
     ranked = []
     rejected = []
     rejected_total = 0
@@ -188,8 +235,6 @@ def _related_metric_plan(
         for _, _, descriptor, signature, _ in ranked
     ]
     audit = {
-        "status": "success",
-        "_private": True,
         "policy_version": 1,
         "stage": "related_metric_recovery",
         "primary_terms": sorted(primary_signature),
@@ -554,7 +599,11 @@ class QueryRecovery:
             ToolResult(
                 "select_prometheus_candidates",
                 {"stage": "related_metric_recovery"},
-                audit,
+                {
+                    "status": "success",
+                    "_private": True,
+                    "_candidate_selection_audit": audit,
+                },
                 0.0,
             )
         )

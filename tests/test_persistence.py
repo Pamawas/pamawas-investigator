@@ -732,6 +732,39 @@ def test_result_summary_is_bounded_for_resume_state():
     assert summary["status"] == "success"
 
 
+def test_result_summary_preserves_bounded_recovery_policy_audits():
+    pers = InvestigationPersistence(database_url="test://url")
+    result = {
+        "status": "success",
+        "target_coverage": {
+            "validated": True,
+            "method": "exact_incident_identity",
+            "label": "opaque_scope",
+            "value": "alpha-target",
+        },
+        "_candidate_selection_audit": {
+            "policy_version": 1,
+            "accepted": [{
+                "name": "vendor_domain_metric",
+                "domain_overlap": ["vendor"],
+                "score": {"domain_overlap": 1},
+            }],
+            "rejected": [{
+                "name": "unrelated_metric",
+                "reason": "no_incident_domain_overlap",
+            }],
+        },
+    }
+
+    summary = pers._summarize_result(result)
+
+    assert summary["target_coverage"]["validated"] is True
+    assert summary["target_coverage"]["label"] == "opaque_scope"
+    audit = summary["_candidate_selection_audit"]
+    assert audit["accepted"][0]["score"]["domain_overlap"] == 1
+    assert audit["rejected"][0]["reason"] == "no_incident_domain_overlap"
+
+
 class TestRequeueExpiredStaleRunning:
     """Tests for InvestigationPersistence.requeue_expired_stale_running."""
 

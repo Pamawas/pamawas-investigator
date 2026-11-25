@@ -544,7 +544,10 @@ def _prometheus_has_numeric_samples(result: Any) -> bool:
 
 
 def _prometheus_metric_candidate_plan(
-    promql: str, metric_catalog: Any, limit: int = 12
+    promql: str,
+    metric_catalog: Any,
+    limit: int = 12,
+    context: IncidentContext | None = None,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """Admit only real metrics with positive non-generic query-domain overlap."""
     metric_names = _prometheus_metric_names(str(promql))
@@ -552,6 +555,12 @@ def _prometheus_metric_candidate_plan(
     # them for admission recreated the production bug where a shared cluster
     # label made unrelated Argo CD and Kubernetes metrics look relevant.
     query_terms = metric_semantic_terms(" ".join(metric_names))
+    incident_terms = metric_semantic_terms(context.title) if context else []
+    required_terms = (
+        set(query_terms).intersection(incident_terms)
+        if context is not None
+        else set(query_terms)
+    )
     query_counts = Counter(query_terms)
     query_bigrams = set(itertools.pairwise(query_terms))
     normalized_query = "_".join(query_terms)
@@ -605,7 +614,7 @@ def _prometheus_metric_candidate_plan(
         candidate_terms = metric_semantic_terms(
             f"{item['name']} {item['help']} {item['unit']}"
         )
-        overlap = sorted(query_term_set.intersection(candidate_terms))
+        overlap = sorted(required_terms.intersection(candidate_terms))
         if not overlap:
             rejected_total += 1
             if len(rejected) < _CANDIDATE_AUDIT_LIMIT:
@@ -635,6 +644,8 @@ def _prometheus_metric_candidate_plan(
         "policy_version": 1,
         "stage": "empty_prometheus_query_recovery",
         "query_domain_terms": sorted(query_term_set),
+        "incident_domain_terms": sorted(set(incident_terms)),
+        "required_domain_terms": sorted(required_terms),
         "accepted": [
             {
                 "name": name,
@@ -656,10 +667,13 @@ def _prometheus_metric_candidate_plan(
 
 
 def _prometheus_metric_candidates(
-    promql: str, metric_catalog: Any, limit: int = 12
+    promql: str,
+    metric_catalog: Any,
+    limit: int = 12,
+    context: IncidentContext | None = None,
 ) -> list[dict[str, str]]:
     """Compatibility wrapper returning only admitted retry candidates."""
-    return _prometheus_metric_candidate_plan(promql, metric_catalog, limit)[0]
+    return _prometheus_metric_candidate_plan(promql, metric_catalog, limit, context)[0]
 
 
 def _public_tool_result(result: Any) -> Any:
@@ -3035,6 +3049,7 @@ class PamawasInvestigator:
         function_name: str,
         function_args: dict,
         verification: bool = False,
+        context: IncidentContext | None = None,
     ):
         """Execute a tool call and return the result.
 
@@ -3102,7 +3117,7 @@ class PamawasInvestigator:
                             exc,
                         )
                     candidates, candidate_audit = _prometheus_metric_candidate_plan(
-                        promql, metric_catalog
+                        promql, metric_catalog, context=context
                     )
                     logger.warning(
                         "Prometheus query returned no numeric series; retry candidates: %s",
@@ -4588,7 +4603,10 @@ class PamawasInvestigator:
                 has_fresh_tool_call = True
                 tool_start = time.time()
                 result, findings, is_final = await self._execute_tool(
-                    function_name, function_args, verification=verification
+                    function_name,
+                    function_args,
+                    verification=verification,
+                    context=state.context,
                 )
 
                 if is_final:

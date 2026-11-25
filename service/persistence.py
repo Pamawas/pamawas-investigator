@@ -1396,6 +1396,16 @@ class InvestigationPersistence:
         for k, v in result.items():
             if k in ("status", "error", "data", "result"):
                 summary[k] = v
+            elif k in ("_candidate_selection_audit", "target_coverage"):
+                # These harness-owned decisions are already bounded at their
+                # source and must remain inspectable. Collapsing them to
+                # ``<dict len=N>`` defeats the audit contract that explains
+                # why telemetry was admitted or rejected.
+                summary[k] = self._bound_summary_value(
+                    v,
+                    list_limit=25,
+                    string_limit=2000,
+                )
             elif isinstance(v, (str, int, float, bool)):
                 summary[k] = v
             elif isinstance(v, (list, dict)):

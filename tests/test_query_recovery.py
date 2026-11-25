@@ -142,16 +142,27 @@ async def test_counter_recovery_preserves_rate_query_and_meaningful_observations
 @pytest.mark.asyncio
 async def test_recovery_queries_primary_and_two_metadata_ranked_related_signals(monkeypatch):
     monkeypatch.setenv("TZ", "Asia/Jakarta")
+    related_context = IncidentContext(
+        "inc_related",
+        "Vendor compute pressure",
+        started_at="2026-11-23T11:35:10Z",
+        resolved_at="2026-11-23T11:40:10Z",
+        affected_services=["alpha-target", "metrics-job"],
+        events=[{"labels": {
+            "metric_scope": "alpha-target",
+            "metric_job": "metrics-job",
+        }}],
+    )
 
     async def query_range(expression, _start, _end):
         values_by_expression = {
             'vendor_compute_utilization{metric_scope="alpha-target"}': (
                 [1795433700, "85.6"], [1795434000, "63.51"]
             ),
-            'vendor_memory_available_bytes{metric_scope="alpha-target"}': (
+            'vendor_compute_memory_available_bytes{metric_scope="alpha-target"}': (
                 [1795433700, "2147483648"], [1795434000, "3221225472"]
             ),
-            'rate(vendor_storage_read_bytes_total{metric_scope="alpha-target"}[5m])': (
+            'rate(vendor_compute_storage_read_bytes_total{metric_scope="alpha-target"}[5m])': (
                 [1795433700, "1048576"], [1795434000, "524288"]
             ),
         }
@@ -180,13 +191,13 @@ async def test_recovery_queries_primary_and_two_metadata_ranked_related_signals(
                     "unit": "percent",
                 },
                 {
-                    "name": "vendor_memory_available_bytes",
+                    "name": "vendor_compute_memory_available_bytes",
                     "type": "gauge",
                     "help": "Available memory",
                     "unit": "bytes",
                 },
                 {
-                    "name": "vendor_storage_read_bytes_total",
+                    "name": "vendor_compute_storage_read_bytes_total",
                     "type": "counter",
                     "help": "Bytes read from storage",
                     "unit": "bytes",
@@ -195,7 +206,9 @@ async def test_recovery_queries_primary_and_two_metadata_ranked_related_signals(
         }),
         query_range=AsyncMock(side_effect=query_range),
     )
-    recovery = QueryRecovery(SimpleNamespace(_prometheus_adapter=adapter), context(), 100)
+    recovery = QueryRecovery(
+        SimpleNamespace(_prometheus_adapter=adapter), related_context, 100
+    )
 
     await recovery.recover_prometheus([
         {
@@ -208,10 +221,10 @@ async def test_recovery_queries_primary_and_two_metadata_ranked_related_signals(
 
     assert [call.args[0] for call in adapter.query_range.await_args_list] == [
         'vendor_compute_utilization{metric_scope="alpha-target"}',
-        'vendor_memory_available_bytes{metric_scope="alpha-target"}',
-        'rate(vendor_storage_read_bytes_total{metric_scope="alpha-target"}[5m])',
+        'vendor_compute_memory_available_bytes{metric_scope="alpha-target"}',
+        'rate(vendor_compute_storage_read_bytes_total{metric_scope="alpha-target"}[5m])',
     ]
-    grounded = _ground_findings_in_data_queries([], recovery.calls, context())
+    grounded = _ground_findings_in_data_queries([], recovery.calls, related_context)
     contents = " ".join(finding.content for finding in grounded)
     assert "85.6%" in contents
     assert "3.00 GiB" in contents
@@ -427,6 +440,18 @@ async def test_related_recovery_rejects_unrelated_production_shaped_metrics():
                     "unit": "",
                 },
                 {
+                    "name": "mysql_global_status_ssl_server_not_after",
+                    "type": "gauge",
+                    "help": "TLS certificate expiration timestamp",
+                    "unit": "seconds",
+                },
+                {
+                    "name": "mysqld_exporter_config_last_reload_successful",
+                    "type": "gauge",
+                    "help": "Whether the last exporter reload succeeded",
+                    "unit": "",
+                },
+                {
                     "name": "traefik_connections_open",
                     "type": "gauge",
                     "help": "Open proxy connections",
@@ -455,9 +480,14 @@ async def test_related_recovery_rejects_unrelated_production_shaped_metrics():
     audit = next(
         call for call in recovery.calls if call.tool_name == "select_prometheus_candidates"
     )
-    rejected = {item["name"] for item in audit.result["rejected"]}
+    rejected = {
+        item["name"]
+        for item in audit.result["_candidate_selection_audit"]["rejected"]
+    }
     assert rejected == {
         "argocd_cluster_cache_age_seconds",
         "kube_pod_service_account",
+        "mysql_global_status_ssl_server_not_after",
+        "mysqld_exporter_config_last_reload_successful",
     }
     assert audit.result["_private"] is True
