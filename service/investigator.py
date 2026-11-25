@@ -54,6 +54,7 @@ from models import (
     ToolResult,
 )
 from service.daily_summary import write_day_summary as _write_day_summary
+from service.evidence_policy import EVIDENCE_POLICY
 from service.evidence_summary import (
     alert_observation,
     log_observations,
@@ -66,7 +67,7 @@ from tools import InvestigatorTools, ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "pamawas-investigator-v22"
+PROMPT_VERSION = "pamawas-investigator-v23"
 
 _FULL_INVESTIGATION_DATA_TOOLS = ("query_prometheus", "query_loki")
 _VERIFICATION_DATA_TOOLS = ("query_prometheus",)
@@ -1114,48 +1115,54 @@ def _loki_query_finding(
 def _causal_query_details(tool_calls: list[ToolResult]) -> str:
     """Identify the successful provider queries available to a causal synthesis."""
     details: list[str] = []
+    seen: set[tuple[str, str]] = set()
     for tool_name, argument_name in (
         ("query_prometheus", "promql"),
         ("query_loki", "logql"),
     ):
-        calls = _successful_tool_calls(tool_calls, tool_name)
-        if calls:
-            details.append(_query_source_detail(calls[-1], argument_name))
+        for call in _successful_tool_calls(tool_calls, tool_name):
+            identity = _data_query_identity(call)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            details.append(_query_source_detail(call, argument_name))
     return "; ".join(details)
 
 
-def _normalized_causal_synthesis(
+def _normalized_causal_syntheses(
     findings: list[Finding], tool_calls: list[ToolResult]
-) -> Finding | None:
-    """Keep one model causal verdict and rewrite provenance to real queries.
+) -> list[Finding]:
+    """Rewrite every model causal candidate to grounded query provenance.
 
     Requiring the model to copy an exact PromQL/LogQL string into
     ``source_detail`` discarded otherwise useful hypotheses. The harness owns
-    provenance, so it attaches the actual executed queries after validating
-    that usable provider data exists.
+    provenance, so it attaches the actual executed queries. The shared evidence
+    policy chooses the one candidate whose mechanism has real support later.
     """
     candidates = [
         finding for finding in findings
         if finding.type in _CAUSAL_FINDING_TYPES
         and not _finding_claims_no_provider_data(finding)
     ]
-    if not candidates or not _causal_query_details(tool_calls):
-        return None
-    best = max(
-        candidates,
-        key=lambda finding: (
-            finding.type == EvidenceType.LIKELY_CAUSE,
-            finding.confidence,
-        ),
-    )
-    confidence_cap = 0.75 if best.type == EvidenceType.LIKELY_CAUSE else 0.6
-    detail = _causal_query_details(tool_calls) or "model synthesis without provider evidence"
-    return replace(
-        best,
-        source=EvidenceSource.LLM,
-        source_detail=f"synthesis from {detail}",
-        confidence=min(float(best.confidence), confidence_cap),
-    )
+    detail = _causal_query_details(tool_calls)
+    if not candidates or not detail:
+        return []
+    return [
+        replace(
+            candidate,
+            source=EvidenceSource.LLM,
+            source_detail=f"synthesis from {detail}",
+            confidence=min(
+                float(candidate.confidence),
+                (
+                    EVIDENCE_POLICY.likely_cause_confidence_cap
+                    if candidate.type is EvidenceType.LIKELY_CAUSE
+                    else EVIDENCE_POLICY.hypothesis_confidence_cap
+                ),
+            ),
+        )
+        for candidate in candidates
+    ]
 
 
 def _has_causal_verdict(findings: list[Finding]) -> bool:
@@ -1314,29 +1321,25 @@ def _ensure_causal_verdict(
     candidates = [finding for finding in findings if finding.type in _CAUSAL_FINDING_TYPES]
     causal_unknowns = [finding for finding in findings if _is_root_cause_unknown(finding)]
     facts = [finding for finding in findings if finding.type == EvidenceType.FACT]
-    fact_sources = {finding.source for finding in facts}
 
     selected: Finding
     if candidates:
-        selected = max(
-            candidates,
-            key=lambda finding: (
-                finding.type == EvidenceType.LIKELY_CAUSE,
-                finding.confidence,
-            ),
-        )
-        # A likely cause needs independent corroboration from both telemetry
-        # providers. Two metrics from Prometheus are still one line of
-        # evidence; alert state plus a metric is not an independent mechanism.
-        if selected.type == EvidenceType.LIKELY_CAUSE and not {
-            EvidenceSource.PROMETHEUS,
-            EvidenceSource.LOKI,
-        }.issubset(fact_sources):
-            selected = replace(
-                selected,
-                type=EvidenceType.HYPOTHESIS,
-                confidence=min(selected.confidence, 0.55),
+        validated = [
+            result
+            for candidate in candidates
+            if (result := EVIDENCE_POLICY.validate(candidate, facts, context)) is not None
+        ]
+        selected = (
+            max(
+                validated,
+                key=lambda finding: (
+                    finding.type is EvidenceType.LIKELY_CAUSE,
+                    finding.confidence,
+                ),
             )
+            if validated
+            else _fallback_causal_finding(findings, tool_calls, context)
+        )
     else:
         # Provider gaps do not decide the causal verdict. If no submitted
         # hypothesis names an evidence-backed mechanism, the harness records
@@ -1520,11 +1523,11 @@ def _ground_findings_in_data_queries(
         _loki_query_finding(call, context)
         for call in loki_calls
     )
-    causal_synthesis = _normalized_causal_synthesis(
-        findings, [*prometheus_calls, *loki_calls]
+    grounded.extend(
+        _normalized_causal_syntheses(
+            findings, [*prometheus_calls, *loki_calls]
+        )
     )
-    if causal_synthesis is not None:
-        grounded.append(causal_synthesis)
     return grounded + kept
 
 
@@ -2632,10 +2635,7 @@ class PamawasInvestigator:
             "label maps, source-code paths, or scientific notation in content.\n"
             "- FACT: a new observation from a successful data query, a post-trigger lifecycle "
             "event, or related history. Restating the triggering alert is not a finding.\n"
-            "- LIKELY_CAUSE: supported by multiple consistent observations and a plausible "
-            "mechanism, with no stronger contradiction.\n"
-            "- HYPOTHESIS: plausible but not adequately tested.\n"
-            "- UNKNOWN: a material question the available evidence cannot answer.\n"
+            f"{EVIDENCE_POLICY.prompt_contract()}"
             "- RECOMMENDATION: a concrete next action tied to a finding or unknown.\n"
             "Use source=prometheus only for a successful Prometheus data query, source=loki "
             "only for returned log data, source=incidents only for new related-history or "
@@ -2648,16 +2648,12 @@ class PamawasInvestigator:
             "- Use submit_findings; prose alone does not complete the investigation.\n"
             "- Submit after at least one relevant provider has returned usable data. If another "
             "provider was attempted but lacks target coverage or exhausts bounded attempts, record "
-            "that source gap and continue. A cause can be supported by one provider; evaluate the "
-            "evidence and mechanism, not the count of successful providers. Do not submit after "
-            "catalog discovery alone.\n"
-            "- Prefer two distinct observations before a causal verdict. They may come from the "
-            "same provider. If bounded attempts cannot obtain the second observation, do not "
-            "invent a mechanism: submit UNKNOWN for root cause and recommend the specific next "
-            "measurement that could establish or reject one.\n"
+            "that source gap and continue. Do not submit after catalog discovery alone.\n"
             "- Every full investigation MUST contain exactly one causal verdict: LIKELY_CAUSE "
             "when the mechanism is strongly supported, HYPOTHESIS when it is plausible but "
             "unconfirmed, or UNKNOWN explicitly stating that the root cause was not established. "
+            f"The {EVIDENCE_POLICY.version} validator may downgrade or replace a model verdict "
+            "that does not meet the policy printed above. "
             "A recommendation without a causal verdict is incomplete. Use source=llm for a "
             "causal synthesis and cite the exact executed query in source_detail. Explain "
             "the observed metric change or specific log event that supports the mechanism. "

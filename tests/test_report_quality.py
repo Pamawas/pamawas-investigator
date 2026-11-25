@@ -13,6 +13,7 @@ from models import (
 )
 from service.investigator import (
     _ensure_causal_verdict,
+    _finalize_findings,
     _ground_findings_in_data_queries,
     _is_reasoning_preamble,
     _logs_from_tool_calls,
@@ -198,17 +199,108 @@ def test_positive_telemetry_never_independently_declares_recovery():
     assert all("recovery" not in finding.content.lower() for finding in findings)
 
 
-def test_likely_cause_requires_prometheus_and_loki_facts():
+def test_two_distinct_prometheus_facts_can_support_likely_cause():
     findings = [
-        Finding(EvidenceType.FACT, "Metric one.", EvidenceSource.PROMETHEUS, 1.0),
-        Finding(EvidenceType.FACT, "Metric two.", EvidenceSource.PROMETHEUS, 1.0),
-        Finding(EvidenceType.LIKELY_CAUSE, "A component saturated.", EvidenceSource.LLM, 0.9),
+        Finding(
+            EvidenceType.FACT,
+            "Vendor queue depth rose before request latency.",
+            EvidenceSource.PROMETHEUS,
+            1.0,
+            "query_prometheus: vendor_queue_depth",
+        ),
+        Finding(
+            EvidenceType.FACT,
+            "Vendor worker saturation increased during the same interval.",
+            EvidenceSource.PROMETHEUS,
+            1.0,
+            "query_prometheus: vendor_worker_saturation",
+        ),
+        Finding(
+            EvidenceType.LIKELY_CAUSE,
+            "Vendor worker saturation delayed queue processing and caused request latency.",
+            EvidenceSource.LLM,
+            0.9,
+        ),
+    ]
+
+    completed = _ensure_causal_verdict(findings, [])
+    causal = [finding for finding in completed if finding.type == EvidenceType.LIKELY_CAUSE]
+    assert len(causal) == 1
+    assert causal[0].confidence == 0.75
+    assert causal[0].supports_evidence == [0, 1]
+
+
+def test_provider_pair_does_not_make_unrelated_fact_causal_support():
+    findings = [
+        Finding(
+            EvidenceType.FACT,
+            "Vendor request latency increased.",
+            EvidenceSource.PROMETHEUS,
+            1.0,
+            "query_prometheus: vendor_request_latency",
+        ),
+        Finding(
+            EvidenceType.FACT,
+            "The nightly backup completed successfully.",
+            EvidenceSource.LOKI,
+            1.0,
+            "query_loki: backup",
+        ),
+        Finding(
+            EvidenceType.LIKELY_CAUSE,
+            "Worker saturation caused vendor request latency.",
+            EvidenceSource.LLM,
+            0.9,
+        ),
     ]
 
     completed = _ensure_causal_verdict(findings, [])
     causal = [finding for finding in completed if finding.type == EvidenceType.HYPOTHESIS]
     assert len(causal) == 1
     assert causal[0].confidence == 0.55
+    assert causal[0].supports_evidence == [0]
+
+
+def test_full_finalizer_accepts_same_provider_independent_mechanism_support():
+    context = IncidentContext(
+        "inc_generic",
+        "Vendor request degradation",
+        affected_services=["alpha-target"],
+    )
+    calls = [
+        metric_call(
+            'vendor_request_latency_seconds{tenant="alpha-target"}',
+            "4.2",
+        ),
+        metric_call(
+            'vendor_request_worker_saturation_ratio{tenant="alpha-target"}',
+            "0.94",
+        ),
+    ]
+    submitted = [
+        Finding(
+            EvidenceType.LIKELY_CAUSE,
+            "Vendor request worker saturation increased request latency.",
+            EvidenceSource.LLM,
+            0.9,
+        )
+    ]
+
+    finalized = _finalize_findings(
+        submitted,
+        calls,
+        context,
+        context.incident_id,
+        verification=False,
+    )
+
+    facts = [finding for finding in finalized if finding.type is EvidenceType.FACT]
+    causes = [
+        finding for finding in finalized if finding.type is EvidenceType.LIKELY_CAUSE
+    ]
+    assert len(facts) == 2
+    assert len(causes) == 1
+    assert causes[0].supports_evidence == [0, 1]
 
 
 def test_metric_caption_does_not_borrow_incident_title():

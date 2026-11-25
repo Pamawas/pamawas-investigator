@@ -15,6 +15,7 @@ from models import (
     InvestigationState,
     ToolResult,
 )
+from service.evidence_policy import EVIDENCE_POLICY
 from service.investigator import (
     InvestigatorLLM,
     PamawasInvestigator,
@@ -1589,6 +1590,8 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "TOOL DISCIPLINE" in prompt
     assert "Every call must answer one distinct unresolved question" in prompt
     assert "EVIDENCE CONTRACT" in prompt
+    assert EVIDENCE_POLICY.prompt_contract() in prompt
+    assert EVIDENCE_POLICY.version in prompt
     assert "Set source_detail to the exact executed query" in prompt
     assert "SUBMISSION" in prompt
     assert "Never submit a FACT whose only content is that this incident exists" in prompt
