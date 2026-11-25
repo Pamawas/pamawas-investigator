@@ -4,6 +4,7 @@ import asyncio
 import itertools
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -853,6 +854,8 @@ def _metric_from_series(series: Any, query_name: str) -> Metric | None:
         at = datetime.fromtimestamp(float(point[0]), tz=UTC)
         value = float(point[1])
     except (OSError, OverflowError, TypeError, ValueError):
+        return None
+    if not math.isfinite(value):
         return None
 
     normalized_labels = {str(key): str(value) for key, value in labels.items()}

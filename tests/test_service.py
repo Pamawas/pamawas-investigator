@@ -1708,6 +1708,30 @@ def test_query_results_persist_without_assuming_data_lake_labels():
     }
 
 
+@pytest.mark.parametrize("non_finite_value", ["NaN", "+Inf", "-Inf"])
+def test_non_finite_prometheus_samples_are_not_persisted(non_finite_value):
+    """Prometheus sentinels are not valid PostgreSQL JSON evidence values."""
+    tool_call = ToolResult(
+        tool_name="query_prometheus",
+        arguments={"promql": "generic_metric"},
+        result={
+            "status": "success",
+            "data": {
+                "resultType": "matrix",
+                "result": [
+                    {
+                        "metric": {"__name__": "generic_metric"},
+                        "values": [[1795428960, non_finite_value]],
+                    }
+                ],
+            },
+        },
+        duration_ms=1,
+    )
+
+    assert _metrics_from_tool_calls([tool_call]) == []
+
+
 def test_provider_findings_are_grounded_in_exact_executed_queries(monkeypatch):
     """A cheap model cannot cite invented queries or alert-payload values as telemetry."""
     monkeypatch.setenv("TZ", "Asia/Jakarta")
