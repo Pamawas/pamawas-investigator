@@ -5,7 +5,7 @@ import pytest
 
 from models import EvidenceSource, EvidenceType, Finding, IncidentContext
 from service.investigator import _ensure_causal_verdict_for_mode, _ground_findings_in_data_queries
-from service.query_recovery import QueryRecovery
+from service.query_recovery import QueryRecovery, loki_target_coverage
 
 
 def context():
@@ -68,7 +68,7 @@ async def test_loki_recovery_uses_its_own_keys_and_values():
 @pytest.mark.asyncio
 async def test_loki_recovery_stops_after_incident_identity_labels_do_not_match():
     """Missing Loki target coverage does not trigger unrelated label enumeration."""
-    async def label_values(label):
+    async def label_values(label, **_scope):
         values = {
             "instance": ["armbian-2", "koba-labs"],
             "job": ["system_journal", "kube_logs"],
@@ -101,7 +101,6 @@ async def test_loki_recovery_stops_after_incident_identity_labels_do_not_match()
 
     assert [call.args[0] for call in adapter.query_label_values.await_args_list] == [
         "instance",
-        "job",
     ]
     adapter.query_range.assert_not_awaited()
 
@@ -136,7 +135,11 @@ async def test_selector_discovers_arbitrary_provider_label_name():
     await recovery.recover_loki()
 
     adapter.query_labels.assert_not_awaited()
-    adapter.query_label_values.assert_awaited_once_with("opaque_dimension")
+    adapter.query_label_values.assert_awaited_once_with(
+        "opaque_dimension",
+        start="2026-11-24T06:46:00+00:00", end="2026-11-24T06:57:00+00:00",
+        selector='{opaque_dimension="alpha-target"}',
+    )
     adapter.query_range.assert_awaited_once_with(
         '{opaque_dimension="alpha-target"}',
         "2026-11-24T06:46:00+00:00",
@@ -296,13 +299,12 @@ def test_weak_model_run_recovers_queries_and_keeps_actions(investigator):
     investigator.tools._loki_adapter.query_label_values = AsyncMock(
         return_value={"status": "success", "data": ["alpha-target"]}
     )
-    investigator.tools._loki_adapter.query_range = AsyncMock(side_effect=[
-        {"status": "error", "error": "invalid selector"},
-        {"status": "success", "data": {"result": [{
+    investigator.tools._loki_adapter.query_range = AsyncMock(return_value={
+        "status": "success", "data": {"result": [{
             "stream": {"log_scope": "alpha-target"},
             "values": [["1795433800000000000", "worker restarted after timeout"]],
-        }]}},
-    ])
+        }]},
+    })
     investigator.llm.chat_completion = MagicMock(side_effect=[
         response(tool_calls=[tool_call("query_prometheus", {
             "promql": 'vendor_activity_seconds_total{metric_scope="alpha-target"}',
@@ -328,6 +330,7 @@ def test_weak_model_run_recovers_queries_and_keeps_actions(investigator):
     assert any("0.85 seconds per second" in finding.content for finding in findings)
     assert any("Worker restarted after timeout" in finding.content for finding in findings)
     assert not any("40500" in finding.content for finding in findings)
+    assert investigator.tools._loki_adapter.query_range.await_count == 1
 
 
 @pytest.mark.asyncio
@@ -345,8 +348,32 @@ async def test_recovery_does_not_query_without_a_validated_target():
 
 
 @pytest.mark.asyncio
+async def test_loki_probes_are_bounded_and_cached_even_for_an_old_incident():
+    incident = IncidentContext(
+        "inc", "Long provider outage", started_at="2026-11-21T11:00:00Z",
+        resolved_at="2026-11-23T11:30:00Z", affected_services=["alpha-target"],
+    )
+    adapter = SimpleNamespace(
+        query_labels=AsyncMock(return_value={
+            "status": "success", "data": [f"label_{index:02d}" for index in range(20)],
+        }),
+        query_label_values=AsyncMock(return_value={"status": "success", "data": []}),
+    )
+
+    coverage = await loki_target_coverage(adapter, incident)
+    assert coverage == {"validated": False, "reason": "no_exact_target_label_match", "probes": 6}
+    assert await loki_target_coverage(adapter, incident) == coverage
+    assert adapter.query_label_values.await_count == 6
+    first = adapter.query_label_values.await_args_list[0].kwargs
+    assert first == {
+        "start": "2026-11-23T05:35:00+00:00", "end": "2026-11-23T11:35:00+00:00",
+        "selector": '{label_00="alpha-target"}',
+    }
+
+
+@pytest.mark.asyncio
 async def test_condition_reference_target_label_is_preferred_over_broad_event_scope():
-    async def label_values(label):
+    async def label_values(label, **_scope):
         values = {
             "cluster": ["production"],
             "opaque_target": ["alpha-target"],
@@ -407,11 +434,12 @@ async def test_broad_cluster_match_cannot_authorize_recovery_query():
 
     await recovery.recover_loki()
 
-    adapter.query_label_values.assert_awaited_once_with("cluster")
+    adapter.query_label_values.assert_not_awaited()
     adapter.query_range.assert_not_awaited()
     assert recovery.calls[0].result["target_coverage"] == {
         "validated": False,
         "reason": "no_exact_target_label_match",
+        "probes": 0,
     }
 
 

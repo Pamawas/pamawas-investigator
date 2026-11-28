@@ -422,7 +422,7 @@ def build_prompt_context(context: IncidentContext) -> PromptIncidentContext:
     )
 
 
-def _json_bytes(value: dict[str, Any]) -> bytes:
+def prompt_data_bytes(value: dict[str, Any]) -> bytes:
     rendered = json.dumps(
         value,
         ensure_ascii=True,
@@ -440,7 +440,7 @@ def _json_bytes(value: dict[str, Any]) -> bytes:
 
 
 def _render_within_budget(payload: dict[str, Any], budget: int) -> str | None:
-    rendered = _json_bytes(payload)
+    rendered = prompt_data_bytes(payload)
     return rendered.decode("utf-8") if len(rendered) <= budget else None
 
 

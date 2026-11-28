@@ -133,7 +133,11 @@ async def lifespan(app: FastAPI):
     workers = []
     retry_scheduler_task = None
     stale_verification_worker_task = None
-    if investigator is not None and investigator.persistence:
+    catalog_refresh_task = None
+    catalog_refresh = investigator.catalog_refresh
+    if catalog_refresh is not None:
+        catalog_refresh_task = asyncio.create_task(catalog_refresh.run())
+    if investigator.persistence:
         for worker_id in range(max(1, config.max_concurrent_investigations)):
             workers.append(asyncio.create_task(_investigation_worker(worker_id, config)))
         # Reclaims due failed_retryable runs and stranded running ones, both of
@@ -148,24 +152,25 @@ async def lifespan(app: FastAPI):
         stale_verification_worker_task = asyncio.create_task(_stale_verification_worker())
         log.info("investigation_workers_started", count=len(workers))
 
-    yield
-
-    # Shutdown
-    for task in [*workers, retry_scheduler_task, stale_verification_worker_task]:
-        if task is None:
-            continue
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-    if otel_shutdown:
-        otel_shutdown()
-    # Close investigator
-    if investigator is not None:
+    try:
+        yield
+    finally:
+        if catalog_refresh_task is not None:
+            catalog_refresh.stop()
+        tasks = [
+            task for task in [*workers, retry_scheduler_task, stale_verification_worker_task]
+            if task is not None
+        ]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if catalog_refresh_task is not None:
+            await catalog_refresh_task
+        if otel_shutdown:
+            otel_shutdown()
         await investigator.close()
-    log.info("shutting_down_pamawas_investigator")
-    set_running(False)
+        log.info("shutting_down_pamawas_investigator")
+        set_running(False)
 
 
 app = FastAPI(

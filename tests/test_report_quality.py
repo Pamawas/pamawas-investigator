@@ -11,6 +11,7 @@ from models import (
     IncidentContext,
     ToolResult,
 )
+from service.catalog_refresh import CatalogRefreshWorker
 from service.investigator import (
     _ensure_causal_verdict,
     _finalize_findings,
@@ -330,9 +331,8 @@ def test_circuit_breaker_stdlib_logging_does_not_raise(caplog):
 
 
 @pytest.mark.asyncio
-async def test_investigator_refreshes_and_freezes_live_catalog(investigator):
+async def test_investigator_pins_last_published_catalog_without_waiting(investigator):
     persistence = MagicMock()
-    persistence.claim_telemetry_catalog_refresh.return_value = True
     persistence.load_pinned_telemetry_catalog.return_value = None
     persistence.pin_telemetry_catalog_revision.return_value = {
         "revision_id": "tcr_abc",
@@ -350,55 +350,38 @@ async def test_investigator_refreshes_and_freezes_live_catalog(investigator):
         },
     }
     investigator.persistence = persistence
-    investigator.tools._prometheus_adapter.query_metric_catalog = AsyncMock(return_value={
-        "status": "success",
-        "data": [{
-            "name": "pg_stat_statements_mean_exec_time",
-            "help": "PostgreSQL query duration",
-            "type": "gauge",
-            "unit": "seconds",
-        }],
-    })
-    investigator.tools._loki_adapter.query_labels = AsyncMock(return_value={
-        "status": "success", "data": ["app", "namespace"],
-    })
+    investigator.catalog_refresh = MagicMock()
     context = IncidentContext("inc", "PostgreSQL Slow Query")
 
-    await investigator._refresh_telemetry_catalog(context, "irun_1")
+    await investigator._ensure_catalog_available(context, "irun_1")
 
-    assert persistence.store_telemetry_catalog.call_count == 2
+    investigator.catalog_refresh.request_refresh.assert_called_once_with()
+    persistence.claim_telemetry_catalog_refresh.assert_not_called()
     assert "pg_stat_statements_mean_exec_time" in context.telemetry_catalog["prometheus"]
     assert context.telemetry_catalog_revision_id == "tcr_abc"
     persistence.pin_telemetry_catalog_revision.assert_called_once_with("irun_1")
 
 
 @pytest.mark.asyncio
-async def test_failed_catalog_refresh_keeps_last_db_snapshot(investigator):
+async def test_catalog_refresh_handles_each_provider_independently(investigator):
     persistence = MagicMock()
-    persistence.claim_telemetry_catalog_refresh.return_value = True
-    persistence.load_pinned_telemetry_catalog.return_value = None
-    persistence.pin_telemetry_catalog_revision.return_value = {
-        "revision_id": "tcr_last_good",
-        "content_hash": "last-good",
-        "entry_count": 1,
-        "catalog": {
-            "prometheus": {"up": {"name": "up", "_search_text": "up"}},
-            "loki": {},
-        },
-    }
-    investigator.persistence = persistence
+    persistence.claim_telemetry_catalog_refresh.side_effect = lambda provider, _: provider
     investigator.tools._prometheus_adapter.query_metric_catalog = AsyncMock(
         side_effect=RuntimeError("provider unavailable")
     )
     investigator.tools._loki_adapter.query_labels = AsyncMock(
-        side_effect=RuntimeError("provider unavailable")
+        return_value={"status": "success", "data": ["target"]}
     )
-    context = IncidentContext("inc", "Target Down")
+    worker = CatalogRefreshWorker(persistence, investigator.tools, 86_400)
 
-    await investigator._refresh_telemetry_catalog(context, "irun_2")
+    await worker.refresh_due()
 
-    assert context.telemetry_catalog["prometheus"]["up"]["name"] == "up"
-    assert persistence.mark_telemetry_catalog_refresh_failed.call_count == 2
+    persistence.store_telemetry_catalog.assert_called_once_with(
+        "loki", "label", [{"name": "target"}], "loki"
+    )
+    persistence.mark_telemetry_catalog_refresh_failed.assert_called_once_with(
+        "prometheus", "RuntimeError", "prometheus"
+    )
 
 
 @pytest.mark.asyncio
@@ -421,7 +404,7 @@ async def test_retry_reuses_pinned_catalog_without_live_refresh(investigator):
     investigator.persistence = persistence
     context = IncidentContext("inc", "Vendor queue latency")
 
-    await investigator._refresh_telemetry_catalog(context, "irun_retry")
+    await investigator._ensure_catalog_available(context, "irun_retry")
 
     assert context.telemetry_catalog_revision_id == "tcr_original"
     assert "vendor_queue_depth" in context.telemetry_catalog["prometheus"]

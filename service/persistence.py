@@ -13,7 +13,7 @@ import psycopg2
 import psycopg2.extras
 import psycopg2.pool
 
-from models import Finding, LogEntry, Metric
+from models import Finding, InvestigationPolicy, LogEntry, Metric
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ class InvestigationPersistence:
     """Handles persistence of investigation runs, tool executions, and evidence."""
 
     MAX_RESULT_SUMMARY_BYTES = 64 * 1024
+    CATALOG_LEASE_SECONDS = 120
 
     def __init__(self, database_url: str):
         self.database_url = database_url
@@ -114,116 +115,219 @@ class InvestigationPersistence:
             conn.rollback()
 
     def claim_telemetry_catalog_refresh(
-        self, provider: str, refresh_after_seconds: int = 900
-    ) -> bool:
-        """Atomically let one investigator refresh a stale provider catalog."""
+        self, provider: str, refresh_after_seconds: int
+    ) -> str | None:
+        """Lease a due provider refresh across all investigator replicas."""
+        token = str(uuid.uuid4())
         conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
                     INSERT INTO telemetry_catalog_sync_state (
-                        provider, last_attempted_at, updated_at
-                    ) VALUES (%s, now(), now())
+                        provider, last_attempted_at, updated_at, lease_token, lease_expires_at
+                    ) VALUES (%s, now(), now(), %s, now() + (%s * interval '1 second'))
                     ON CONFLICT (provider) DO UPDATE
-                    SET last_attempted_at = now(), updated_at = now()
-                    WHERE telemetry_catalog_sync_state.last_attempted_at IS NULL
-                       OR telemetry_catalog_sync_state.last_attempted_at
-                          < now() - (%s * interval '1 second')
+                    SET last_attempted_at = EXCLUDED.last_attempted_at,
+                        updated_at = EXCLUDED.updated_at,
+                        lease_token = EXCLUDED.lease_token,
+                        lease_expires_at = EXCLUDED.lease_expires_at
+                    WHERE (telemetry_catalog_sync_state.last_succeeded_at IS NULL
+                           OR telemetry_catalog_sync_state.last_succeeded_at
+                              <= now() - (%s * interval '1 second'))
+                      AND (telemetry_catalog_sync_state.next_retry_at IS NULL
+                           OR telemetry_catalog_sync_state.next_retry_at <= now())
+                      AND (telemetry_catalog_sync_state.lease_expires_at IS NULL
+                           OR telemetry_catalog_sync_state.lease_expires_at <= now())
                     RETURNING provider
                     """,
-                    (provider, refresh_after_seconds),
+                    (provider, token, self.CATALOG_LEASE_SECONDS, refresh_after_seconds),
                 )
                 claimed = cursor.fetchone() is not None
                 conn.commit()
-                return claimed
-        except psycopg2.Error as e:
-            conn.rollback()
-            logger.warning("Telemetry catalog refresh claim failed for %s: %s", provider, e)
-            return False
-        finally:
-            self._put_connection(conn)
-
-    def store_telemetry_catalog(
-        self, provider: str, resource_kind: str, entries: list[dict[str, Any]]
-    ) -> None:
-        """Upsert one successful live discovery without deleting the last good snapshot."""
-        conn = self._get_connection()
-        try:
-            rows = []
-            for entry in entries:
-                name = str(entry.get("name") or "").strip()
-                if not name:
-                    continue
-                metadata = dict(entry)
-                search_text = " ".join(
-                    str(metadata.get(key) or "")
-                    for key in ("name", "help", "type", "unit")
-                ).strip()
-                rows.append((provider, resource_kind, name, search_text, json.dumps(metadata)))
-            with conn.cursor() as cursor:
-                if rows:
-                    psycopg2.extras.execute_values(
-                        cursor,
-                        """
-                        INSERT INTO telemetry_catalog_entries (
-                            provider, resource_kind, resource_name, search_text,
-                            metadata, first_seen_at, last_seen_at
-                        ) VALUES %s
-                        ON CONFLICT (provider, resource_kind, resource_name) DO UPDATE
-                        SET search_text = EXCLUDED.search_text,
-                            metadata = EXCLUDED.metadata,
-                            last_seen_at = now()
-                        """,
-                        rows,
-                        template="(%s, %s, %s, %s, %s::jsonb, now(), now())",
-                    )
-                    cursor.execute(
-                        """
-                        DELETE FROM telemetry_catalog_entries
-                        WHERE provider = %s
-                          AND resource_kind = %s
-                          AND NOT (resource_name = ANY(%s))
-                        """,
-                        (provider, resource_kind, [row[2] for row in rows]),
-                    )
-                cursor.execute(
-                    """
-                    INSERT INTO telemetry_catalog_sync_state (
-                        provider, last_attempted_at, last_succeeded_at,
-                        last_error_class, entry_count, updated_at
-                    ) VALUES (%s, now(), now(), NULL, %s, now())
-                    ON CONFLICT (provider) DO UPDATE
-                    SET last_succeeded_at = now(), last_error_class = NULL,
-                        entry_count = EXCLUDED.entry_count, updated_at = now()
-                    """,
-                    (provider, len(rows)),
-                )
-            conn.commit()
-        except (psycopg2.Error, TypeError, ValueError):
+                return token if claimed else None
+        except psycopg2.Error:
             conn.rollback()
             raise
         finally:
             self._put_connection(conn)
 
+    def store_telemetry_catalog(
+        self, provider: str, resource_kind: str, entries: list[dict[str, Any]], lease_token: str
+    ) -> bool:
+        """Publish a nonempty replacement and record success in the same transaction."""
+        rows = []
+        for entry in entries:
+            name = str(entry.get("name") or "").strip()
+            if not name:
+                continue
+            search_text = " ".join(
+                str(entry.get(key) or "") for key in ("name", "help", "type", "unit")
+            ).strip()
+            rows.append((provider, resource_kind, name, search_text, json.dumps(entry)))
+        if not rows:
+            raise ValueError("Discovery returned no valid catalog entries")
+
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                # Serialize publication of combined revisions while allowing the
+                # provider API calls to run independently outside the transaction.
+                cursor.execute("SELECT pg_advisory_xact_lock(1346456897, 1)")
+                cursor.execute(
+                    """
+                    SELECT provider FROM telemetry_catalog_sync_state
+                    WHERE provider = %s AND lease_token = %s
+                      AND lease_expires_at > clock_timestamp()
+                    FOR UPDATE
+                    """,
+                    (provider, lease_token),
+                )
+                if cursor.fetchone() is None:
+                    conn.rollback()
+                    return False
+                self._replace_catalog_entries(cursor, provider, resource_kind, rows)
+                revision_id = self._snapshot_live_catalog(cursor)
+                cursor.execute(
+                    """
+                    UPDATE telemetry_catalog_sync_state
+                    SET last_succeeded_at = clock_timestamp(), last_error_class = NULL,
+                        entry_count = %s, updated_at = clock_timestamp(), failure_count = 0,
+                        next_retry_at = NULL, lease_token = NULL, lease_expires_at = NULL,
+                        catalog_revision_id = %s
+                    WHERE provider = %s
+                    """,
+                    (len(rows), revision_id, provider),
+                )
+            conn.commit()
+            return True
+        except (psycopg2.Error, RuntimeError, TypeError, ValueError):
+            conn.rollback()
+            raise
+        finally:
+            self._put_connection(conn)
+
+    @staticmethod
+    def _replace_catalog_entries(cursor, provider: str, resource_kind: str, rows: list[tuple]):
+        psycopg2.extras.execute_values(
+            cursor,
+            """
+            INSERT INTO telemetry_catalog_entries (
+                provider, resource_kind, resource_name, search_text,
+                metadata, first_seen_at, last_seen_at
+            ) VALUES %s
+            ON CONFLICT (provider, resource_kind, resource_name) DO UPDATE
+            SET search_text = EXCLUDED.search_text,
+                metadata = EXCLUDED.metadata,
+                last_seen_at = now()
+            """,
+            rows,
+            template="(%s, %s, %s, %s, %s::jsonb, now(), now())",
+        )
+        cursor.execute(
+            """
+            DELETE FROM telemetry_catalog_entries
+            WHERE provider = %s AND resource_kind = %s AND NOT (resource_name = ANY(%s))
+            """,
+            (provider, resource_kind, [row[2] for row in rows]),
+        )
+
     def mark_telemetry_catalog_refresh_failed(
-        self, provider: str, error_class: str
-    ) -> None:
+        self, provider: str, error_class: str, lease_token: str
+    ) -> bool:
         conn = self._get_connection()
         try:
             with conn.cursor() as cursor:
                 cursor.execute(
                     """
                     UPDATE telemetry_catalog_sync_state
-                    SET last_error_class = %s, updated_at = now()
-                    WHERE provider = %s
+                    SET last_error_class = %s, updated_at = now(),
+                        next_retry_at = now() + (ARRAY[5, 15, 30, 60])[LEAST(failure_count + 1, 4)]
+                                        * interval '1 minute',
+                        failure_count = LEAST(failure_count + 1, 4),
+                        lease_token = NULL, lease_expires_at = NULL
+                    WHERE provider = %s AND lease_token = %s
+                      AND lease_expires_at > now()
                     """,
-                    (error_class, provider),
+                    (error_class, provider, lease_token),
                 )
+                updated = cursor.rowcount == 1
             conn.commit()
-        except psycopg2.Error as e:
+            return updated
+        except psycopg2.Error:
             conn.rollback()
-            logger.warning("Could not record %s catalog refresh failure: %s", provider, e)
+            raise
+        finally:
+            self._put_connection(conn)
+
+    def telemetry_catalog_status(self) -> list[tuple]:
+        """Read freshness independently from refresh attempts and return the published pin."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT provider, last_succeeded_at, entry_count,
+                           first_value(catalog_revision_id) OVER (
+                               ORDER BY (catalog_revision_id IS NULL),
+                                        last_succeeded_at DESC NULLS LAST, provider
+                           ) AS latest_revision_id
+                    FROM telemetry_catalog_sync_state
+                    """
+                )
+                rows = cursor.fetchall()
+            conn.commit()
+            return rows
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+        finally:
+            self._put_connection(conn)
+
+    def load_investigation_policies(self) -> tuple[InvestigationPolicy, ...]:
+        """Read the enabled policy versions in a single database snapshot."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, version, priority, labels, provider, metric_type, metric_unit,
+                           minimum_observations, recommendation, runbook_reference
+                    FROM investigation_policies
+                    WHERE enabled
+                    """
+                )
+                policies = tuple(InvestigationPolicy(*row) for row in cursor.fetchall())
+            conn.commit()
+            return policies
+        except psycopg2.Error:
+            conn.rollback()
+            raise
+        finally:
+            self._put_connection(conn)
+
+    def save_prompt_context_audit(self, run_id: str, audit: dict[str, Any]) -> None:
+        """Preserve the first and latest audited model input for the logical run."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    """
+                    UPDATE investigation_runs
+                    SET prompt_context_audit = jsonb_build_object(
+                        'first', COALESCE(prompt_context_audit->'first', %s::jsonb),
+                        'latest', %s::jsonb
+                    )
+                    WHERE id = %s AND status <> 'completed'
+                    """,
+                    (psycopg2.extras.Json(audit), psycopg2.extras.Json(audit), run_id),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(f"Cannot audit model input for investigation run {run_id}")
+            conn.commit()
+        except (psycopg2.Error, RuntimeError):
+            conn.rollback()
+            raise
         finally:
             self._put_connection(conn)
 
@@ -261,11 +365,30 @@ class InvestigationPersistence:
             """
             SELECT provider, resource_name, search_text, metadata
             FROM telemetry_catalog_entries
-            WHERE last_seen_at >= now() - interval '7 days'
             ORDER BY provider, resource_name
             """
         )
         return cursor.fetchall()
+
+    def _snapshot_live_catalog(self, cursor) -> str:
+        catalog = self._catalog_from_rows(self._load_live_catalog_rows(cursor))
+        canonical, content_hash, entry_count = self._catalog_content(catalog)
+        cursor.execute(
+            """
+            INSERT INTO telemetry_catalog_revisions (id, content_hash, catalog, entry_count)
+            VALUES (%s, %s, %s::jsonb, %s)
+            ON CONFLICT (content_hash) DO NOTHING
+            """,
+            (f"tcr_{content_hash.upper()}", content_hash, canonical, entry_count),
+        )
+        cursor.execute(
+            "SELECT id FROM telemetry_catalog_revisions WHERE content_hash = %s",
+            (content_hash,),
+        )
+        stored = cursor.fetchone()
+        if not stored:
+            raise RuntimeError("Failed to create telemetry catalog revision")
+        return str(stored[0])
 
     def load_telemetry_catalog(self) -> dict[str, dict[str, dict[str, Any]]]:
         """Load the current mutable catalog used only to create a revision."""
@@ -342,32 +465,20 @@ class InvestigationPersistence:
 
                 revision_id = str(run[0]) if run[0] else None
                 if revision_id is None:
-                    catalog = self._catalog_from_rows(
-                        self._load_live_catalog_rows(cursor)
-                    )
-                    canonical, content_hash, entry_count = self._catalog_content(catalog)
-                    revision_id = f"tcr_{content_hash.upper()}"
                     cursor.execute(
                         """
-                        INSERT INTO telemetry_catalog_revisions (
-                            id, content_hash, catalog, entry_count
-                        ) VALUES (%s, %s, %s::jsonb, %s)
-                        ON CONFLICT (content_hash) DO NOTHING
-                        """,
-                        (revision_id, content_hash, canonical, entry_count),
-                    )
-                    cursor.execute(
+                        SELECT catalog_revision_id FROM telemetry_catalog_sync_state
+                        WHERE catalog_revision_id IS NOT NULL
+                        ORDER BY last_succeeded_at DESC NULLS LAST, provider
+                        LIMIT 1
                         """
-                        SELECT id
-                        FROM telemetry_catalog_revisions
-                        WHERE content_hash = %s
-                        """,
-                        (content_hash,),
                     )
-                    stored = cursor.fetchone()
-                    if not stored:
-                        raise RuntimeError("Failed to create telemetry catalog revision")
-                    revision_id = str(stored[0])
+                    published = cursor.fetchone()
+                    # Before the first worker publication, retain the successful
+                    # entries populated by earlier investigator releases.
+                    revision_id = str(published[0]) if published else self._snapshot_live_catalog(
+                        cursor
+                    )
                     cursor.execute(
                         """
                         UPDATE investigation_runs
@@ -1282,6 +1393,7 @@ class InvestigationPersistence:
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
         safe_error_code: str | None = None,
+        recommendation_policy: tuple[str, int] | None = None,
     ):
         """Update investigation run status and timestamps."""
         conn = self._get_connection()
@@ -1315,6 +1427,12 @@ class InvestigationPersistence:
                 if safe_error_code:
                     updates.append("safe_error_code = %s")
                     params.append(safe_error_code)
+
+                if recommendation_policy is not None:
+                    updates.extend([
+                        "recommendation_policy_id = %s", "recommendation_policy_version = %s",
+                    ])
+                    params.extend(recommendation_policy)
 
                 params.append(run_id)
                 query = f"UPDATE investigation_runs SET {', '.join(updates)} WHERE id = %s"

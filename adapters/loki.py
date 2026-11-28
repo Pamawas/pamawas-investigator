@@ -1,5 +1,6 @@
 """Loki HTTP API adapter with safety bounds and validation."""
 
+import json
 import logging
 import re
 import time
@@ -254,7 +255,6 @@ class LokiAdapter:
 
             # Check response size
             self._validate_response_size(len(response.content))
-
             data = response.json()
 
             # Validate Loki response structure
@@ -375,7 +375,9 @@ class LokiAdapter:
             logger.error("Loki instant query failed: %s", e)
             raise LokiError(f"Loki query failed: {e}")
 
-    async def query_label_values(self, label: str) -> dict[str, Any]:
+    async def query_label_values(
+        self, label: str, *, start: str = "", end: str = "", selector: str = ""
+    ) -> dict[str, Any]:
         """Get the values for one Loki label.
 
         Querying the real label schema is what keeps the investigation honest:
@@ -395,10 +397,16 @@ class LokiAdapter:
             return self._unavailable_response("circuit_breaker_open")
 
         try:
-            response = await client.get(f"/loki/api/v1/label/{label}/values")
-            response.raise_for_status()
-
-            data = response.json()
+            params = {"start": start, "end": end, "query": selector} if selector else None
+            body = bytearray()
+            async with client.stream(
+                "GET", f"/loki/api/v1/label/{label}/values", params=params
+            ) as response:
+                response.raise_for_status()
+                async for chunk in response.aiter_bytes():
+                    self._validate_response_size(len(body) + len(chunk))
+                    body.extend(chunk)
+            data = json.loads(body)
 
             if data.get("status") != "success":
                 error_msg = data.get("error", "Unknown Loki error")
@@ -424,7 +432,7 @@ class LokiAdapter:
             self._circuit_breaker.record_failure()
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
-            raise LokiError(f"Loki HTTP error {e.response.status_code}: {e.response.text}")
+            raise LokiError(f"Loki label values HTTP error {e.response.status_code}")
         except LokiError:
             observe_tool_call_duration("loki", time.time() - start_time)
             increment_tool_calls("loki", "error")
@@ -453,6 +461,7 @@ class LokiAdapter:
             response = await client.get("/loki/api/v1/labels")
             response.raise_for_status()
 
+            self._validate_response_size(len(response.content))
             data = response.json()
 
             if data.get("status") != "success":

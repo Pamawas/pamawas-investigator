@@ -167,6 +167,7 @@ class TestTelemetryCatalogRevisions:
         ]
         mock_cursor.fetchone.side_effect = [
             (None,),
+            None,
             ("tcr_stored",),
             ("tcr_stored", "catalog-hash", catalog, 1),
         ]

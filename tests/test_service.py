@@ -421,7 +421,9 @@ def test_investigate_returns_context_error(investigator):
 
 def test_investigate_executes_tool_then_submits_findings(investigator):
     investigator._get_incident_context = MagicMock(
-        return_value=IncidentContext("inc", "API Down", affected_services=["api"])
+        return_value=IncidentContext(
+            "inc", "API Down", affected_services=["api"], started_at="2026-11-23T11:35:00Z",
+        )
     )
     # Mock the async adapters directly - use AsyncMock for async methods
     from unittest.mock import AsyncMock
@@ -433,7 +435,7 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
                 "result": [
                     {
                         "metric": {"target": "api"},
-                        "values": [[1, "1"], [2, "0"]],
+                        "values": [[1795433700, "1"], [1795434000, "0"]],
                     }
                 ]
             },
@@ -441,6 +443,12 @@ def test_investigate_executes_tool_then_submits_findings(investigator):
     )
     investigator.tools._loki_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": {"result": []}}
+    )
+    investigator.tools._loki_adapter.query_labels = AsyncMock(
+        return_value={"status": "success", "data": ["service"]}
+    )
+    investigator.tools._loki_adapter.query_label_values = AsyncMock(
+        return_value={"status": "success", "data": ["api"]}
     )
     investigator.tools.submit_findings = MagicMock(return_value={"status": "success"})
     investigator.llm.chat_completion = MagicMock(
@@ -1386,25 +1394,30 @@ async def test_execute_tool_repairs_weak_model_logql_syntax_and_limit(investigat
         return_value={"status": "success", "data": {"result": []}}
     )
     arguments = {
-        "logql": "{instance='koba-labs', job='system_node'} |~ 'CPU|load'",
+        "logql": "{instance='koba-labs'} |~ 'CPU|load'",
         "start": "2026-11-23T11:30:00Z",
         "end": "2026-11-23T11:45:00Z",
         "limit": 200,
     }
 
+    context = IncidentContext(
+        "inc", "Host load", loki_target_coverage={
+            "validated": True, "label": "instance", "value": "koba-labs",
+        },
+    )
     result, findings, is_final = await investigator._execute_tool(
-        "query_loki", arguments
+        "query_loki", arguments, context=context
     )
 
     assert result["status"] == "success"
     assert findings is None
     assert is_final is False
     assert arguments["logql"] == (
-        '{instance="koba-labs", job="system_node"} |~ "CPU|load"'
+        '{instance="koba-labs"} |~ "CPU|load"'
     )
     assert arguments["limit"] == 100
     investigator.tools._loki_adapter.query_range.assert_awaited_once_with(
-        '{instance="koba-labs", job="system_node"} |~ "CPU|load"',
+        '{instance="koba-labs"} |~ "CPU|load"',
         "2026-11-23T11:30:00Z",
         "2026-11-23T11:45:00Z",
         100,
@@ -1610,28 +1623,34 @@ def test_private_candidate_audit_is_persisted_but_hidden_from_model_context(inve
 
 
 @pytest.mark.asyncio
-async def test_empty_loki_query_rejects_undiscovered_selector(investigator):
+async def test_loki_rejects_unvalidated_selector_before_querying(investigator):
     investigator.tools._loki_adapter.query_range = AsyncMock(
         return_value={"status": "success", "data": {"result": []}}
     )
     investigator.tools._loki_adapter.query_labels = AsyncMock(
         return_value={"status": "success", "data": ["vendor_scope"]}
     )
-    investigator.tools._loki_adapter.query_label_values = AsyncMock()
+    investigator.tools._loki_adapter.query_label_values = AsyncMock(
+        return_value={"status": "success", "data": ["alpha", "other-target"]}
+    )
+    context = IncidentContext(
+        "inc", "Target error", affected_services=["alpha"], started_at="2026-11-23T11:30:00Z",
+    )
 
     result, _, _ = await investigator._execute_tool(
         "query_loki",
         {
-            "logql": '{invented_key="alpha"}',
+            "logql": '{cluster="region"} |= "mention vendor_scope=\\"alpha\\""',
             "start": "2026-11-23T11:30:00Z",
             "end": "2026-11-23T11:45:00Z",
         },
+        context=context,
     )
 
-    assert result["status"] == "empty"
-    assert result["available_labels"] == ["vendor_scope"]
-    assert "invented_key" in result["error"]
-    investigator.tools._loki_adapter.query_label_values.assert_not_awaited()
+    assert result["status"] == "error"
+    assert result["target_coverage"]["selector"] == '{vendor_scope="alpha"}'
+    assert "other-target" not in str(result)
+    investigator.tools._loki_adapter.query_range.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -1645,6 +1664,10 @@ async def test_empty_loki_query_is_meaningful_after_selector_validation(investig
     investigator.tools._loki_adapter.query_label_values = AsyncMock(
         return_value={"status": "success", "data": ["alpha", "beta"]}
     )
+    context = IncidentContext(
+        "inc", "Target error", affected_services=["alpha"], started_at="2026-11-23T11:35:00Z",
+        resolved_at="2026-11-23T11:40:00Z",
+    )
 
     result, _, _ = await investigator._execute_tool(
         "query_loki",
@@ -1653,12 +1676,37 @@ async def test_empty_loki_query_is_meaningful_after_selector_validation(investig
             "start": "2026-11-23T11:30:00Z",
             "end": "2026-11-23T11:45:00Z",
         },
+        context=context,
     )
 
     assert result["status"] == "success"
     investigator.tools._loki_adapter.query_label_values.assert_awaited_once_with(
-        "vendor_scope"
+        "vendor_scope", start="2026-11-23T11:30:00+00:00", end="2026-11-23T11:45:00+00:00",
+        selector='{vendor_scope="alpha"}',
     )
+
+
+@pytest.mark.asyncio
+async def test_loki_drops_response_with_an_unmatched_stream(investigator):
+    context = IncidentContext(
+        "inc", "Target error", loki_target_coverage={
+            "validated": True, "label": "vendor_scope", "value": "alpha",
+        },
+    )
+    investigator.tools._loki_adapter.query_range = AsyncMock(return_value={
+        "status": "success", "data": {"result": [{
+            "stream": {"vendor_scope": "beta"}, "values": [["1", "unrelated log"]],
+        }]},
+    })
+
+    result, _, _ = await investigator._execute_tool(
+        "query_loki", {"logql": '{vendor_scope="alpha"}', "start": "s", "end": "e"},
+        context=context,
+    )
+
+    assert result["status"] == "error"
+    assert result["reason"] == "loki_result_outside_validated_target"
+    assert "data" not in result
 
 
 def test_system_prompt_keeps_external_incident_data_out_of_system_role(investigator):
@@ -1743,17 +1791,17 @@ def test_system_prompt_is_source_agnostic_and_evidence_grounded(investigator):
     assert "Use query_prometheus to establish" in prompt
     assert "Use query_loki over the same target and time window" in prompt
     assert "call get_prometheus_labels once" in prompt
-    assert "call get_loki_labels once" in prompt
+    assert "Call get_loki_labels once" in prompt
     assert "Metrics describe what changed; logs may explain why" in prompt
-    assert "never treat catalog output as evidence" in prompt
+    assert "Never repeat catalogs or treat them as evidence" in prompt
     assert "MUST obtain usable evidence from at least one relevant provider" in prompt
     assert "metrics without logs or logs without metrics" in prompt
     assert "at least one materially distinct causal query" in prompt
     assert "A cause can be supported by one provider" in prompt
     assert "zero numeric series is not evidence" in prompt
-    assert "zero-entry Loki result is accepted only after" in prompt
+    assert "Loki queries require an exact target match" in prompt
     assert "MUST contain exactly one causal verdict" in prompt
-    assert "A recommendation without a causal verdict is incomplete" in prompt
+    assert "The harness selects the operator recommendation from approved policies" in prompt
     assert "The current incident is the investigation premise, not a finding" in prompt
     assert "Restating the triggering alert is not a finding" in prompt
     assert "DECISION PROCEDURE" in prompt
@@ -2121,7 +2169,8 @@ def test_single_provider_fact_outranks_provider_gap_root_cause_unknown():
     assert any("No usable data from query_loki" in finding.content for finding in completed)
     actions = [finding for finding in completed if finding.type is EvidenceType.RECOMMENDATION]
     assert len(actions) == 1
-    assert actions[0].content == "Inspect logs because no cause was found."
+    assert actions[0].source_detail == "default investigation action"
+    assert "exact condition instance normal" in actions[0].content
 
 
 def test_model_causal_verdict_is_preserved_as_capped_synthesis():

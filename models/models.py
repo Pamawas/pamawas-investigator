@@ -152,6 +152,7 @@ class Finding:
     # resolves these indexes to durable evidence IDs after IDs are allocated.
     supports_evidence: list[int] = field(default_factory=list)
     contradicts_evidence: list[int] = field(default_factory=list)
+    recommendation_policy: tuple[str, int] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -179,6 +180,22 @@ class Finding:
         )
 
 
+@dataclass(frozen=True)
+class InvestigationPolicy:
+    """One reviewed version of a deterministic recommendation policy."""
+
+    id: str
+    version: int
+    priority: int
+    labels: dict[str, str]
+    provider: str
+    metric_type: str | None
+    metric_unit: str | None
+    minimum_observations: int
+    recommendation: str
+    runbook_reference: str | None
+
+
 @dataclass
 class IncidentContext:
     """Incident context loaded from database."""
@@ -196,6 +213,8 @@ class IncidentContext:
     telemetry_catalog: dict[str, dict[str, Any]] | None = None
     telemetry_catalog_revision_id: str | None = None
     telemetry_catalog_content_hash: str | None = None
+    loki_target_coverage: dict[str, Any] | None = None
+    investigation_policies: tuple[InvestigationPolicy, ...] = ()
     # Stable source identity used by an adapter to query exact current state.
     condition_ref: ConditionReference | None = None
     condition_ref_error: str | None = None
@@ -264,6 +283,9 @@ class InvestigationState:
     exhausted_data_tools: set[str] = field(default_factory=set)
     recovered_data_tools: set[str] = field(default_factory=set)
     context: IncidentContext | None = None
+    prompt_context_audit: dict[str, Any] = field(default_factory=dict)
+    prompt_prefix_messages: int = 0
+    prompt_messages_omitted: int = 0
     completed: bool = False
     # Results already produced in this run, keyed by (tool, arguments). A model
     # that asks the same question again is answered from here instead of paying

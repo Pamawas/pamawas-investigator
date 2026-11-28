@@ -1,11 +1,13 @@
 """Bounded query planning from each provider's discovered schema."""
 
+import asyncio
 import json
 import logging
 import math
 import re
 import time
 from datetime import UTC, datetime, timedelta
+from itertools import islice
 from typing import Any
 
 from adapters import LokiError, PrometheusError
@@ -19,6 +21,10 @@ _RELATED_QUERY_ATTEMPT_LIMIT = 6
 _MAX_RELATED_SIGNALS = 2
 _MAX_SIGNATURE_SIMILARITY = 0.6
 _SELECTOR_LABEL_PROBE_LIMIT = 32
+_LOKI_PROBE_LIMIT = 6
+_LOKI_PROBE_TIMEOUT_SECONDS = 8
+_LOKI_PROBE_WINDOW = timedelta(hours=6)
+_LOKI_LABEL = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]{0,127}")
 _CANDIDATE_AUDIT_LIMIT = 12
 _EXACT_LABEL_MATCHER = re.compile(
     r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:\\.|[^"\\])*)"'
@@ -407,6 +413,77 @@ def investigation_window(context: IncidentContext) -> tuple[str, str]:
     )
 
 
+def _loki_target_pairs(
+    context: IncidentContext, catalog: list[str]
+) -> list[tuple[str, str]]:
+    available = {label for label in catalog if _LOKI_LABEL.fullmatch(label)}
+    values_by_key = _incident_label_values(context)
+    identities = list(dict.fromkeys(
+        value.strip() for value in context.affected_services or []
+        if isinstance(value, str) and 0 < len(value.strip()) <= 512
+    ))
+    keys = _selector_keys(available, values_by_key, identities)
+    pairs = (
+        (key, value) for key in keys for value in identities
+        if key not in values_by_key or value in values_by_key[key]
+    )
+    return list(islice(pairs, _LOKI_PROBE_LIMIT))
+
+
+async def _probe_loki_coverage(adapter, context: IncidentContext) -> dict[str, Any]:
+    if not context.affected_services or not context.started_at:
+        return {"validated": False, "reason": "incident_target_or_window_missing"}
+    start, end = investigation_window(context)
+    window_end = datetime.fromisoformat(end)
+    start = max(datetime.fromisoformat(start), window_end - _LOKI_PROBE_WINDOW).isoformat()
+    pinned = (context.telemetry_catalog or {}).get("loki", {})
+    if context.telemetry_catalog_revision_id:
+        labels = list(pinned)
+    else:
+        response = await adapter.query_labels()
+        if response.get("status") != "success" or not isinstance(response.get("data"), list):
+            return {"validated": False, "reason": "provider_label_catalog_unavailable"}
+        labels = [label for label in response["data"] if isinstance(label, str)]
+
+    pairs = _loki_target_pairs(context, labels)
+    attempted = 0
+    for label, identity in pairs:
+        selector = "{" + label + "=" + json.dumps(identity, ensure_ascii=False) + "}"
+        attempted += 1
+        response = await adapter.query_label_values(label, start=start, end=end, selector=selector)
+        if _matched_target_value(response, [identity]) == identity:
+            return {
+                "validated": True, "method": "exact_incident_identity", "label": label,
+                "value": identity, "selector": selector, "start": start, "end": end,
+                "probes": attempted,
+            }
+    return {"validated": False, "reason": "no_exact_target_label_match", "probes": attempted}
+
+
+async def loki_target_coverage(adapter, context: IncidentContext) -> dict[str, Any]:
+    """Cache one bounded incident-window lookup. Retain only the incident's own value."""
+    if context.loki_target_coverage is None:
+        try:
+            async with asyncio.timeout(_LOKI_PROBE_TIMEOUT_SECONDS):
+                context.loki_target_coverage = await _probe_loki_coverage(adapter, context)
+        except (LokiError, TimeoutError, AttributeError, ValueError):
+            context.loki_target_coverage = {"validated": False, "reason": "live_probe_unavailable"}
+    return context.loki_target_coverage
+
+
+def loki_result_has_target(result: dict[str, Any], coverage: dict[str, Any]) -> bool:
+    """Check returned stream labels before messages, grounding, or persistence use them."""
+    data = result.get("data")
+    streams = data.get("result") if isinstance(data, dict) else None
+    if not isinstance(streams, list):
+        return False
+    return all(
+        isinstance(stream, dict) and isinstance(stream.get("stream"), dict)
+        and stream["stream"].get(coverage["label"]) == coverage["value"]
+        for stream in streams
+    )
+
+
 class QueryRecovery:
     """Record discovery and data calls so recovery evidence remains auditable."""
 
@@ -416,7 +493,8 @@ class QueryRecovery:
         self.max_logs = max_logs
         self.calls: list[ToolResult] = []
         self.counter_metric = False
-        self._selector_cache: dict[str, str | None] = {}
+        self._prometheus_selector_checked = False
+        self._prometheus_selector: str | None = None
         self._target_coverage: dict[str, dict[str, Any]] = {}
         self._metric_catalog: list[dict[str, Any]] | None = None
 
@@ -431,30 +509,14 @@ class QueryRecovery:
         )
         return result
 
-    async def selector(self, provider: str) -> str | None:
-        """Match incident identities against returned keys and values for this provider."""
-        if provider in self._selector_cache:
-            return self._selector_cache[provider]
-        adapter = getattr(self.tools, f"_{provider}_adapter")
-        pinned = (self.context.telemetry_catalog or {}).get(provider, {})
-        if (
-            provider == "loki"
-            and self.context.telemetry_catalog_revision_id
-            and isinstance(pinned, dict)
-        ):
-            catalog = {
-                "status": "success",
-                "data": sorted(str(name) for name in pinned),
-                "catalog_revision_id": self.context.telemetry_catalog_revision_id,
-                "_private": True,
-            }
-            self.calls.append(
-                ToolResult(f"get_{provider}_labels", {}, catalog, 0.0)
-            )
-        else:
-            catalog = await self.call(
-                f"get_{provider}_labels", {}, adapter.query_labels
-            )
+    async def prometheus_selector(self) -> str | None:
+        """Match incident identities against Prometheus's returned keys and values."""
+        provider = "prometheus"
+        if self._prometheus_selector_checked:
+            return self._prometheus_selector
+        adapter = self.tools._prometheus_adapter
+        catalog = await self.call("get_prometheus_labels", {}, adapter.query_labels)
+        self._prometheus_selector_checked = True
         if catalog.get("status") != "success" or not isinstance(catalog.get("data"), list):
             coverage = {
                 "validated": False,
@@ -462,7 +524,6 @@ class QueryRecovery:
             }
             self._target_coverage[provider] = coverage
             catalog["target_coverage"] = coverage
-            self._selector_cache[provider] = None
             return None
         available = {str(key) for key in catalog["data"]}
         incident_label_values = _incident_label_values(self.context)
@@ -480,14 +541,13 @@ class QueryRecovery:
             }
             self._target_coverage[provider] = coverage
             catalog["target_coverage"] = coverage
-            self._selector_cache[provider] = None
             return None
         # Prefer incident-carried keys. Probe the bounded provider schema only
         # when it shares no keys with the incident; no label vocabulary is baked in.
         candidate_keys = _selector_keys(available, incident_label_values, identities)
         for key in candidate_keys[:_SELECTOR_LABEL_PROBE_LIMIT]:
             response = await self.call(
-                f"get_{provider}_labels", {"label": key}, adapter.query_label_values, key
+                "get_prometheus_labels", {"label": key}, adapter.query_label_values, key
             )
             matched = _matched_target_value(response, identities)
             if matched is None:
@@ -501,7 +561,7 @@ class QueryRecovery:
             }
             self._target_coverage[provider] = coverage
             catalog["target_coverage"] = coverage
-            self._selector_cache[provider] = selector
+            self._prometheus_selector = selector
             return selector
         coverage = {
             "validated": False,
@@ -509,7 +569,6 @@ class QueryRecovery:
         }
         self._target_coverage[provider] = coverage
         catalog["target_coverage"] = coverage
-        self._selector_cache[provider] = None
         return None
 
     @property
@@ -561,22 +620,28 @@ class QueryRecovery:
         return result
 
     async def recover_loki(self) -> None:
-        selector = await self.selector("loki")
+        coverage = await loki_target_coverage(self.tools._loki_adapter, self.context)
+        self._target_coverage["loki"] = coverage
+        self.calls.append(ToolResult(
+            "get_loki_labels", {}, {"target_coverage": coverage, "_private": True}, 0.0
+        ))
+        selector = coverage.get("selector")
         if selector is None:
             return
-        start, end = investigation_window(self.context)
+        start, end = coverage["start"], coverage["end"]
         arguments = {"logql": selector, "start": start, "end": end, "limit": self.max_logs}
         result = await self.call(
             "query_loki", arguments, self.tools._loki_adapter.query_range,
             selector, start, end, self.max_logs,
         )
+        if result.get("status") == "success" and not loki_result_has_target(result, coverage):
+            result.clear()
+            result.update({"status": "empty", "reason": "no_validated_target_streams"})
         result["signal_role"] = "recovered_target"
-        result["target_coverage"] = self._target_coverage.get(
-            "loki", {"validated": False, "reason": "selector_not_validated"}
-        )
+        result["target_coverage"] = coverage
 
     async def recover_prometheus(self, candidates: list[dict]) -> None:
-        selector = await self.selector("prometheus")
+        selector = await self.prometheus_selector()
         if selector is None:
             return
         start, end = investigation_window(self.context)
@@ -601,7 +666,7 @@ class QueryRecovery:
     ) -> None:
         """Query up to two changing, semantically distinct target signals."""
         if selector is None:
-            selector = await self.selector("prometheus")
+            selector = await self.prometheus_selector()
         else:
             coverage = _expression_target_coverage(selector, self.context)
             if coverage is None:
